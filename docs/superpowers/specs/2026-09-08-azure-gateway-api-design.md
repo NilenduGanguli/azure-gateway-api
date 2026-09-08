@@ -53,7 +53,7 @@ precisely the property that makes a PVC the right store and a second gateway rep
 
 | # | Decision | Rationale |
 |---|---|---|
-| D1 | Go 1.23, stdlib `net/http` | Static binary, distroless image, best-in-class streaming of large PDFs |
+| D1 | Go 1.26, stdlib `net/http` | Static binary, distroless image, best-in-class streaming of large PDFs. 1.26 is the floor the pure-Go SQLite driver's transitive dependencies impose |
 | D2 | SQLite via `modernc.org/sqlite` (pure Go, no cgo) | Keeps the binary static; SQL + indexes for TTL/GC and job queries |
 | D3 | Upstream call is always synchronous where possible | The user's requirement, and the documented field workaround for the multi-replica problem |
 | D4 | `429` the moment workers are busy; queue depth configurable, default `0` | Explicit user choice |
@@ -83,7 +83,7 @@ precisely the property that makes a PVC the right store and a second gateway rep
 
 | Package | Responsibility |
 |---|---|
-| `cmd/gateway` | wiring, lifecycle, graceful shutdown, `probe` subcommand |
+| `cmd/gateway` | wiring, lifecycle, graceful shutdown, and the `probe` subcommand |
 | `internal/config` | env-driven config, fail-fast validation |
 | `internal/logging` | `log/slog` JSON, request-scoped logger |
 | `internal/httpx` | recover, request-id, access log, body cap, timeouts, streaming helpers |
@@ -92,8 +92,8 @@ precisely the property that makes a PVC the right store and a second gateway rep
 | `internal/store` | SQLite job store; PVC blob store (atomic write, shard, stream, GC) |
 | `internal/upstream` | blocking `Analyze` per surface; capability detection; affinity fallback |
 | `internal/jobs` | worker pool, admission control, lease/heartbeat, crash recovery, TTL sweeper |
-| `internal/surface/di` | DI handlers + envelope composition |
-| `internal/surface/read` | Read handlers + envelope composition |
+| `internal/surface` | client-facing handlers; `di.go` and `read.go` share the submit, poll and passthrough paths in `surface.go` |
+| `internal/jsonx` | locates a member's byte range in a large JSON document without buffering it |
 | `internal/admin` | `/_gw/health,ready,live,jobs,metrics,version,config` |
 | `internal/probe` | live-container capability probe (subcommand + startup) |
 | `internal/mockazure` | faithful fakes of **both** containers, including the failure modes |
@@ -402,3 +402,51 @@ build and supersedes every Microsoft doc where they disagree. It closes most of 
 The gateway is additive: it sits beside the containers rather than replacing them. Rollback is
 repointing clients at the container Routes directly, which restores exactly today's behaviour —
 including today's async fragility. No data migration, no schema in any shared system.
+
+---
+
+## Implementation notes
+
+Two deviations from the plan above, both deliberate:
+
+- **`internal/surface` is one package**, with `di.go` and `read.go` over a shared submit, poll and
+  passthrough core in `surface.go`, rather than two sibling packages. The two surfaces differ only
+  in their URL shapes and error vocabulary; splitting them would have duplicated the whole
+  lifecycle to separate about forty lines.
+- **Go 1.26, not 1.23.** `golang.org/x/sys` arrives transitively through the pure-Go SQLite driver
+  and declares a 1.26 floor, so nothing older can build the module. The direct dependency on
+  x/sys was removed — stdlib `syscall` covers the two `Statfs` calls — but the transitive one
+  remains.
+
+### Review outcomes
+
+An adversarial review pass — six reviewers with distinct lenses, then three verifiers per finding
+each trying to refute it — found **eight real defects**. Every one was reproduced before being
+fixed, and every one now has a regression test.
+
+| # | Defect | Consequence |
+|---|---|---|
+| 1 | `jsonx` skipped the name/value separator with a fixed 64-byte lookahead | a pretty-printed upstream response produced an envelope that was invalid JSON |
+| 2 | recovery probed for the input document with `Open` and discarded the `*os.File` | one leaked descriptor per orphaned job, during recovery from a restart |
+| 3 | shutdown cancellation was wrapped into a surface-shaped error | a job whose 202 was already sent was marked terminally failed instead of resumed |
+| 4 | request contexts were derived from the signal context | `Shutdown` returned in ~1.5 ms and an in-flight synchronous call died with a 500 — the grace period existed and nothing used it |
+| 5 | boot recovery filtered `running` jobs on lease expiry | backwards for a crash: the lease is minutes in the *future*, so the scan skipped exactly the jobs it existed to rescue, and they stayed `running` forever |
+| 6 | recovery re-ran TTL-expired jobs | after an outage longer than the TTL, every stored job was resubmitted to produce results whose ids already 404 |
+| 7 | result-file fetching was uncancellable with no aggregate budget | a wedged container turned N figures into N × the per-request timeout, outlasting any grace period and getting the pod SIGKILLed |
+| 8 | `X-Forwarded-Host` was trusted by default and unvalidated | a caller could name its own `Operation-Location` host, sending its operation id somewhere else; a value with a path also shifted the segment positions `Azure.AI.FormRecognizer` counts backwards from |
+
+Defects 4 and 5 were the ones that mattered most, and they compounded: a rolling restart both killed
+in-flight work and then failed to reclaim it. That is precisely the scenario the gateway exists to
+survive.
+
+Defect 8 changed a default. `TRUST_FORWARDED_HEADERS` is now **off**, forwarded authorities are
+validated as bare `host[:port]`, and `TRUSTED_FORWARDED_HOSTS` can pin them. Behind an OpenShift
+Route the request's own `Host` header is already correct; `PUBLIC_BASE_URL` remains the
+recommended setting for every other topology.
+
+### Coverage
+
+Roughly 60% of statements overall, but that number is dominated by `cmd/gateway` and
+`internal/probe`, which drive real I/O and are exercised by hand. The paths that carry the
+guarantees are well covered: `ids` 98%, `jsonx` 86%, `azerr` 80%, `store` 75%, `surface` 70%,
+`jobs` 70%.
