@@ -1,0 +1,28 @@
+# build output
+/bin/
+/dist/
+gateway
+
+# local runtime data (PVC contents)
+/data/
+*.db
+*.db-wal
+*.db-shm
+
+# go
+*.test
+*.out
+coverage.*
+
+# env / secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+service-account.json
+application_default_credentials.json
+
+# editor / os
+.DS_Store
+.idea/
+.vscode/
