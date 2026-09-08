@@ -49,8 +49,15 @@ type Config struct {
 	// it is derived per request from the forwarded headers or Host.
 	PublicBaseURL string
 	// TrustForwardedHeaders enables X-Forwarded-Proto/Host when deriving the public base URL.
-	// Leave off when the gateway is directly exposed, so a client cannot forge its own poll host.
+	//
+	// It defaults OFF. With it on and no allowlist, any caller can set X-Forwarded-Host and have
+	// the gateway mint an Operation-Location pointing wherever it likes — so that caller's SDK
+	// then sends the operation id somewhere else. Behind an OpenShift Route the request's own Host
+	// header is already correct, and PUBLIC_BASE_URL covers every other topology.
 	TrustForwardedHeaders bool
+	// TrustedForwardedHosts, when non-empty, restricts which authorities a forwarded header may
+	// name. An entry without a port matches that host on any port.
+	TrustedForwardedHosts []string
 
 	DataDir        string
 	AllowNetworkFS bool
@@ -67,6 +74,13 @@ type Config struct {
 	// QueueDepth is how many admitted-but-unstarted jobs may wait per surface. Zero means a
 	// submit is rejected with 429 the moment every slot is busy.
 	QueueDepth int
+
+	// ArtifactFetchTimeout bounds the whole result-file phase of one job.
+	//
+	// Artifacts are a bonus, not the result: the analysis is already stored by the time they are
+	// fetched. Without an aggregate budget a wedged container turns N figures into N times the
+	// per-request timeout, which outlasts any shutdown grace and gets the pod SIGKILLed.
+	ArtifactFetchTimeout time.Duration
 
 	ResultTTL         time.Duration
 	GCInterval        time.Duration
@@ -92,7 +106,8 @@ func Load() (*Config, error) {
 	c := &Config{
 		Addr:                  env("GATEWAY_ADDR", ":8080"),
 		PublicBaseURL:         strings.TrimRight(env("PUBLIC_BASE_URL", ""), "/"),
-		TrustForwardedHeaders: envBool("TRUST_FORWARDED_HEADERS", true),
+		TrustForwardedHeaders: envBool("TRUST_FORWARDED_HEADERS", false),
+		TrustedForwardedHosts: envList("TRUSTED_FORWARDED_HOSTS"),
 		DataDir:               env("DATA_DIR", "/data"),
 		AllowNetworkFS:        envBool("ALLOW_NETWORK_FS", false),
 		DISyncMode:            SyncMode(strings.ToLower(env("DI_SYNC_ANALYZE", string(SyncAuto)))),
@@ -130,6 +145,9 @@ func Load() (*Config, error) {
 	if c.GCInterval, err = envDuration("GC_INTERVAL", 5*time.Minute); err != nil {
 		collect(err)
 	}
+	if c.ArtifactFetchTimeout, err = envDuration("ARTIFACT_FETCH_TIMEOUT", 2*time.Minute); err != nil {
+		collect(err)
+	}
 	if c.DI.Timeout, err = envDuration("DI_UPSTREAM_TIMEOUT", 15*time.Minute); err != nil {
 		collect(err)
 	}
@@ -144,8 +162,16 @@ func Load() (*Config, error) {
 	collect(validateUpstream("READ", c.Read))
 
 	if c.PublicBaseURL != "" {
-		if u, perr := url.Parse(c.PublicBaseURL); perr != nil || u.Scheme == "" || u.Host == "" {
+		u, perr := url.Parse(c.PublicBaseURL)
+		switch {
+		case perr != nil || u.Scheme == "" || u.Host == "":
 			collect(fmt.Errorf("PUBLIC_BASE_URL must be an absolute URL with scheme and host, got %q", c.PublicBaseURL))
+		case u.Path != "" || u.RawQuery != "" || u.Fragment != "":
+			// A path here would shift every segment of Operation-Location, and
+			// Azure.AI.FormRecognizer 4.x locates the model and result ids by counting segments
+			// backwards from the end.
+			collect(fmt.Errorf("PUBLIC_BASE_URL must be scheme and host only, with no path, "+
+				"query or fragment, got %q", c.PublicBaseURL))
 		}
 	}
 	if c.DataDir == "" {
@@ -176,6 +202,9 @@ func Load() (*Config, error) {
 	}
 	if c.GCInterval <= 0 {
 		collect(errors.New("GC_INTERVAL must be positive"))
+	}
+	if c.ArtifactFetchTimeout <= 0 {
+		collect(errors.New("ARTIFACT_FETCH_TIMEOUT must be positive"))
 	}
 
 	if len(errs) > 0 {
@@ -238,6 +267,11 @@ func (c *Config) Warnings() []string {
 	if c.Read.APIKey == "" {
 		out = append(out, "READ_UPSTREAM_API_KEY is empty; upstream calls will be unauthenticated")
 	}
+	if c.PublicBaseURL == "" && c.TrustForwardedHeaders && len(c.TrustedForwardedHosts) == 0 {
+		out = append(out, "TRUST_FORWARDED_HEADERS is on with neither PUBLIC_BASE_URL nor "+
+			"TRUSTED_FORWARDED_HOSTS set: any caller can set X-Forwarded-Host and have its "+
+			"Operation-Location point elsewhere. Set PUBLIC_BASE_URL, or list the allowed hosts")
+	}
 	if c.PublicBaseURL == "" && !c.TrustForwardedHeaders {
 		out = append(out, "PUBLIC_BASE_URL is unset and forwarded headers are not trusted; "+
 			"Operation-Location will be derived from the request Host header")
@@ -287,6 +321,21 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envList parses a comma-separated list, dropping empty entries.
+func envList(key string) []string {
+	raw, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if v := strings.TrimSpace(part); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func envInt(key string, def int) int {

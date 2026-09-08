@@ -2,21 +2,21 @@
 
 package store
 
-import "golang.org/x/sys/unix"
+import "syscall"
 
 // diskUsage reports free and total bytes for the filesystem holding path.
 func diskUsage(path string) (free, total uint64, err error) {
-	var st unix.Statfs_t
-	if err := unix.Statfs(path, &st); err != nil {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
 		return 0, 0, err
 	}
 	bs := uint64(st.Bsize)
 	return st.Bavail * bs, st.Blocks * bs, nil
 }
 
-// Filesystem magic numbers for the network filesystems where SQLite's WAL mode is unsafe,
-// because WAL relies on shared memory and POSIX advisory locks that these do not provide
-// reliably. https://www.sqlite.org/wal.html#noshm
+// Filesystem magic numbers for the network filesystems where SQLite's WAL mode is unsafe: WAL
+// depends on shared memory and POSIX advisory locks that these do not provide reliably.
+// https://www.sqlite.org/wal.html#noshm
 const (
 	magicNFS   = 0x6969
 	magicSMB   = 0x517B
@@ -29,8 +29,8 @@ const (
 
 // networkFS reports whether path lives on a filesystem where WAL cannot be trusted.
 func networkFS(path string) (bool, string) {
-	var st unix.Statfs_t
-	if err := unix.Statfs(path, &st); err != nil {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
 		return false, ""
 	}
 	switch int64(st.Type) {

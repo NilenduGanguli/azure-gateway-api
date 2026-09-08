@@ -209,6 +209,9 @@ func (b *base) pollUntilTerminal(ctx context.Context, ac *affinityClient, cfg po
 		}
 		resp, err := ac.http.Do(req)
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
 			transient++
 			if transient > 10 {
 				return nil, azerr.Internal(b.surface, fmt.Sprintf(

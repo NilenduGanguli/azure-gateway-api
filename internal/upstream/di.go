@@ -2,7 +2,6 @@ package upstream
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -139,8 +138,7 @@ func (c *DIClient) trySync(ctx context.Context, ac *affinityClient, doc Document
 	}
 	resp, err := ac.http.Do(hreq)
 	if err != nil {
-		return nil, azerr.Internal(azerr.SurfaceDI,
-			fmt.Sprintf("The document-intelligence container is unreachable: %v", err))
+		return nil, c.unreachable(ctx, err)
 	}
 
 	switch resp.StatusCode {
@@ -232,8 +230,7 @@ func (c *DIClient) analyzeAsync(ctx context.Context, ac *affinityClient, doc Doc
 	}
 	resp, err := ac.http.Do(hreq)
 	if err != nil {
-		return nil, azerr.Internal(azerr.SurfaceDI,
-			fmt.Sprintf("The document-intelligence container is unreachable: %v", err))
+		return nil, c.unreachable(ctx, err)
 	}
 	if resp.StatusCode != http.StatusAccepted {
 		return nil, c.readErrorBody(resp)

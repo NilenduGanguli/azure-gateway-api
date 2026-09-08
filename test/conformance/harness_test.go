@@ -36,6 +36,7 @@ const (
 type harness struct {
 	t       *testing.T
 	gateway *httptest.Server
+	handler http.Handler
 	di      *mockazure.Container
 	read    *mockazure.Container
 	store   *store.Store
@@ -62,7 +63,7 @@ func newHarness(t *testing.T, o harnessOpts) *harness {
 		Addr:                  "127.0.0.1:0",
 		DataDir:               dir,
 		AllowNetworkFS:        true,
-		TrustForwardedHeaders: true,
+		TrustForwardedHeaders: false,
 		DISyncMode:            config.SyncAuto,
 		DIBlindPollBudget:     10,
 		QueueDepth:            0,
@@ -105,16 +106,22 @@ func newHarness(t *testing.T, o harnessOpts) *harness {
 	mux := http.NewServeMux()
 	surface.New(surface.Deps{
 		Config: cfg, Store: st, Jobs: manager,
-		BaseURL: httpx.BaseURLResolver{TrustForwarded: true},
+		BaseURL: httpx.BaseURLResolver{
+			Configured:     cfg.PublicBaseURL,
+			TrustForwarded: cfg.TrustForwardedHeaders,
+			AllowedHosts:   cfg.TrustedForwardedHosts,
+		},
 	}).Register(mux)
 	admin.New(cfg, st, manager, admin.BuildInfo{Version: "test"}, time.Now()).Register(mux)
 
-	gw := httptest.NewServer(httpx.Chain(mux,
+	handler := httpx.Chain(mux,
 		httpx.RequestID(log), httpx.Recover(func(http.ResponseWriter, *http.Request, any) {}),
-	))
+	)
+	gw := httptest.NewServer(handler)
 	t.Cleanup(gw.Close)
 
-	return &harness{t: t, gateway: gw, di: diC, read: readC, store: st, manager: manager, cfg: cfg}
+	return &harness{t: t, gateway: gw, handler: handler, di: diC, read: readC,
+		store: st, manager: manager, cfg: cfg}
 }
 
 // post submits a document and returns the raw response.

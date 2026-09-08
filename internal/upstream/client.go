@@ -384,6 +384,20 @@ func (b *base) joinURL(path string, q url.Values) string {
 // tempPrefix derives a filename-safe prefix from a surface name.
 func tempPrefix(name string) string { return filepath.Base(name) }
 
+// unreachable turns a transport failure into the right kind of error.
+//
+// A cancelled or expired context is not an upstream fault: during graceful shutdown every
+// in-flight request fails this way, and reporting it as a container error would make the worker
+// mark a job terminally failed instead of leaving it for the recovery pass to resume. The 202 for
+// that job has already been sent, so failing it would break the promise.
+func (b *base) unreachable(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return azerr.Internal(b.surface,
+		fmt.Sprintf("The %s container is unreachable: %v", b.name, err))
+}
+
 // ErrSyncUnavailable reports that a container does not serve its synchronous analyze route.
 var ErrSyncUnavailable = errors.New("upstream: synchronous analyze route unavailable")
 

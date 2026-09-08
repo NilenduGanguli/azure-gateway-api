@@ -16,16 +16,28 @@ const maxAttempts = 3
 // recoverBatch is how many orphaned jobs are reconciled per pass.
 const recoverBatch = 256
 
-// recover reconciles jobs left in flight by a previous process.
+// recover reclaims jobs that are no longer progressing.
 //
-// Two states need attention at startup: notStarted jobs that were admitted and committed but
-// whose 202 was followed by a crash, and running jobs whose worker died without releasing its
-// lease. Both were already acknowledged to a client, so they are re-driven rather than dropped.
+// Two states need attention: notStarted jobs that were admitted and committed but whose 202 was
+// followed by a crash, and running jobs whose worker is gone. Both were already acknowledged to a
+// client, so they are re-driven rather than dropped.
+//
+// It runs twice over: once at boot ignoring leases, and then periodically from the sweeper with
+// the lease filter applied, so a worker that dies while the process lives is also caught.
 //
 // Recovered jobs take an admission slot like any other work, but they wait for one instead of
 // being rejected: a 429 is a refusal to make a promise, and these promises were already made.
-func (m *Manager) recover(ctx context.Context) {
-	jobsToRecover, err := m.store.Orphaned(ctx, m.now(), recoverBatch)
+func (m *Manager) recover(ctx context.Context, atBoot bool) {
+	var jobsToRecover []*store.Job
+	var err error
+	if atBoot {
+		// A freshly booted process holds no leases, so every unfinished row was abandoned.
+		// Filtering on lease expiry here would skip precisely the jobs that need rescuing: a
+		// crash leaves lease_until minutes in the future.
+		jobsToRecover, err = m.store.Abandoned(ctx, m.now(), recoverBatch)
+	} else {
+		jobsToRecover, err = m.store.Orphaned(ctx, m.now(), recoverBatch)
+	}
 	if err != nil {
 		m.log.Error("could not scan for orphaned jobs", "error", err)
 		return
@@ -33,7 +45,8 @@ func (m *Manager) recover(ctx context.Context) {
 	if len(jobsToRecover) == 0 {
 		return
 	}
-	m.log.Info("recovering jobs left in flight by a previous process", "count", len(jobsToRecover))
+	m.log.Info("reclaiming jobs that stopped progressing",
+		"count", len(jobsToRecover), "atBoot", atBoot)
 
 	for _, job := range jobsToRecover {
 		if ctx.Err() != nil {
@@ -54,7 +67,7 @@ func (m *Manager) recoverOne(ctx context.Context, r *surfaceRunner, job *store.J
 	// Without the input document the upstream call cannot be repeated. That happens when the
 	// crash landed between storing the result and committing the row, or when a previous attempt
 	// already consumed it.
-	if _, _, err := m.store.Blob.Open(job.ID, store.KindInput); err != nil {
+	if !m.store.Blob.Exists(job.ID, store.KindInput) {
 		log.Warn("orphaned job has no input document; failing it")
 		m.failJob(ctx, r, job.ID, azerr.Internal(r.analyzer.Surface(),
 			"The analysis was interrupted and could not be resumed."), 0, 0)
@@ -127,6 +140,10 @@ func (m *Manager) sweepOnce(ctx context.Context) {
 	if n, err := m.store.Blob.SweepTemp(int64(time.Hour/time.Second), now.Unix()); err == nil && n > 0 {
 		m.log.Info("removed orphaned temporary files", "count", n)
 	}
+
+	// Catch workers that died while this process kept running. The boot pass cannot cover these
+	// because their leases were still valid when it ran.
+	m.recover(ctx, false)
 
 	m.evictUnderPressure(ctx)
 }

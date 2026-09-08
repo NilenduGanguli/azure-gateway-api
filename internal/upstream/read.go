@@ -2,7 +2,6 @@ package upstream
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -72,8 +71,7 @@ func (c *ReadClient) Analyze(ctx context.Context, doc Document, req Request) (*R
 	}
 	resp, err := ac.http.Do(hreq)
 	if err != nil {
-		return nil, azerr.Internal(azerr.SurfaceRead,
-			fmt.Sprintf("The computer-vision-read container is unreachable: %v", err))
+		return nil, c.unreachable(ctx, err)
 	}
 
 	switch resp.StatusCode {
@@ -155,8 +153,7 @@ func (c *ReadClient) analyzeAsync(ctx context.Context, ac *affinityClient, doc D
 	}
 	resp, err := ac.http.Do(hreq)
 	if err != nil {
-		return nil, azerr.Internal(azerr.SurfaceRead,
-			fmt.Sprintf("The computer-vision-read container is unreachable: %v", err))
+		return nil, c.unreachable(ctx, err)
 	}
 	if resp.StatusCode != http.StatusAccepted {
 		return nil, c.readErrorBody(resp)

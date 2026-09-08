@@ -81,3 +81,52 @@ func TestIsObject(t *testing.T) {
 		}
 	}
 }
+
+// TestValueRangeSurvivesLongSeparatorWhitespace is a regression test.
+//
+// The separator scan once used a fixed 64-byte lookahead. JSON permits unlimited whitespace
+// between a member name and its value, so a pretty-printed response with more than that produced
+// a range still containing the colon — and the envelope composed around it was invalid JSON that
+// no client could parse.
+func TestValueRangeSurvivesLongSeparatorWhitespace(t *testing.T) {
+	for _, ws := range []int{0, 1, 63, 64, 65, 100, 2000} {
+		pad := strings.Repeat(" ", ws)
+		for _, doc := range []string{
+			`{"analyzeResult"` + pad + `:{"a":1}}`, // whitespace before the colon
+			`{"analyzeResult":` + pad + `{"a":1}}`, // whitespace after the colon
+			`{"analyzeResult"` + pad + `:` + pad + `{"a":1}}`,
+		} {
+			start, end, found, err := ValueRange(strings.NewReader(doc), int64(len(doc)), "analyzeResult")
+			if err != nil || !found {
+				t.Fatalf("ws=%d: found=%v err=%v", ws, found, err)
+			}
+			got := doc[start:end]
+			if got != `{"a":1}` {
+				t.Errorf("ws=%d: extracted %q, want %q", ws, got, `{"a":1}`)
+			}
+			// The composed envelope is what a client actually receives.
+			composed := `{"status":"succeeded","analyzeResult":` + got + `}`
+			if !json.Valid([]byte(composed)) {
+				t.Errorf("ws=%d: composed envelope is not valid JSON: %q", ws, composed)
+			}
+		}
+	}
+}
+
+// TestValueRangeIgnoresNestedAndQuotedOccurrences checks that only a genuine top-level member
+// matches, not the same name nested inside an earlier value or appearing inside a string.
+func TestValueRangeIgnoresNestedAndQuotedOccurrences(t *testing.T) {
+	for _, doc := range []string{
+		`{"a":{"analyzeResult":"NESTED"},"analyzeResult":{"real":1}}`,
+		`{"a":"\"analyzeResult\":{}","analyzeResult":{"real":1}}`,
+		`{"a":[{"analyzeResult":0}],"analyzeResult":{"real":1}}`,
+	} {
+		start, end, found, err := ValueRange(strings.NewReader(doc), int64(len(doc)), "analyzeResult")
+		if err != nil || !found {
+			t.Fatalf("found=%v err=%v for %s", found, err, doc)
+		}
+		if got := doc[start:end]; got != `{"real":1}` {
+			t.Errorf("extracted %q from %s, want the top-level member", got, doc)
+		}
+	}
+}

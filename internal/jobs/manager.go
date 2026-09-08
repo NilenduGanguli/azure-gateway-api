@@ -134,7 +134,7 @@ func (m *Manager) Start(ctx context.Context) {
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
-		m.recover(ctx)
+		m.recover(ctx, true)
 	}()
 
 	m.wg.Add(1)
@@ -142,6 +142,32 @@ func (m *Manager) Start(ctx context.Context) {
 		defer m.wg.Done()
 		m.sweep(ctx)
 	}()
+}
+
+// Drain waits for in-flight jobs to finish on their own, up to ctx's deadline.
+//
+// It is the difference between a rolling restart that finishes its work and one that abandons it:
+// every job still running when Stop cancels has to be redone from its stored input on the next
+// boot, and until then its client sees a status that is not advancing.
+func (m *Manager) Drain(ctx context.Context) {
+	t := time.NewTicker(100 * time.Millisecond)
+	defer t.Stop()
+	for {
+		var inFlight int
+		for _, r := range m.runners {
+			inFlight += len(r.admits)
+		}
+		if inFlight == 0 {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			m.log.Warn("shutdown grace expired with jobs still running; "+
+				"they will be reclaimed on the next start", "inFlight", inFlight)
+			return
+		case <-t.C:
+		}
+	}
 }
 
 // Stop cancels the workers and waits for in-flight jobs to finish or abort.
@@ -274,14 +300,16 @@ func (m *Manager) run(ctx context.Context, r *surfaceRunner, owner, id string) {
 		RequireOperation: wantsArtifacts(query),
 	})
 	if err != nil {
+		// Cancellation is checked first and on the context itself, not on the error. During
+		// shutdown the upstream client may already have wrapped the cancellation in a
+		// surface-shaped error, and classifying on the error alone would mark a job terminally
+		// failed that the recovery pass could have resumed — after its 202 was already sent.
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			log.Info("job interrupted by shutdown; it will be recovered on the next start")
+			return
+		}
 		apiErr, ok := azerr.AsAPIError(err)
 		if !ok {
-			if errors.Is(err, context.Canceled) {
-				// Shutting down. Leave the job for the recovery pass rather than failing a job
-				// the client is still entitled to.
-				log.Info("job interrupted by shutdown; will be recovered")
-				return
-			}
 			apiErr = azerr.Internal(r.analyzer.Surface(), err.Error())
 		}
 		log.Warn("analysis failed", "code", apiErr.Code, "message", apiErr.Message)
@@ -290,7 +318,7 @@ func (m *Manager) run(ctx context.Context, r *surfaceRunner, owner, id string) {
 	}
 	defer res.Cleanup()
 
-	if err := m.finish(context.WithoutCancel(ctx), r, job, res); err != nil {
+	if err := m.finish(ctx, r, job, res); err != nil {
 		log.Error("could not persist result", "error", err)
 		m.failJob(context.WithoutCancel(ctx), r, id,
 			azerr.Internal(r.analyzer.Surface(), "The result could not be stored."), 0, res.UpstreamMS)
@@ -305,7 +333,12 @@ func (m *Manager) run(ctx context.Context, r *surfaceRunner, owner, id string) {
 // Writing the final bytes now, rather than assembling them per poll, means a successful poll is a
 // plain file stream with an exact Content-Length: no re-serialisation, and no parsing of a result
 // that Azure allows to reach 500 MB.
+// ctx is the live worker context, used only to notice shutdown. The store writes below run under
+// a derived uncancellable context: the analysis is already done, and losing it to a signal would
+// mean paying the container to redo it.
 func (m *Manager) finish(ctx context.Context, r *surfaceRunner, job *store.Job, res *upstream.Result) error {
+	storeCtx := context.WithoutCancel(ctx)
+
 	src, err := os.Open(res.Path)
 	if err != nil {
 		return fmt.Errorf("jobs: reopen upstream result: %w", err)
@@ -339,9 +372,9 @@ func (m *Manager) finish(ctx context.Context, r *surfaceRunner, job *store.Job, 
 		return err
 	}
 
-	hasPDF, figures := m.fetchArtifacts(ctx, r, job, res)
+	hasPDF, figures := m.fetchArtifacts(ctx, storeCtx, r, job, res)
 
-	if err := m.store.Succeed(ctx, job.ID, m.store.Blob.Path(job.ID, store.KindResult), size,
+	if err := m.store.Succeed(storeCtx, job.ID, m.store.Blob.Path(job.ID, store.KindResult), size,
 		res.Mode, res.UpstreamMS, hasPDF, strings.Join(figures, ","), now); err != nil {
 		return err
 	}
@@ -353,11 +386,18 @@ func (m *Manager) finish(ctx context.Context, r *surfaceRunner, job *store.Job, 
 // fetchArtifacts eagerly retrieves result files the client asked for.
 //
 // They must be fetched now: the result-file endpoints are addressed by the container's own
-// operation id, whose lifetime is governed by the container's StorageTimeToLiveInMinutes and
-// whose owning replica may disappear at any time. Failures are logged, not fatal — the analysis
-// itself succeeded, and an artifact the client never requests should not fail the job.
-func (m *Manager) fetchArtifacts(ctx context.Context, r *surfaceRunner, job *store.Job,
-	res *upstream.Result) (hasPDF bool, figures []string) {
+// operation id, whose lifetime is governed by the container's StorageTimeToLiveInMinutes and whose
+// owning replica may disappear at any time.
+//
+// The phase is bounded twice over, because an artifact is a bonus and the analysis it belongs to
+// is already stored. It gets one aggregate budget, so a wedged container cannot turn N figures
+// into N times the per-request timeout; and it stops between artifacts once the worker context is
+// cancelled, so a shutdown is never held up by work no client is waiting on. A missing artifact
+// yields a clean 404 from the gateway, which is a far better outcome than a SIGKILLed pod.
+//
+// liveCtx observes shutdown; storeCtx survives it, for the writes that must land.
+func (m *Manager) fetchArtifacts(liveCtx, storeCtx context.Context, r *surfaceRunner,
+	job *store.Job, res *upstream.Result) (hasPDF bool, figures []string) {
 
 	di, ok := r.analyzer.(*upstream.DIClient)
 	if !ok || res.UpstreamOpID == "" {
@@ -370,12 +410,38 @@ func (m *Manager) fetchArtifacts(ctx context.Context, r *surfaceRunner, job *sto
 	}
 	log := m.log.With("job", job.ID)
 
+	budget := m.cfg.ArtifactFetchTimeout
+	if budget <= 0 {
+		budget = 2 * time.Minute
+	}
+	actx, cancel := context.WithTimeout(storeCtx, budget)
+	defer cancel()
+
+	// abort reports whether to stop fetching, and says why once.
+	var aborted bool
+	abort := func(what string) bool {
+		if aborted {
+			return true
+		}
+		switch {
+		case liveCtx.Err() != nil:
+			log.Warn("shutting down; skipping remaining result files", "pending", what)
+		case actx.Err() != nil:
+			log.Warn("result-file budget exhausted; skipping the rest",
+				"budget", budget.String(), "pending", what)
+		default:
+			return false
+		}
+		aborted = true
+		return true
+	}
+
 	if outputs["pdf"] {
-		path, _, _, err := di.FetchArtifact(ctx, job.ModelID, res.UpstreamOpID, "/pdf", query)
-		if err != nil {
-			log.Warn("could not fetch searchable pdf", "error", err)
-		} else {
-			if err := m.moveInto(path, job.ID, store.KindPDF); err != nil {
+		if !abort("pdf") {
+			path, _, _, err := di.FetchArtifact(actx, job.ModelID, res.UpstreamOpID, "/pdf", query)
+			if err != nil {
+				log.Warn("could not fetch searchable pdf", "error", err)
+			} else if err := m.moveInto(path, job.ID, store.KindPDF); err != nil {
 				log.Warn("could not store searchable pdf", "error", err)
 			} else {
 				hasPDF = true
@@ -385,7 +451,10 @@ func (m *Manager) fetchArtifacts(ctx context.Context, r *surfaceRunner, job *sto
 
 	if outputs["figures"] {
 		for _, figID := range figureIDs(res, log) {
-			path, _, _, err := di.FetchArtifact(ctx, job.ModelID, res.UpstreamOpID,
+			if abort("figure " + figID) {
+				break
+			}
+			path, _, _, err := di.FetchArtifact(actx, job.ModelID, res.UpstreamOpID,
 				"/figures/"+url.PathEscape(figID), query)
 			if err != nil {
 				log.Warn("could not fetch figure", "figure", figID, "error", err)

@@ -92,51 +92,57 @@ func skipValue(dec *json.Decoder) (int64, error) {
 	return dec.InputOffset(), nil
 }
 
-// TrimValueStart advances start past the colon and whitespace separating a member name from its
-// value, given the raw bytes at that offset.
+// skipSeparator advances past the colon and whitespace between a member name and its value.
 //
-// MemberRange returns the offset just past the member name, which is the cheapest position for
-// the tokenizer to report. Callers that want the value's own first byte pass the leading bytes of
-// the range here.
-func TrimValueStart(lead []byte) int64 {
-	var i int
-	for i < len(lead) {
-		switch lead[i] {
-		case ' ', '\t', '\r', '\n', ':':
-			i++
-			continue
+// JSON permits unlimited whitespace there, so this scans rather than assuming a bound. An earlier
+// version used a fixed 64-byte lookahead, which silently produced a byte range that still began
+// with the colon whenever a pretty-printer had left more whitespace than that — and the composed
+// envelope was then invalid JSON.
+func skipSeparator(ra io.ReaderAt, from, limit int64) (int64, error) {
+	const chunk = 512
+	buf := make([]byte, chunk)
+	off := from
+	for off < limit {
+		n := limit - off
+		if n > chunk {
+			n = chunk
 		}
-		break
+		read, err := ra.ReadAt(buf[:n], off)
+		for i := 0; i < read; i++ {
+			switch buf[i] {
+			case ' ', '\t', '\r', '\n', ':':
+				continue
+			}
+			return off + int64(i), nil
+		}
+		if read == 0 {
+			if err != nil && !errors.Is(err, io.EOF) {
+				return 0, fmt.Errorf("jsonx: read value separator: %w", err)
+			}
+			break
+		}
+		off += int64(read)
 	}
-	return int64(i)
+	return 0, errors.New("jsonx: member value is empty after its separator")
 }
 
-// ValueRange combines MemberRange with TrimValueStart, returning the exact byte range of a
-// member's value in ra.
+// ValueRange returns the exact byte range of a member's value in ra.
 //
 // It is the form callers actually want: the result can be handed straight to io.NewSectionReader.
+//
+// When a member name appears more than once, the first occurrence wins. These containers do not
+// emit duplicate keys, and scanning for a later one would mean walking the whole document even
+// after the value has been found.
 func ValueRange(ra io.ReaderAt, size int64, key string) (start, end int64, found bool, err error) {
 	start, end, found, err = MemberRange(io.NewSectionReader(ra, 0, size), key)
 	if err != nil || !found {
 		return 0, 0, found, err
 	}
-
-	// The gap between the member name and its value is a colon plus whitespace; a short read is
-	// enough to skip it.
-	const lookahead = 64
-	n := end - start
-	if n > lookahead {
-		n = lookahead
+	valueStart, err := skipSeparator(ra, start, end)
+	if err != nil {
+		return 0, 0, false, err
 	}
-	lead := make([]byte, n)
-	if _, err := ra.ReadAt(lead, start); err != nil && !errors.Is(err, io.EOF) {
-		return 0, 0, false, fmt.Errorf("jsonx: read value lead: %w", err)
-	}
-	start += TrimValueStart(lead)
-	if start > end {
-		return 0, 0, false, errors.New("jsonx: value range is empty after trimming separator")
-	}
-	return start, end, true, nil
+	return valueStart, end, true, nil
 }
 
 // IsObject reports whether the first non-whitespace byte of lead opens a JSON object. It is used

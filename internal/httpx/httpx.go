@@ -176,13 +176,23 @@ func SetRetryAfter(w http.ResponseWriter, seconds int) {
 }
 
 // BaseURLResolver derives the externally visible base URL for Operation-Location.
+//
+// This is security-relevant, not just cosmetic. The value becomes the host a client's SDK polls,
+// so anything that can influence it can redirect a caller's follow-up requests — and with them the
+// operation id — somewhere else. Precedence is therefore: an explicitly configured base wins;
+// otherwise a forwarded host is honoured only when forwarding is trusted, the value is a
+// well-formed bare authority, and it passes any configured allowlist; otherwise the request's own
+// Host header.
 type BaseURLResolver struct {
-	// Configured, when set, overrides everything. It is the only reliable option behind a proxy
-	// that does not set forwarded headers.
+	// Configured is PUBLIC_BASE_URL. When set it overrides everything, and it is the only option
+	// that is correct behind a proxy which rewrites Host without setting forwarded headers.
 	Configured string
-	// TrustForwarded enables X-Forwarded-Proto and X-Forwarded-Host. Leave it off when the
-	// gateway is directly exposed, so a client cannot point its own poll URL somewhere else.
+	// TrustForwarded enables X-Forwarded-Proto and X-Forwarded-Host. It defaults off: with it on
+	// and no allowlist, a caller can name its own poll host.
 	TrustForwarded bool
+	// AllowedHosts, when non-empty, is the set of authorities a forwarded header may name.
+	// Comparison is case-insensitive on the host, and a value without a port matches any port.
+	AllowedHosts []string
 }
 
 // Resolve returns the scheme and authority to advertise, without a trailing slash.
@@ -197,20 +207,76 @@ func (b BaseURLResolver) Resolve(r *http.Request) string {
 	host := r.Host
 
 	if b.TrustForwarded {
-		if v := firstForwarded(r.Header.Get("X-Forwarded-Proto")); v != "" {
+		if v := firstForwarded(r.Header.Get("X-Forwarded-Proto")); v == "http" || v == "https" {
 			scheme = v
 		}
-		if v := firstForwarded(r.Header.Get("X-Forwarded-Host")); v != "" {
+		if v := firstForwarded(r.Header.Get("X-Forwarded-Host")); validAuthority(v) && b.hostAllowed(v) {
 			host = v
 		}
 	}
-	if host == "" {
-		// Nothing to advertise. A relative Operation-Location makes Python join it onto its own
-		// endpoint and produce a doubled path, so an empty authority is never emitted; the caller
-		// treats this as a configuration error.
+	if !validAuthority(host) {
+		// Nothing safe to advertise. A relative Operation-Location makes Python join it onto its
+		// own endpoint and produce a doubled path, so an empty authority is never emitted; the
+		// caller treats this as a configuration error.
 		return ""
 	}
 	return scheme + "://" + host
+}
+
+// hostAllowed applies the optional allowlist. An empty list allows anything that parses, which is
+// why Warnings tells an operator to set PUBLIC_BASE_URL or an allowlist when forwarding is trusted.
+func (b BaseURLResolver) hostAllowed(host string) bool {
+	if len(b.AllowedHosts) == 0 {
+		return true
+	}
+	h, _, hasPort := strings.Cut(host, ":")
+	for _, allowed := range b.AllowedHosts {
+		if strings.EqualFold(allowed, host) {
+			return true
+		}
+		// An allowlist entry with no port matches the same host on any port.
+		if !strings.Contains(allowed, ":") && hasPort && strings.EqualFold(allowed, h) {
+			return true
+		}
+	}
+	return false
+}
+
+// validAuthority reports whether s is a bare host or host:port.
+//
+// A forwarded value carrying a path, query or fragment does more than pick the wrong host: it
+// shifts the path segments of Operation-Location, and Azure.AI.FormRecognizer 4.x locates the
+// model and result ids by counting segments backwards from the end.
+func validAuthority(s string) bool {
+	if s == "" || len(s) > 255 {
+		return false
+	}
+	if strings.ContainsAny(s, "/?#@\\ \t\r\n\"'<>") {
+		return false
+	}
+	host, port, hasPort := strings.Cut(s, ":")
+	if host == "" {
+		return false
+	}
+	if hasPort {
+		if port == "" || len(port) > 5 {
+			return false
+		}
+		for i := 0; i < len(port); i++ {
+			if port[i] < '0' || port[i] > '9' {
+				return false
+			}
+		}
+	}
+	for i := 0; i < len(host); i++ {
+		c := host[i]
+		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+			c == '.' || c == '-' || c == '_' || c == '[' || c == ']' || c == ':'
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // firstForwarded takes the client-most value from a comma-separated forwarded header.

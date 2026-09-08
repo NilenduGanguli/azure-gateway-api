@@ -338,12 +338,39 @@ func (s *Store) Requeue(ctx context.Context, id string, now time.Time) error {
 	return err
 }
 
-// Orphaned returns jobs that were accepted but are not progressing: notStarted jobs left by a
-// previous process, and running jobs whose lease has expired because the worker died.
+// Orphaned returns jobs that stopped progressing while this process was running: notStarted jobs
+// that were never picked up, and running jobs whose lease expired because their worker died.
+//
+// The lease filter is what makes this safe to run periodically — it will not reclaim a job that
+// another worker in this process is still heartbeating. TTL-expired jobs are excluded for the same
+// reason as in Abandoned.
 func (s *Store) Orphaned(ctx context.Context, now time.Time, limit int) ([]*Job, error) {
 	rows, err := s.r.QueryContext(ctx, `
 		SELECT `+jobColumns+` FROM jobs
-		WHERE (status = ?) OR (status = ? AND lease_until < ?)
+		WHERE ((status = ?) OR (status = ? AND lease_until < ?)) AND expires_at >= ?
+		ORDER BY created_at ASC LIMIT ?`,
+		string(StatusNotStarted), string(StatusRunning), now.Unix(), now.Unix(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	return collectJobs(rows)
+}
+
+// Abandoned returns every job left unfinished by a previous process, ignoring leases entirely.
+//
+// It is only correct at startup, and only because the gateway is single-pod by design: a process
+// that has just booted holds no leases, so any row still marked running was abandoned by whatever
+// died. Applying the lease filter here was a real bug — a crash leaves lease_until minutes in the
+// future, so the boot pass skipped exactly the jobs it existed to rescue and their clients polled
+// a running status forever.
+// Jobs past their TTL are excluded: their results are unfetchable by definition, so re-running
+// them would spend container capacity — and Azure billing — producing output no client can ever
+// read. That matters most after a long outage, when every stored job has expired at once.
+func (s *Store) Abandoned(ctx context.Context, now time.Time, limit int) ([]*Job, error) {
+	rows, err := s.r.QueryContext(ctx, `
+		SELECT `+jobColumns+` FROM jobs
+		WHERE status IN (?, ?) AND expires_at >= ?
 		ORDER BY created_at ASC LIMIT ?`,
 		string(StatusNotStarted), string(StatusRunning), now.Unix(), limit)
 	if err != nil {

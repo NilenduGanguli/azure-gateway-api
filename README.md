@@ -110,8 +110,9 @@ disk and no secret is ever logged.
 | Variable | Default | Purpose |
 |---|---|---|
 | `GATEWAY_ADDR` | `:8080` | Listen address |
-| `PUBLIC_BASE_URL` | *(derived)* | Overrides scheme and authority in `Operation-Location`. Set it when behind a proxy that does not set forwarded headers |
-| `TRUST_FORWARDED_HEADERS` | `true` | Honour `X-Forwarded-Proto` / `X-Forwarded-Host`. Turn **off** if the gateway is directly exposed |
+| `PUBLIC_BASE_URL` | *(derived)* | Scheme and authority for `Operation-Location`, no path. **The recommended setting** — it is the only option that is correct behind any proxy topology, and it removes the question of which headers to trust |
+| `TRUST_FORWARDED_HEADERS` | `false` | Honour `X-Forwarded-Proto` / `X-Forwarded-Host`. Off by default: with it on and no allowlist, a caller can set `X-Forwarded-Host` and have its `Operation-Location` point anywhere. Behind an OpenShift Route the request's own `Host` is already correct |
+| `TRUSTED_FORWARDED_HOSTS` | | Comma-separated authorities a forwarded header may name. An entry without a port matches that host on any port |
 | `DATA_DIR` | `/data` | The PVC mount |
 | `ALLOW_NETWORK_FS` | `false` | Permit a network filesystem, where SQLite's WAL mode is unsafe |
 | `DI_UPSTREAM_URL` | *(required)* | Document Intelligence container root |
@@ -127,6 +128,7 @@ disk and no secret is ever logged.
 | `QUEUE_DEPTH` | `0` | Admitted jobs allowed to wait. `0` means 429 as soon as every worker is busy |
 | `RESULT_TTL` | `24h` | How long a result stays fetchable, matching Azure |
 | `GC_INTERVAL` | `5m` | Sweeper period |
+| `ARTIFACT_FETCH_TIMEOUT` | `2m` | Aggregate budget for one job's result files. Bounds a wedged container so it cannot outlast the shutdown grace |
 | `DISK_HIGH_WATERMARK` | `0.90` | Fraction of the volume above which completed results are evicted |
 | `MAX_REQUEST_BYTES` | `524288000` | 500 MB, the Document Intelligence S0 ceiling |
 | `POLL_RETRY_AFTER` | `1` | Integer seconds on the 202 and in-progress polls |

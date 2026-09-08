@@ -173,6 +173,15 @@ func (b *BlobStore) Open(id string, k Kind) (*os.File, int64, error) {
 	return f, fi.Size(), nil
 }
 
+// Exists reports whether an artifact is present, without leaving a descriptor open.
+//
+// Callers that only need presence must use this rather than Open: Open hands back a live *os.File,
+// and discarding it leaks a descriptor per call.
+func (b *BlobStore) Exists(id string, k Kind) bool {
+	fi, err := os.Stat(b.Path(id, k))
+	return err == nil && !fi.IsDir()
+}
+
 // WriteAll stores a complete in-memory artifact atomically.
 func (b *BlobStore) WriteAll(id string, k Kind, data []byte) error {
 	w, err := b.Create(id, k, 0)

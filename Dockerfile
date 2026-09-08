@@ -2,7 +2,7 @@
 
 # Build stage. CGO is off because the SQLite driver is pure Go (modernc.org/sqlite), which is why
 # the runtime image can be distroless static rather than a full libc base.
-FROM golang:1.23-bookworm AS build
+FROM golang:1.26-bookworm AS build
 
 WORKDIR /src
 
@@ -26,7 +26,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
       -X main.built=${BUILT}" \
     -o /out/gateway ./cmd/gateway
 
-RUN CGO_ENABLED=0 go test ./... > /dev/null
+RUN CGO_ENABLED=0 go test ./...
 
 # Runtime stage.
 FROM gcr.io/distroless/static-debian12:nonroot
