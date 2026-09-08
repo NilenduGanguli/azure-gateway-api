@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/url"
 	"os"
 	"strings"
@@ -382,6 +383,7 @@ func (m *Manager) run(ctx context.Context, r *surfaceRunner, owner, id string) {
 	res, err := r.analyzer.Analyze(ctx, doc, upstream.Request{
 		ModelID:          job.ModelID,
 		Query:            query,
+		Prefix:           job.Prefix,
 		RequireOperation: wantsArtifacts(query),
 	})
 	if err != nil {
@@ -533,13 +535,23 @@ func (m *Manager) fetchArtifacts(liveCtx, storeCtx context.Context, r *surfaceRu
 
 	if outputs["pdf"] {
 		if !abort("pdf") {
-			path, _, _, err := di.FetchArtifact(actx, job.ModelID, res.UpstreamOpID, "/pdf", query)
-			if err != nil {
+			path, _, ct, err := di.FetchArtifact(actx, job.ModelID, res.UpstreamOpID, "/pdf", query)
+			switch {
+			case err != nil:
 				log.Warn("could not fetch searchable pdf", "error", err)
-			} else if err := m.moveInto(path, job.ID, store.KindPDF); err != nil {
-				log.Warn("could not store searchable pdf", "error", err)
-			} else {
-				hasPDF = true
+			case !isPDF(ct):
+				// A probed container answers this route 200 with application/json. Storing that
+				// as a PDF would serve a client a file that is not one, with the wrong
+				// Content-Type, and look like a successful capture.
+				log.Warn("result-file endpoint did not return a pdf; not storing it",
+					"contentType", ct)
+				_ = os.Remove(path)
+			default:
+				if err := m.moveInto(path, job.ID, store.KindPDF); err != nil {
+					log.Warn("could not store searchable pdf", "error", err)
+				} else {
+					hasPDF = true
+				}
 			}
 		}
 	}
@@ -677,4 +689,13 @@ func (m *Manager) startHeartbeat(ctx context.Context, id string) func() {
 		}
 	}()
 	return func() { close(done) }
+}
+
+// isPDF reports whether a Content-Type actually denotes a PDF.
+func isPDF(contentType string) bool {
+	ct, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return false
+	}
+	return ct == "application/pdf"
 }

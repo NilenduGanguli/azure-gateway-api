@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NilenduGanguli/azure-gateway-api/internal/azerr"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/config"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/ids"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/mockazure"
@@ -152,59 +153,79 @@ func TestNoRetryAfterOnNonRetriableErrors(t *testing.T) {
 	}
 }
 
-// TestDIUnknownResultReturnsWrappedError checks the Document Intelligence error shape.
-func TestDIUnknownResultReturnsWrappedError(t *testing.T) {
+// TestUnknownIDMatchesTheContainersNotTheSpec checks the error shapes a probe found real
+// containers emitting, which are not the ones their published contracts describe.
+//
+// Document Intelligence wraps every error except this one, which comes back flat — the divergence
+// Microsoft has acknowledged. Computer Vision Read wraps everything, including the errors its own
+// Ocr.json models as flat. The gateway reproduces both, because a client being unable to tell the
+// gateway from the container is the entire product.
+func TestUnknownIDMatchesTheContainersNotTheSpec(t *testing.T) {
 	h := newHarness(t, harnessOpts{})
-	resp := h.get("/documentintelligence/documentModels/prebuilt-layout/analyzeResults/" +
-		"00000000-0000-4000-8000-000000000000?api-version=" + apiVersion)
-	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("got %d, want 404", resp.StatusCode)
-	}
-	var body struct {
-		Error *struct {
-			Code       string `json:"code"`
-			Message    string `json:"message"`
-			InnerError *struct {
-				Code string `json:"code"`
-			} `json:"innererror"`
-		} `json:"error"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if body.Error == nil {
-		t.Fatal("Document Intelligence errors must be wrapped in an \"error\" object")
-	}
-	if body.Error.Code != "NotFound" {
-		t.Errorf("code is %q, want NotFound", body.Error.Code)
-	}
-	if body.Error.InnerError == nil || body.Error.InnerError.Code != "OperationNotFound" {
-		t.Errorf("innererror.code is missing or wrong: %+v", body.Error.InnerError)
-	}
+	t.Run("document intelligence is flat here", func(t *testing.T) {
+		resp := h.get("/documentintelligence/documentModels/prebuilt-layout/analyzeResults/" +
+			"00000000-0000-4000-8000-000000000000?api-version=" + apiVersion)
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("got %d, want 404", resp.StatusCode)
+		}
+		body := decode(t, resp)
+		if _, wrapped := body["error"]; wrapped {
+			t.Error("wrapped; the container returns this one error flat")
+		}
+		if body["code"] != "NotFound" {
+			t.Errorf("code is %v, want NotFound", body["code"])
+		}
+		if body["message"] != "Analyze result does not exist." {
+			t.Errorf("message is %q, want the container's own wording", body["message"])
+		}
+	})
+
+	t.Run("read is wrapped", func(t *testing.T) {
+		resp := h.get("/vision/v3.2/read/analyzeResults/00000000-0000-4000-8000-000000000000")
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("got %d, want 404", resp.StatusCode)
+		}
+		body := decode(t, resp)
+		inner, wrapped := body["error"].(map[string]any)
+		if !wrapped {
+			t.Fatalf("flat; the container wraps every Read error. got %v", body)
+		}
+		// The Read enum contains no not-found code at all; the container answers BadArgument.
+		if inner["code"] != "BadArgument" {
+			t.Errorf("code is %v, want BadArgument", inner["code"])
+		}
+	})
 }
 
-// TestReadUnknownOperationReturnsFlatError checks that Read uses the *other* shape. Read's routes
-// are defined in Ocr.json and use the flat ComputerVisionOcrError, unlike every other Computer
-// Vision operation; writing the gateway from the wrong swagger inverts this.
-func TestReadUnknownOperationReturnsFlatError(t *testing.T) {
-	h := newHarness(t, harnessOpts{})
-	resp := h.get("/vision/v3.2/read/analyzeResults/00000000-0000-4000-8000-000000000000")
-	defer func() { _ = resp.Body.Close() }()
+// TestDocumentedCompatRestoresTheSpecShapes covers ERROR_COMPAT=documented, for a client written
+// against the published SDK models rather than against these containers.
+func TestDocumentedCompatRestoresTheSpecShapes(t *testing.T) {
+	azerr.SetCompat(azerr.CompatDocumented)
+	t.Cleanup(func() { azerr.SetCompat(azerr.CompatObserved) })
 
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("got %d, want 404", resp.StatusCode)
+	h := newHarness(t, harnessOpts{})
+
+	resp := h.get("/documentintelligence/documentModels/prebuilt-layout/analyzeResults/" +
+		"00000000-0000-4000-8000-000000000000?api-version=" + apiVersion)
+	di := decode(t, resp)
+	_ = resp.Body.Close()
+	if _, wrapped := di["error"]; !wrapped {
+		t.Errorf("documented mode must wrap Document Intelligence errors, got %v", di)
 	}
-	var body map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("decode: %v", err)
+
+	resp = h.get("/vision/v3.2/read/analyzeResults/00000000-0000-4000-8000-000000000000")
+	rd := decode(t, resp)
+	_ = resp.Body.Close()
+	if _, wrapped := rd["error"]; wrapped {
+		t.Errorf("documented mode must leave Read errors flat, got %v", rd)
 	}
-	if _, wrapped := body["error"]; wrapped {
-		t.Error("Read errors must be flat, with no \"error\" envelope")
-	}
-	if body["code"] == nil || body["message"] == nil {
-		t.Errorf("Read error must carry code and message at the top level, got %v", body)
+	if rd["code"] == nil {
+		t.Errorf("documented Read error needs a top-level code, got %v", rd)
 	}
 }
 

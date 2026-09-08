@@ -1,16 +1,16 @@
-// Package azerr reproduces the two *different* error contracts of the upstream Azure
-// containers.
+// Package azerr reproduces the error contracts of the upstream Azure containers.
 //
-// Document Intelligence wraps: {"error":{"code","message","target","details","innererror"}}
-// Computer Vision Read is flat: {"code","message","requestId"}
+// Two shapes exist. Wrapped is {"error":{"code","message","target","details","innererror"}};
+// flat is {"code","message","requestId"}.
 //
-// Read is the odd one out even within Computer Vision — every other v3.2 operation uses the
-// wrapped ComputerVisionErrorResponse from ComputerVision.json, but the Read routes are defined
-// in Ocr.json and use the flat ComputerVisionOcrError. Writing this package from the wrong
-// swagger file inverts the shape.
+// Which one applies is not what the published specifications say. Document Intelligence models
+// every error wrapped, and Computer Vision Read models its own as flat, because the Read routes
+// live in Ocr.json rather than ComputerVision.json. Probing real containers found both diverging
+// from that: Read wraps everything, and Document Intelligence wraps everything except an unknown
+// or expired result id, which it returns flat.
 //
-// Each surface's swagger declares exactly one `default` error response covering every non-2xx
-// status, so the shape is chosen per surface, never per status code.
+// So the shape is chosen per response, not per surface, and Compat decides whether to follow the
+// containers or their documentation. See Compat.
 package azerr
 
 import (
@@ -20,6 +20,44 @@ import (
 	"net/http"
 	"strconv"
 )
+
+// Compat selects whether errors are rendered the way the containers actually behave or the way
+// their published contracts describe.
+//
+// The two differ, and a probe against real containers settled which is which:
+//
+//	Document Intelligence wraps every error except an unknown or expired result id, which comes
+//	back flat as {"code":"NotFound","message":"Analyze result does not exist."} — the divergence
+//	Microsoft has acknowledged as "a valid difference between documentation and Service side".
+//
+//	Computer Vision Read wraps every error, including the ones its own Ocr.json models as flat.
+//	Four distinct cases were checked — unknown id, malformed id, bad readingOrder, unparseable
+//	image — and all four were wrapped.
+//
+// CompatObserved is the default because the gateway's whole purpose is that a client cannot tell
+// it from the container it fronts. CompatDocumented exists for a client written against the
+// published SDK models instead.
+type Compat int
+
+const (
+	// CompatObserved renders errors as the on-prem containers actually emit them.
+	CompatObserved Compat = iota
+	// CompatDocumented renders errors as the swagger definitions and generated SDK models describe.
+	CompatDocumented
+)
+
+var compat = CompatObserved
+
+// SetCompat selects the error rendering mode. It is set once at startup, before serving.
+func SetCompat(c Compat) { compat = c }
+
+// CompatMode reports the active mode, for the admin surface.
+func CompatMode() string {
+	if compat == CompatDocumented {
+		return "documented"
+	}
+	return "observed"
+}
 
 // Surface selects which wire contract an error is rendered in.
 type Surface int
@@ -193,6 +231,13 @@ type APIError struct {
 	Details    []Error
 	RequestID  string // Read only
 	RetryAfter int    // seconds; emitted only for retriable statuses. See WriteTo.
+
+	// flat forces the unwrapped shape regardless of surface. Only the Document Intelligence
+	// unknown-result-id response sets it, because that is the one place the container diverges
+	// from its own contract.
+	flat bool
+	// bare suppresses the body entirely, matching the container's response to an unrouted path.
+	bare bool
 }
 
 func (e *APIError) Error() string {
@@ -237,9 +282,19 @@ func retriable(status int) bool {
 	return false
 }
 
+// useFlat reports whether this error renders unwrapped.
+func (e *APIError) useFlat(s Surface) bool {
+	if compat == CompatDocumented {
+		// The published contracts: Read is flat, Document Intelligence is wrapped.
+		return s == SurfaceRead
+	}
+	// Observed: both containers wrap, except the one Document Intelligence case that does not.
+	return e.flat
+}
+
 // Body renders the error in the wire shape of the given surface.
 func (e *APIError) Body(s Surface) any {
-	if s == SurfaceRead {
+	if e.useFlat(s) {
 		return ReadError{Code: e.Code, Message: e.Message, RequestID: e.RequestID}
 	}
 	out := Response{Error: Error{
@@ -258,10 +313,20 @@ func (e *APIError) Body(s Surface) any {
 //
 // Retry-After is emitted only when both requested and safe for the status; see WithRetryAfter.
 func (e *APIError) WriteTo(w http.ResponseWriter, s Surface) {
+	if e.bare {
+		// An unrouted path. Both containers answer with a bodyless 404, and no SDK parses an
+		// unrouted response as operation state, so matching them costs nothing.
+		if e.RetryAfter > 0 && retriable(e.Status) {
+			w.Header().Set("Retry-After", strconv.Itoa(e.RetryAfter))
+		}
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(e.Status)
+		return
+	}
 	body, err := json.Marshal(e.Body(s))
 	if err != nil { // unreachable for these types, but never emit a bodyless error
 		body = []byte(`{"error":{"code":"InternalServerError","message":"An unexpected error occurred."}}`)
-		if s == SurfaceRead {
+		if e.useFlat(s) {
 			body = []byte(`{"code":"InternalServerError","message":"An unexpected error occurred."}`)
 		}
 	}
@@ -285,16 +350,27 @@ func (e *APIError) WriteTo(w http.ResponseWriter, s Surface) {
 //
 // It is never returned for a live id: a 404 on an in-flight poll kills Java clients with an
 // opaque NullPointerException and marks the operation terminally failed in .NET and JS.
+//
+// The two surfaces answer this differently on real containers, and both are reproduced verbatim.
+// Document Intelligence is the one place it drops its own wrapper; Read answers BadArgument
+// rather than any not-found code, which its enum does not contain.
 func NotFound(s Surface) *APIError {
 	if s == SurfaceRead {
 		return &APIError{
-			Status:  http.StatusNotFound,
-			Code:    ReadInvalidRequest,
-			Message: "Operation not found. The identifier is invalid or the operation is expired.",
+			Status: http.StatusNotFound,
+			Code:   ReadBadArgument,
+			Message: "Operation ID is invalid, expired or the results matching this operationId " +
+				"have been deleted.",
 		}
 	}
-	return New(http.StatusNotFound, CodeNotFound, "").
-		WithInner(InnerOperationNotFound, "")
+	e := New(http.StatusNotFound, CodeNotFound, "Analyze result does not exist.")
+	e.flat = true
+	return e
+}
+
+// Unrouted is the bodyless 404 both containers return for a path they do not serve.
+func Unrouted(s Surface) *APIError {
+	return &APIError{Status: http.StatusNotFound, Code: CodeNotFound, bare: true}
 }
 
 // ModelNotFound is returned for an unrecognised modelId on the DI surface.

@@ -38,7 +38,7 @@ func TestCancellationIsNotReportedAsAnUpstreamFailure(t *testing.T) {
 
 			client := NewDI(config.Upstream{
 				BaseURL: container.URL(), MaxInflight: 1, Timeout: time.Minute,
-			}, config.SyncAuto, 5, t.TempDir(), 1<<20)
+			}, config.SyncAuto, 5, t.TempDir(), 1<<20, time.Minute)
 
 			ctx, cancel := context.WithCancel(context.Background())
 			go func() {

@@ -71,6 +71,9 @@ type submitParams struct {
 	apiVersion  string
 	// upstreamQuery is what gets forwarded to the container.
 	upstreamQuery url.Values
+	// upstreamPrefix is the path family the caller arrived on, forwarded so the container sees
+	// the same one. The containers serve both /documentintelligence and /formrecognizer.
+	upstreamPrefix string
 	// operationLocation builds the client-facing poll URL for a new operation id.
 	operationLocation func(base, id string) string
 }
@@ -144,6 +147,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request, p submitParams) 
 		UpdatedAt:   now,
 		ExpiresAt:   now.Add(s.deps.Config.ResultTTL),
 		Query:       p.upstreamQuery.Encode(),
+		Prefix:      p.upstreamPrefix,
 		ContentType: r.Header.Get("Content-Type"),
 		InputPath:   s.deps.Store.Blob.Path(id, store.KindInput),
 		InputBytes:  written,

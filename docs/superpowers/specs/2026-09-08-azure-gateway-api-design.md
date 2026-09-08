@@ -40,9 +40,12 @@ synchronous whenever the container allows it.
 
 ## Non-goals
 
-`:analyzeBatch` (Azure-Blob-bound, unusable air-gapped) · `/formrecognizer` legacy aliases ·
-custom models and classifiers · client-facing authentication · Kubernetes/Helm manifests ·
-multi-replica gateway.
+`:analyzeBatch` (Azure-Blob-bound, unusable air-gapped) · custom models and classifiers ·
+client-facing authentication · Kubernetes/Helm manifests · multi-replica gateway.
+
+`/formrecognizer` aliases were originally a non-goal and are now served: a probe found the
+containers declaring that family alongside `/documentintelligence`, so clients on
+`azure-ai-formrecognizer` reach them today.
 
 The gateway is **single-pod by design**. Operation ids are pod-local by construction — that is
 precisely the property that makes a PVC the right store and a second gateway replica wrong.
@@ -491,3 +494,43 @@ Roughly 60% of statements overall, but that number is dominated by `cmd/gateway`
 `internal/probe`, which drive real I/O and are exercised by hand. The paths that carry the
 guarantees are well covered: `ids` 98%, `jsonx` 86%, `azerr` 80%, `store` 75%, `surface` 70%,
 `jobs` 70%.
+
+---
+
+## What probing a real deployment changed
+
+The design above was built from documentation and image forensics. Running
+`scripts/probe-containers.sh` against live containers corrected four things, and two of them were
+load-bearing.
+
+**The error shapes were backwards.** The published contracts say Document Intelligence wraps and
+Computer Vision Read is flat. Both containers disagree, in opposite directions:
+
+| Case | Container answered |
+|---|---|
+| DI unknown result id | **flat** `{"code":"NotFound","message":"Analyze result does not exist."}` |
+| DI bad api-version, unknown model, bad content | wrapped, with `innererror` |
+| Read unknown id, malformed id, bad readingOrder, bad image | **wrapped**, all four |
+| Either, unrouted path | bodyless 404 |
+
+So Document Intelligence drops its wrapper for exactly one response, and Read wraps everything.
+The gateway now reproduces that, with `ERROR_COMPAT=documented` to restore the published shapes for
+a client written against the SDK models instead.
+
+**`:syncAnalyze` can be declared and still never answer.** The probed build lists it in its own
+swagger and held the connection past five minutes on a blank 200×120 image. The attempt previously
+inherited `DI_UPSTREAM_TIMEOUT`, so in `auto` mode every job would have paid fifteen minutes before
+falling back to the route that works. It now has its own `DI_SYNC_PROBE_TIMEOUT`, default 60s, and
+the capability latches off after the first failure.
+
+**Two smaller corrections.** A failed Computer Vision Read operation carries its detail in
+`analyzeResult.errors[]` rather than a top-level `error`, so that detail is lifted out instead of
+replaced with a generic message. And `analyzeResults/{id}/pdf` answered `200` with
+`application/json`, so a fetched result file is now checked against its declared media type before
+being stored as a PDF.
+
+**One thing the probe could not settle.** That deployment's layout container left a blank
+200×120 PNG `running` after 90 seconds, which is far outside Microsoft's own benchmark of roughly
+one request per second on a 523 KB scanned letter. Whether `:syncAnalyze` is broken on that build
+or merely starved of the 8 cores and 16–24 GB the container wants is a resourcing question, not a
+gateway one.

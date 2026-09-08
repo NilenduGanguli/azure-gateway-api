@@ -143,6 +143,15 @@ func inspectOperation(path string, size int64, surface azerr.Surface) (*operatio
 				}
 			}
 		}
+		// Computer Vision Read puts its failure detail inside analyzeResult.errors rather than in a
+		// top-level error object — its schema models no error member for a failed operation at all.
+		// A probed container returns exactly that, so the detail is lifted out here instead of
+		// being discarded in favour of a generic message.
+		if view.Err == nil && view.HasResult {
+			if e := firstResultError(f, view.Start, view.End-view.Start); e != nil {
+				view.Err = e
+			}
+		}
 		if view.Err == nil {
 			view.Err = azerr.Internal(surface,
 				"The upstream container reported the analysis as failed.")
@@ -366,4 +375,34 @@ func min64(a, b int64) int64 {
 		return a
 	}
 	return b
+}
+
+// firstResultError lifts the first entry of analyzeResult.errors, which is where Computer Vision
+// Read reports why an analysis failed.
+func firstResultError(ra io.ReaderAt, start, size int64) *azerr.APIError {
+	section := io.NewSectionReader(ra, start, size)
+	errStart, errEnd, found, err := jsonx.ValueRange(section, size, "errors")
+	if err != nil || !found {
+		return nil
+	}
+	const maxErrorsBytes = 1 << 20
+	if errEnd-errStart > maxErrorsBytes {
+		return nil
+	}
+	raw := make([]byte, errEnd-errStart)
+	if _, rerr := section.ReadAt(raw, errStart); rerr != nil && !errors.Is(rerr, io.EOF) {
+		return nil
+	}
+	var list []struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(raw, &list) != nil || len(list) == 0 || list[0].Code == "" {
+		return nil
+	}
+	return &azerr.APIError{
+		Status:  http.StatusInternalServerError,
+		Code:    list[0].Code,
+		Message: list[0].Message,
+	}
 }

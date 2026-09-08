@@ -73,6 +73,9 @@ type Job struct {
 	UpStatus    int
 	UpstreamMS  int64
 	ClientReqID string
+	// Prefix is the path family the client used, so the upstream call and any later result-file
+	// fetch use the same one.
+	Prefix string
 	// HasPDF and Figures record which extra artifacts were persisted alongside the result.
 	HasPDF  bool
 	Figures string // comma-separated figure ids
@@ -104,7 +107,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   upstream_ms       INTEGER NOT NULL DEFAULT 0,
   client_request_id TEXT NOT NULL DEFAULT '',
   has_pdf           INTEGER NOT NULL DEFAULT 0,
-  figures           TEXT NOT NULL DEFAULT ''
+  figures           TEXT NOT NULL DEFAULT '',
+  prefix            TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS jobs_status  ON jobs(status, created_at);
 CREATE INDEX IF NOT EXISTS jobs_expiry  ON jobs(expires_at);
@@ -219,11 +223,11 @@ func (s *Store) Create(ctx context.Context, j *Job) error {
 	_, err := s.w.ExecContext(ctx, `
 		INSERT INTO jobs (id, surface, model_id, api_version, status, created_at, updated_at,
 		                  expires_at, request_query, content_type, input_path, input_bytes,
-		                  client_request_id)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		                  client_request_id, prefix)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		j.ID, j.Surface, j.ModelID, j.APIVersion, string(j.Status),
 		j.CreatedAt.Unix(), j.UpdatedAt.Unix(), j.ExpiresAt.Unix(),
-		j.Query, j.ContentType, j.InputPath, j.InputBytes, j.ClientReqID)
+		j.Query, j.ContentType, j.InputPath, j.InputBytes, j.ClientReqID, j.Prefix)
 	if err != nil {
 		return fmt.Errorf("store: create job: %w", err)
 	}
@@ -233,7 +237,7 @@ func (s *Store) Create(ctx context.Context, j *Job) error {
 const jobColumns = `id, surface, model_id, api_version, status, created_at, updated_at,
 	expires_at, request_query, content_type, input_path, input_bytes, result_path, result_bytes,
 	error_json, attempts, lease_owner, lease_until, upstream_mode, upstream_op_url,
-	upstream_status, upstream_ms, client_request_id, has_pdf, figures`
+	upstream_status, upstream_ms, client_request_id, has_pdf, figures, prefix`
 
 func scanJob(sc interface{ Scan(...any) error }) (*Job, error) {
 	var j Job
@@ -243,7 +247,7 @@ func scanJob(sc interface{ Scan(...any) error }) (*Job, error) {
 	err := sc.Scan(&j.ID, &j.Surface, &j.ModelID, &j.APIVersion, &status, &created, &updated,
 		&expires, &j.Query, &j.ContentType, &j.InputPath, &j.InputBytes, &j.ResultPath,
 		&j.ResultBytes, &j.ErrorJSON, &j.Attempts, &j.LeaseOwner, &lease, &mode, &j.UpstreamOp,
-		&j.UpStatus, &j.UpstreamMS, &j.ClientReqID, &hasPDF, &j.Figures)
+		&j.UpStatus, &j.UpstreamMS, &j.ClientReqID, &hasPDF, &j.Figures, &j.Prefix)
 	if err != nil {
 		return nil, err
 	}

@@ -128,9 +128,10 @@ func (c *DIClient) SyncAnalyze(ctx context.Context, req Request, contentType str
 	if req.ModelID == "" {
 		return nil, azerr.BadRequest(azerr.SurfaceDI, "A model id is required.")
 	}
-	path := DIPathPrefix + "/documentModels/" + escapeSegment(req.ModelID) + ":syncAnalyze"
+	fam := prefix(req.Prefix)
+	path := fam + "/documentModels/" + escapeSegment(req.ModelID) + ":syncAnalyze"
 	return c.syncAnalyze(ctx, path, cloneQuery(req.Query), contentType, body, contentLength,
-		func(opID string) string { return c.pollURL(req.ModelID, opID, req.Query) },
+		func(opID string) string { return c.pollURLIn(fam, req.ModelID, opID, req.Query) },
 		c.blindBudget)
 }
 

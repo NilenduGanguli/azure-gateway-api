@@ -370,7 +370,7 @@ func TestCrashRecoveryResumesAcceptedJobs(t *testing.T) {
 	defer readC.Close()
 
 	cfg := &config.Config{
-		DataDir: dir, AllowNetworkFS: true, DISyncMode: config.SyncAuto, DIBlindPollBudget: 5,
+		DataDir: dir, AllowNetworkFS: true, DISyncMode: config.SyncAuto, DIBlindPollBudget: 5, DISyncProbeTimeout: 30 * time.Second,
 		ResultTTL: time.Hour, GCInterval: time.Hour, DiskHighWatermark: 0.99,
 		MaxRequestBytes: 1 << 20, PollRetryAfter: 1, BusyRetryAfter: 5,
 		DI:   config.Upstream{BaseURL: diC.URL(), MaxInflight: 2, Timeout: 20 * time.Second},
@@ -409,7 +409,7 @@ func TestCrashRecoveryResumesAcceptedJobs(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	manager := jobs.New(jobs.Options{
 		Config: cfg, Store: st2, Logger: log,
-		DI:   upstream.NewDI(cfg.DI, cfg.DISyncMode, cfg.DIBlindPollBudget, st2.Blob.Root(), cfg.MaxRequestBytes),
+		DI:   upstream.NewDI(cfg.DI, cfg.DISyncMode, cfg.DIBlindPollBudget, st2.Blob.Root(), cfg.MaxRequestBytes, cfg.DISyncProbeTimeout),
 		Read: upstream.NewRead(cfg.Read, cfg.DIBlindPollBudget, st2.Blob.Root(), cfg.MaxRequestBytes),
 	})
 	ctx, cancel := context.WithCancel(context.Background())

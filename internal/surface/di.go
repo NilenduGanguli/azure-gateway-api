@@ -24,6 +24,26 @@ const DefaultAPIVersion = "2024-11-30"
 
 const diPrefix = upstream.DIPathPrefix
 
+// frPrefix is the legacy Form Recognizer family.
+//
+// It is served because the containers serve it: a probed layout-4.0 build declares
+// /formrecognizer/documentModels/{modelId}:analyze, :syncAnalyze and the matching analyzeResults
+// route alongside the /documentintelligence ones. A client on azure-ai-formrecognizer therefore
+// reaches the container today and would have hit a 404 on a gateway that only served the newer
+// prefix.
+//
+// The prefix a caller arrived on is echoed back in Operation-Location, because every SDK derives
+// the operation id from that header with a regex that hard-codes its own prefix.
+const frPrefix = "/formrecognizer"
+
+// prefixOf reports which family a request arrived on.
+func prefixOf(r *http.Request) string {
+	if strings.HasPrefix(r.URL.Path, frPrefix+"/") {
+		return frPrefix
+	}
+	return diPrefix
+}
+
 func (s *Server) registerDI(mux *http.ServeMux) {
 	// The colon action is part of the final path segment, so {action} captures
 	// "prebuilt-layout:analyze" whole and the verb is split off below.
@@ -34,6 +54,15 @@ func (s *Server) registerDI(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE "+diPrefix+"/documentModels/{modelId}/analyzeResults/{resultId}", s.diDelete)
 	mux.HandleFunc("GET "+diPrefix+"/documentModels/{modelId}/analyzeResults/{resultId}/pdf", s.diPDF)
 	mux.HandleFunc("GET "+diPrefix+"/documentModels/{modelId}/analyzeResults/{resultId}/figures/{figureId}", s.diFigure)
+
+	// The legacy family, served by the same handlers. Operation-Location echoes whichever prefix
+	// the caller used.
+	mux.HandleFunc("POST "+frPrefix+"/documentModels/{action}", s.diAction)
+	mux.HandleFunc("GET "+frPrefix+"/documentModels/{modelId}/analyzeResults/{resultId}", s.diPoll)
+	mux.HandleFunc("HEAD "+frPrefix+"/documentModels/{modelId}/analyzeResults/{resultId}", s.diPoll)
+	mux.HandleFunc("DELETE "+frPrefix+"/documentModels/{modelId}/analyzeResults/{resultId}", s.diDelete)
+	mux.HandleFunc("GET "+frPrefix+"/documentModels/{modelId}/analyzeResults/{resultId}/pdf", s.diPDF)
+	mux.HandleFunc("GET "+frPrefix+"/documentModels/{modelId}/analyzeResults/{resultId}/figures/{figureId}", s.diFigure)
 
 	mux.HandleFunc("GET "+diPrefix+"/info", s.diInfo)
 	mux.HandleFunc("GET "+diPrefix+"/documentModels", s.diListModels)
@@ -74,14 +103,16 @@ func (s *Server) diAnalyze(w http.ResponseWriter, r *http.Request, modelID strin
 		err.WriteTo(w, azerr.SurfaceDI)
 		return
 	}
+	prefix := prefixOf(r)
 	s.submit(w, r, submitParams{
-		surface:       azerr.SurfaceDI,
-		surfaceName:   jobs.SurfaceDI,
-		modelID:       modelID,
-		apiVersion:    apiVersion,
-		upstreamQuery: upstreamQuery(r.URL.Query()),
+		surface:        azerr.SurfaceDI,
+		surfaceName:    jobs.SurfaceDI,
+		modelID:        modelID,
+		apiVersion:     apiVersion,
+		upstreamQuery:  upstreamQuery(r.URL.Query()),
+		upstreamPrefix: prefix,
 		operationLocation: func(base, id string) string {
-			return diOperationLocation(base, modelID, id, apiVersion)
+			return diOperationLocation(base, prefix, modelID, id, apiVersion)
 		},
 	})
 }
@@ -100,10 +131,10 @@ func (s *Server) diAnalyze(w http.ResponseWriter, r *http.Request, modelID strin
 //   - ?api-version present, because Python never re-appends it while .NET and Java replace it;
 //   - percent-encoded throughout, because a literal brace raises in Python's str.format and makes
 //     Java's new URI(path) throw, which silently demotes its poller instead of failing loudly.
-func diOperationLocation(base, modelID, resultID, apiVersion string) string {
+func diOperationLocation(base, prefix, modelID, resultID, apiVersion string) string {
 	q := url.Values{}
 	q.Set("api-version", apiVersion)
-	return base + diPrefix + "/documentModels/" + url.PathEscape(modelID) +
+	return base + prefix + "/documentModels/" + url.PathEscape(modelID) +
 		"/analyzeResults/" + url.PathEscape(resultID) + "?" + q.Encode()
 }
 
@@ -118,7 +149,7 @@ func (s *Server) diSyncAnalyze(w http.ResponseWriter, r *http.Request, modelID s
 		return
 	}
 	s.passthrough(w, r, azerr.SurfaceDI, jobs.SurfaceDI, upstream.Request{
-		ModelID: modelID, Query: upstreamQuery(r.URL.Query()),
+		ModelID: modelID, Query: upstreamQuery(r.URL.Query()), Prefix: prefixOf(r),
 	})
 }
 

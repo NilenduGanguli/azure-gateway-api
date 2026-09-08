@@ -70,6 +70,13 @@ type Config struct {
 	// DIBlindPollBudget caps consecutive 404s tolerated while polling a degraded DI operation
 	// whose owning replica cannot be reached through router affinity.
 	DIBlindPollBudget int
+	// DISyncProbeTimeout bounds the attempt on the undocumented :syncAnalyze route.
+	//
+	// It is deliberately far shorter than DI_UPSTREAM_TIMEOUT. The route is declared in some
+	// builds' swagger and still never answers — one probed container held the connection open for
+	// more than five minutes on a blank 200x120 image. Without a separate bound, every job in
+	// auto mode would burn the whole upstream timeout on that route before falling back.
+	DISyncProbeTimeout time.Duration
 
 	// QueueDepth is how many admitted-but-unstarted jobs may wait per surface. Zero means a
 	// submit is rejected with 429 the moment every slot is busy.
@@ -109,6 +116,11 @@ type Config struct {
 
 	ShutdownGrace time.Duration
 
+	// ErrorCompat selects the error rendering mode: "observed" reproduces what the on-prem
+	// containers actually emit, "documented" follows the swagger and the generated SDK models.
+	// They differ on both surfaces; see internal/azerr.
+	ErrorCompat string
+
 	LogLevel  string
 	LogFormat string
 }
@@ -130,6 +142,7 @@ func Load() (*Config, error) {
 		MaxResultBytes:        int64(envInt("MAX_RESULT_BYTES", 512*1024*1024)),
 		PollRetryAfter:        envInt("POLL_RETRY_AFTER", 1),
 		BusyRetryAfter:        envInt("BUSY_RETRY_AFTER", 5),
+		ErrorCompat:           strings.ToLower(env("ERROR_COMPAT", "observed")),
 		LogLevel:              strings.ToLower(env("LOG_LEVEL", "info")),
 		LogFormat:             strings.ToLower(env("LOG_FORMAT", "json")),
 		DI: Upstream{
@@ -164,6 +177,9 @@ func Load() (*Config, error) {
 	if c.UploadTimeout, err = envDuration("UPLOAD_TIMEOUT", 10*time.Minute); err != nil {
 		collect(err)
 	}
+	if c.DISyncProbeTimeout, err = envDuration("DI_SYNC_PROBE_TIMEOUT", 60*time.Second); err != nil {
+		collect(err)
+	}
 	if c.DI.Timeout, err = envDuration("DI_UPSTREAM_TIMEOUT", 15*time.Minute); err != nil {
 		collect(err)
 	}
@@ -192,6 +208,11 @@ func Load() (*Config, error) {
 	}
 	if c.DataDir == "" {
 		collect(errors.New("DATA_DIR must be set"))
+	}
+	switch c.ErrorCompat {
+	case "observed", "documented":
+	default:
+		collect(fmt.Errorf("ERROR_COMPAT must be observed or documented, got %q", c.ErrorCompat))
 	}
 	switch c.DISyncMode {
 	case SyncAuto, SyncForce, SyncOff:
@@ -227,6 +248,9 @@ func Load() (*Config, error) {
 	}
 	if c.UploadTimeout <= 0 {
 		collect(errors.New("UPLOAD_TIMEOUT must be positive"))
+	}
+	if c.DISyncProbeTimeout <= 0 {
+		collect(errors.New("DI_SYNC_PROBE_TIMEOUT must be positive"))
 	}
 
 	if len(errs) > 0 {

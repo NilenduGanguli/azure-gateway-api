@@ -45,8 +45,9 @@ func newTestManager(t *testing.T, a upstream.Analyzer, now time.Time) (*Manager,
 	cfg := &config.Config{
 		QueueDepth: 0, GCInterval: time.Hour, ResultTTL: 24 * time.Hour,
 		DiskHighWatermark: 0.99, ArtifactFetchTimeout: time.Minute,
-		DI:   config.Upstream{MaxInflight: 4, Timeout: time.Minute},
-		Read: config.Upstream{MaxInflight: 4, Timeout: time.Minute},
+		DISyncProbeTimeout: 30 * time.Second,
+		DI:                 config.Upstream{MaxInflight: 4, Timeout: time.Minute},
+		Read:               config.Upstream{MaxInflight: 4, Timeout: time.Minute},
 	}
 	m := New(Options{
 		Config: cfg, Store: st, DI: a, Read: a,
@@ -143,7 +144,7 @@ func TestArtifactFetchIsBoundedAndYieldsToShutdown(t *testing.T) {
 		ArtifactFetchTimeout: 600 * time.Millisecond,
 		DI:                   config.Upstream{BaseURL: wedged.URL, MaxInflight: 1, Timeout: 5 * time.Second},
 	}
-	di := upstream.NewDI(cfg.DI, config.SyncAuto, 5, st.Blob.Root(), 1<<20)
+	di := upstream.NewDI(cfg.DI, config.SyncAuto, 5, st.Blob.Root(), 1<<20, cfg.DISyncProbeTimeout)
 	m := New(Options{
 		Config: cfg, Store: st, DI: di, Read: di,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),

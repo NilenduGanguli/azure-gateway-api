@@ -26,6 +26,17 @@ import (
 // when polling itself would work.
 const DIPathPrefix = "/documentintelligence"
 
+// LegacyPathPrefix is the Form Recognizer family the same containers also serve.
+const LegacyPathPrefix = "/formrecognizer"
+
+// prefix returns the family to call, defaulting to the current one.
+func prefix(p string) string {
+	if p == LegacyPathPrefix {
+		return LegacyPathPrefix
+	}
+	return DIPathPrefix
+}
+
 // syncCapability tracks what the gateway has learned about the undocumented :syncAnalyze route.
 type syncCapability int32
 
@@ -38,18 +49,25 @@ const (
 // DIClient talks to the Document Intelligence layout container.
 type DIClient struct {
 	*base
-	mode        config.SyncMode
-	blindBudget int
-	capability  atomic.Int32
+	mode         config.SyncMode
+	blindBudget  int
+	probeTimeout time.Duration
+	capability   atomic.Int32
 }
 
 // NewDI builds a Document Intelligence client.
-func NewDI(up config.Upstream, mode config.SyncMode, blindBudget int, tempDir string, maxBytes int64) *DIClient {
+func NewDI(up config.Upstream, mode config.SyncMode, blindBudget int, tempDir string,
+	maxBytes int64, probeTimeout time.Duration) *DIClient {
+
+	if probeTimeout <= 0 || probeTimeout > up.Timeout {
+		probeTimeout = up.Timeout
+	}
 	c := &DIClient{
 		base: newBase("document-intelligence", up.BaseURL, up.APIKey, up.Timeout, tempDir,
 			azerr.SurfaceDI, up.MaxInflight+2, maxBytes),
-		mode:        mode,
-		blindBudget: blindBudget,
+		mode:         mode,
+		blindBudget:  blindBudget,
+		probeTimeout: probeTimeout,
 	}
 	if mode == config.SyncOff {
 		c.capability.Store(int32(syncUnavailable))
@@ -129,15 +147,29 @@ func (c *DIClient) trySync(ctx context.Context, ac *affinityClient, doc Document
 	req Request, deadline time.Time) (*Result, error) {
 
 	q := cloneQuery(req.Query)
-	target := c.joinURL(DIPathPrefix+"/documentModels/"+escapeSegment(req.ModelID)+":syncAnalyze", q)
+	target := c.joinURL(prefix(req.Prefix)+"/documentModels/"+escapeSegment(req.ModelID)+":syncAnalyze", q)
+
+	// The attempt gets its own short bound. This route is undocumented and unreliable: one probed
+	// container declares it in its swagger and still never answers, holding the connection past
+	// five minutes on a blank image. Without this, auto mode would spend the entire upstream
+	// timeout here on every job before falling back to a route that works.
+	probeCtx, cancelProbe := context.WithTimeout(ctx, c.probeTimeout)
+	defer cancelProbe()
 
 	started := time.Now()
-	hreq, err := c.newRequest(ctx, http.MethodPost, target, &doc)
+	hreq, err := c.newRequest(probeCtx, http.MethodPost, target, &doc)
 	if err != nil {
 		return nil, err
 	}
 	resp, err := ac.http.Do(hreq)
 	if err != nil {
+		// A caller going away is not a verdict on the route; a probe deadline is.
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if probeCtx.Err() != nil {
+			return nil, ErrSyncUnavailable
+		}
 		return nil, c.unreachable(ctx, err)
 	}
 
@@ -183,8 +215,10 @@ func (c *DIClient) trySync(ctx context.Context, ac *affinityClient, doc Document
 				"The document-intelligence container degraded to an asynchronous operation but "+
 					"returned no usable Operation-Location.")
 		}
+		// Deliberately ctx, not probeCtx: the probe bound covers deciding whether the route
+		// answers, not how long the analysis it accepted may take.
 		res, err := c.pollUntilTerminal(ctx, ac, pollConfig{
-			URL:         c.pollURL(req.ModelID, id, req.Query),
+			URL:         c.pollURLIn(prefix(req.Prefix), req.ModelID, id, req.Query),
 			BlindBudget: c.blindBudget,
 			Deadline:    deadline,
 			Prefix:      "di-poll",
@@ -232,7 +266,7 @@ func (c *DIClient) analyzeAsync(ctx context.Context, ac *affinityClient, doc Doc
 	req Request, deadline time.Time) (*Result, error) {
 
 	q := cloneQuery(req.Query)
-	target := c.joinURL(DIPathPrefix+"/documentModels/"+escapeSegment(req.ModelID)+":analyze", q)
+	target := c.joinURL(prefix(req.Prefix)+"/documentModels/"+escapeSegment(req.ModelID)+":analyze", q)
 
 	started := time.Now()
 	hreq, err := c.newRequest(ctx, http.MethodPost, target, &doc)
@@ -256,7 +290,7 @@ func (c *DIClient) analyzeAsync(ctx context.Context, ac *affinityClient, doc Doc
 				"Operation-Location.")
 	}
 	res, err := c.pollUntilTerminal(ctx, ac, pollConfig{
-		URL:         c.pollURL(req.ModelID, id, req.Query),
+		URL:         c.pollURLIn(prefix(req.Prefix), req.ModelID, id, req.Query),
 		BlindBudget: c.blindBudget,
 		Deadline:    deadline,
 		Prefix:      "di-poll",
@@ -273,12 +307,17 @@ func (c *DIClient) analyzeAsync(ctx context.Context, ac *affinityClient, doc Doc
 // pollURL rebuilds the poll target against the configured upstream base, keeping only the
 // api-version from the original query.
 func (c *DIClient) pollURL(modelID, resultID string, q url.Values) string {
+	return c.pollURLIn(DIPathPrefix, modelID, resultID, q)
+}
+
+// pollURLIn builds the poll target within a given path family.
+func (c *DIClient) pollURLIn(fam, modelID, resultID string, q url.Values) string {
 	pq := url.Values{}
 	if v := q.Get("api-version"); v != "" {
 		pq.Set("api-version", v)
 	}
 	return c.joinURL(
-		DIPathPrefix+"/documentModels/"+escapeSegment(modelID)+"/analyzeResults/"+escapeSegment(resultID),
+		fam+"/documentModels/"+escapeSegment(modelID)+"/analyzeResults/"+escapeSegment(resultID),
 		pq)
 }
 

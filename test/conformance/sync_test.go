@@ -4,6 +4,9 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/NilenduGanguli/azure-gateway-api/internal/config"
 
 	"github.com/NilenduGanguli/azure-gateway-api/internal/mockazure"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/store"
@@ -181,5 +184,87 @@ func TestReadSurfaceHasNoDeleteRoute(t *testing.T) {
 
 	if del.StatusCode == http.StatusNoContent {
 		t.Error("the Read surface served a DELETE, which its contract does not define")
+	}
+}
+
+// TestLegacyFormRecognizerPrefixIsServed covers a family the design originally excluded.
+//
+// A probe found the layout-4.0 container declaring /formrecognizer/documentModels/{modelId}:analyze,
+// :syncAnalyze and the matching analyzeResults route alongside the /documentintelligence ones. A
+// client on azure-ai-formrecognizer therefore reaches the container today, and a gateway serving
+// only the newer prefix would have 404'd it.
+//
+// The prefix the caller arrived on must come back in Operation-Location: every SDK derives the
+// operation id from that header with a regex hard-coding its own family.
+func TestLegacyFormRecognizerPrefixIsServed(t *testing.T) {
+	h := newHarness(t, harnessOpts{di: mockazure.Options{Sync: mockazure.Sync200}})
+
+	resp := h.post("/formrecognizer/documentModels/prebuilt-layout:analyze?api-version="+apiVersion,
+		"%PDF-1.7 fake")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("legacy submit returned %d, want 202", resp.StatusCode)
+	}
+	loc := resp.Header.Get("Operation-Location")
+	if !strings.Contains(loc, "/formrecognizer/") {
+		t.Fatalf("Operation-Location is %q; it must echo the caller's own family, or the SDK "+
+			"regex that derives the operation id will not match", loc)
+	}
+	if strings.Contains(loc, "/documentintelligence/") {
+		t.Errorf("Operation-Location switched families: %q", loc)
+	}
+
+	body := h.pollUntil(loc, "succeeded")
+	if body["status"] != "succeeded" {
+		t.Fatalf("status is %v, want succeeded", body["status"])
+	}
+	if _, ok := body["analyzeResult"]; !ok {
+		t.Error("terminal body has no analyzeResult")
+	}
+}
+
+// TestHungSyncRouteFallsBackQuickly is a regression test for the worst operational trap the probe
+// found: a container that declares :syncAnalyze in its own swagger and then never answers it.
+//
+// Without a bound of its own, the attempt inherits DI_UPSTREAM_TIMEOUT — fifteen minutes by
+// default — and every job pays it before falling back to the route that works. The probe timeout
+// caps the attempt, and the capability latches off so later jobs skip it entirely.
+func TestHungSyncRouteFallsBackQuickly(t *testing.T) {
+	h := newHarness(t, harnessOpts{
+		di: mockazure.Options{Sync: mockazure.SyncHang},
+		tweak: func(c *config.Config) {
+			c.DISyncProbeTimeout = 2 * time.Second
+			c.DI.Timeout = 60 * time.Second // what the attempt would otherwise inherit
+		},
+	})
+
+	started := time.Now()
+	resp := h.post(diAnalyze, "%PDF-1.7 fake")
+	loc := resp.Header.Get("Operation-Location")
+	_ = resp.Body.Close()
+
+	h.pollUntil(loc, "succeeded")
+	elapsed := time.Since(started)
+
+	if elapsed > 30*time.Second {
+		t.Errorf("the job took %v; a hung synchronous route must be abandoned at the probe "+
+			"timeout, not at the upstream timeout", elapsed)
+	}
+	if !h.di.Called(":analyze") {
+		t.Error("the gateway never fell back to :analyze")
+	}
+	assertJobMode(t, h, "async-fallback")
+
+	// A second job must not pay the probe again.
+	before := countCalls(h.di.Requests(), ":syncAnalyze")
+	resp2 := h.post(diAnalyze, "%PDF-1.7 fake")
+	loc2 := resp2.Header.Get("Operation-Location")
+	_ = resp2.Body.Close()
+	h.pollUntil(loc2, "succeeded")
+
+	if after := countCalls(h.di.Requests(), ":syncAnalyze"); after != before {
+		t.Errorf("the hung route was probed again on a later job (%d then %d); the capability "+
+			"should have latched off", before, after)
 	}
 }

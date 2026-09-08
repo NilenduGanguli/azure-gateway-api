@@ -82,6 +82,10 @@ type Request struct {
 	// Query is the client's query string, forwarded to the container unchanged apart from
 	// parameters the gateway owns.
 	Query url.Values
+	// Prefix is the path family to call the container on: /documentintelligence or the legacy
+	// /formrecognizer. Both are served by these containers, and a client that arrived on one
+	// must be answered on the same one.
+	Prefix string
 	// RequireOperation forces the asynchronous upstream path even when a synchronous route is
 	// available.
 	//

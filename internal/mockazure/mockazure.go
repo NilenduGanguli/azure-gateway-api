@@ -36,6 +36,10 @@ const (
 	Sync500Unhandled
 	// SyncModelNotFound serves the route but rejects the model, which is request-scoped.
 	SyncModelNotFound
+	// SyncHang accepts the request and never answers. A probed layout-4.0 build declares
+	// :syncAnalyze in its own swagger and behaves exactly like this, holding the connection open
+	// past five minutes on a blank image.
+	SyncHang
 )
 
 // Options configures a fake container.
@@ -149,6 +153,29 @@ func NewDI(opts Options) *Container {
 			c.servePoll(w, r.PathValue("resultId"), true)
 		})
 
+	// The legacy Form Recognizer family, which a probed layout-4.0 build declares alongside the
+	// newer one.
+	mux.HandleFunc("POST /formrecognizer/documentModels/{action}", func(w http.ResponseWriter, r *http.Request) {
+		c.record(r.URL.Path)
+		if !c.authorized(w, r) {
+			return
+		}
+		_, verb, _ := strings.Cut(r.PathValue("action"), ":")
+		switch verb {
+		case "syncAnalyze":
+			c.serveSync(w, r, true)
+		case "analyze":
+			c.serveSubmit(w, r, "/formrecognizer/documentModels/prebuilt-layout/analyzeResults/")
+		default:
+			writeDIError(w, http.StatusNotFound, "NotFound", "Resource not found.")
+		}
+	})
+	mux.HandleFunc("GET /formrecognizer/documentModels/{modelId}/analyzeResults/{resultId}",
+		func(w http.ResponseWriter, r *http.Request) {
+			c.record(r.URL.Path)
+			c.servePoll(w, r.PathValue("resultId"), true)
+		})
+
 	mux.HandleFunc("GET /documentintelligence/documentModels/{modelId}/analyzeResults/{resultId}/pdf",
 		func(w http.ResponseWriter, r *http.Request) {
 			c.record(r.URL.Path)
@@ -257,6 +284,9 @@ func (c *Container) serveSync(w http.ResponseWriter, r *http.Request, di bool) {
 	}
 
 	switch c.opts.Sync {
+	case SyncHang:
+		<-r.Context().Done()
+		return
 	case Sync404:
 		// Kestrel's unrouted response: no body at all. This is what distinguishes "this build does
 		// not serve the route" from "this build serves it and your model does not exist".
@@ -327,7 +357,7 @@ func (c *Container) servePoll(w http.ResponseWriter, id string, di bool) {
 	op, ok := c.ops[id]
 	if !ok {
 		c.mu.Unlock()
-		writeDIError(w, http.StatusNotFound, "NotFound", "Resource not found.")
+		writeUnknownID(w, di)
 		return
 	}
 	op.polls++
@@ -337,7 +367,7 @@ func (c *Container) servePoll(w http.ResponseWriter, id string, di bool) {
 	if c.opts.WrongReplicaEvery > 0 && polls%c.opts.WrongReplicaEvery == 0 {
 		// A replica that never saw this operation: the containers' default result store is
 		// instance-local, so a round-robin route produces exactly this.
-		writeDIError(w, http.StatusNotFound, "NotFound", "Resource not found.")
+		writeUnknownID(w, di)
 		return
 	}
 	if polls <= c.opts.PollsBeforeSuccess {
@@ -411,6 +441,23 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Length", fmt.Sprint(len(body)))
 	w.WriteHeader(status)
 	_, _ = w.Write(body)
+}
+
+// writeUnknownID mirrors what the real containers answer for an operation id they do not know.
+// Document Intelligence drops its wrapper for this one response, alone among its errors; Read
+// wraps it and calls it BadArgument, a code its own enum defines for something else entirely.
+func writeUnknownID(w http.ResponseWriter, di bool) {
+	if di {
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"code": "NotFound", "message": "Analyze result does not exist.",
+		})
+		return
+	}
+	writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]string{
+		"code": "BadArgument",
+		"message": "Operation ID is invalid, expired or the results matching this " +
+			"operationId have been deleted.",
+	}})
 }
 
 func writeDIError(w http.ResponseWriter, status int, code, message string) {

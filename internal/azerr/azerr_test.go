@@ -4,43 +4,99 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
-// TestSurfacesUseDifferentShapes is the central fact this package exists for: Document
-// Intelligence wraps its error in an "error" object, while Computer Vision Read — alone among the
-// v3.2 operations, because its routes live in Ocr.json — is flat.
-func TestSurfacesUseDifferentShapes(t *testing.T) {
-	e := New(http.StatusNotFound, CodeNotFound, "").WithInner(InnerOperationNotFound, "")
+// TestObservedShapesMatchTheContainers pins the shapes a probe found real containers emitting,
+// which are not the ones their published contracts describe. Document Intelligence wraps every
+// error except an unknown result id; Computer Vision Read wraps all of its.
+func TestObservedShapesMatchTheContainers(t *testing.T) {
+	t.Run("di unknown id is flat", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		NotFound(SurfaceDI).WriteTo(rec, SurfaceDI)
 
-	diRec := httptest.NewRecorder()
-	e.WriteTo(diRec, SurfaceDI)
-	var di map[string]any
-	if err := json.Unmarshal(diRec.Body.Bytes(), &di); err != nil {
-		t.Fatalf("DI body is not JSON: %v", err)
-	}
-	inner, ok := di["error"].(map[string]any)
-	if !ok {
-		t.Fatalf("DI error is not wrapped: %v", di)
-	}
-	if inner["code"] != CodeNotFound {
-		t.Errorf("DI code is %v, want %s", inner["code"], CodeNotFound)
-	}
-	if inner["innererror"] == nil {
-		t.Error("DI error lost its innererror")
+		var body map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("not JSON: %v", err)
+		}
+		if _, wrapped := body["error"]; wrapped {
+			t.Errorf("wrapped, want flat: %s", rec.Body.String())
+		}
+		if body["code"] != CodeNotFound || body["message"] != "Analyze result does not exist." {
+			t.Errorf("body does not match the container's own wording: %s", rec.Body.String())
+		}
+	})
+
+	t.Run("di other errors stay wrapped", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		BadRequest(SurfaceDI, "bad").WriteTo(rec, SurfaceDI)
+		if !strings.Contains(rec.Body.String(), `"error"`) {
+			t.Errorf("flat, want wrapped: %s", rec.Body.String())
+		}
+	})
+
+	t.Run("read errors are wrapped", func(t *testing.T) {
+		for _, e := range []*APIError{
+			NotFound(SurfaceRead), BadRequest(SurfaceRead, "bad"), TooBusy(SurfaceRead, 1),
+			UnsupportedMediaType(SurfaceRead), Internal(SurfaceRead, ""),
+		} {
+			rec := httptest.NewRecorder()
+			e.WriteTo(rec, SurfaceRead)
+			var body map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("not JSON: %v", err)
+			}
+			if _, wrapped := body["error"]; !wrapped {
+				t.Errorf("code %s rendered flat; the container wraps every Read error: %s",
+					e.Code, rec.Body.String())
+			}
+		}
+	})
+
+	t.Run("read unknown id uses BadArgument", func(t *testing.T) {
+		// The Read enum contains no not-found code at all.
+		if got := NotFound(SurfaceRead).Code; got != ReadBadArgument {
+			t.Errorf("code is %q, want %q", got, ReadBadArgument)
+		}
+	})
+}
+
+// TestDocumentedCompatFollowsTheSpecs covers the opt-out for a client written against the
+// published SDK models rather than against these containers.
+func TestDocumentedCompatFollowsTheSpecs(t *testing.T) {
+	SetCompat(CompatDocumented)
+	defer SetCompat(CompatObserved)
+
+	rec := httptest.NewRecorder()
+	NotFound(SurfaceDI).WriteTo(rec, SurfaceDI)
+	if !strings.Contains(rec.Body.String(), `"error"`) {
+		t.Errorf("documented mode must wrap Document Intelligence: %s", rec.Body.String())
 	}
 
-	readRec := httptest.NewRecorder()
-	e.WriteTo(readRec, SurfaceRead)
-	var read map[string]any
-	if err := json.Unmarshal(readRec.Body.Bytes(), &read); err != nil {
-		t.Fatalf("Read body is not JSON: %v", err)
+	rec = httptest.NewRecorder()
+	NotFound(SurfaceRead).WriteTo(rec, SurfaceRead)
+	if strings.Contains(rec.Body.String(), `"error"`) {
+		t.Errorf("documented mode must leave Read flat: %s", rec.Body.String())
 	}
-	if _, wrapped := read["error"]; wrapped {
-		t.Error("Read error must not be wrapped")
-	}
-	if read["code"] == nil || read["message"] == nil {
-		t.Errorf("Read error needs top-level code and message, got %v", read)
+}
+
+// TestUnroutedIsBodyless matches the containers, which answer a path they do not serve with an
+// empty 404. No SDK parses an unrouted response as operation state, so this is safe; routed
+// endpoints always carry a body.
+func TestUnroutedIsBodyless(t *testing.T) {
+	for _, s := range []Surface{SurfaceDI, SurfaceRead} {
+		rec := httptest.NewRecorder()
+		Unrouted(s).WriteTo(rec, s)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("surface %s: status %d, want 404", s, rec.Code)
+		}
+		if rec.Body.Len() != 0 {
+			t.Errorf("surface %s: body %q, want empty", s, rec.Body.String())
+		}
+		if got := rec.Header().Get("Content-Length"); got != "0" {
+			t.Errorf("surface %s: Content-Length %q, want 0", s, got)
+		}
 	}
 }
 

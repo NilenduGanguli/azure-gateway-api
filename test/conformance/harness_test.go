@@ -96,7 +96,7 @@ func newHarness(t *testing.T, o harnessOpts) *harness {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	manager := jobs.New(jobs.Options{
 		Config: cfg, Store: st, Logger: log,
-		DI:   upstream.NewDI(cfg.DI, cfg.DISyncMode, cfg.DIBlindPollBudget, st.Blob.Root(), cfg.MaxRequestBytes),
+		DI:   upstream.NewDI(cfg.DI, cfg.DISyncMode, cfg.DIBlindPollBudget, st.Blob.Root(), cfg.MaxRequestBytes, cfg.DISyncProbeTimeout),
 		Read: upstream.NewRead(cfg.Read, cfg.DIBlindPollBudget, st.Blob.Root(), cfg.MaxRequestBytes),
 	})
 	ctx, cancel := context.WithCancel(context.Background())

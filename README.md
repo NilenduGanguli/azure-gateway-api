@@ -90,7 +90,22 @@ VERDICT
 ```
 
 It sends a blank 200×120 PNG, never one of your documents, and never prints an API key. Cost is
-about four analyses per container.
+about ten analyses per container.
+
+### What a real deployment turned up
+
+Running it against one cluster produced four things worth knowing before you tune anything:
+
+- **`:syncAnalyze` was declared in the container's own swagger and never answered** — the
+  connection stayed open past five minutes on a blank image. `DI_SYNC_PROBE_TIMEOUT` exists for
+  exactly this; set `DI_SYNC_ANALYZE=off` once the probe confirms it on your build.
+- **The layout container was very slow.** A blank 200×120 PNG was still `running` after 90s. That
+  is far outside Microsoft's own sizing benchmark, so check the container has its 8 cores and
+  16–24 GB before concluding the gateway is at fault.
+- **`/formrecognizer/**` was served**, so clients on `azure-ai-formrecognizer` reach it. The
+  gateway now serves that family too.
+- **`/info` and `/documentModels` were 404** on that build. The gateway proxies them; they will
+  simply pass the container's 404 through.
 
 ---
 
@@ -138,6 +153,7 @@ disk and no secret is ever logged.
 | `DI_UPSTREAM_TIMEOUT` | `15m` | Ceiling for one complete DI analysis |
 | `DI_SYNC_ANALYZE` | `auto` | `auto` probes and falls back, `force` requires the route, `off` never uses it |
 | `DI_BLIND_POLL_BUDGET` | `60` | Consecutive poll 404s tolerated before giving up on a degraded operation |
+| `DI_SYNC_PROBE_TIMEOUT` | `60s` | Ceiling on the `:syncAnalyze` attempt alone. Deliberately far below `DI_UPSTREAM_TIMEOUT`: a build can declare the route and never answer it, and without this every job would burn the full timeout before falling back |
 | `READ_UPSTREAM_URL` | *(required)* | Read container root. **No `vision` in the hostname** |
 | `READ_UPSTREAM_API_KEY` | | Sent upstream |
 | `READ_MAX_INFLIGHT` | `4` | Concurrent Read jobs |
@@ -153,6 +169,7 @@ disk and no secret is ever logged.
 | `POLL_RETRY_AFTER` | `1` | Integer seconds on the 202 and in-progress polls |
 | `BUSY_RETRY_AFTER` | `5` | Integer seconds on a 429 |
 | `SHUTDOWN_GRACE` | `30s` | Time allowed for in-flight work at shutdown |
+| `ERROR_COMPAT` | `observed` | `observed` reproduces the error shapes these containers actually emit; `documented` follows the swagger and generated SDK models. They differ on both surfaces — see below |
 | `LOG_LEVEL` / `LOG_FORMAT` | `info` / `json` | Logging |
 
 ### Capacity
@@ -180,6 +197,7 @@ container is close to useless. Scale on the gateway's queue depth instead.
 | DELETE | `/documentintelligence/documentModels/{modelId}/analyzeResults/{resultId}` |
 | GET | `.../analyzeResults/{resultId}/pdf` · `.../figures/{figureId}` |
 | GET | `/documentintelligence/info` · `/documentModels` · `/documentModels/{modelId}` |
+| * | `/formrecognizer/**` — the same routes on the legacy family, which these containers also serve |
 
 ### Computer Vision Read
 
@@ -271,8 +289,12 @@ case; the short version:
   with an opaque `NullPointerException` and marks the operation terminally failed in .NET and JS.
 - **A failed analysis is HTTP 200** with `"status":"failed"`. This is the dominant failure mode on
   both surfaces; code that switches on HTTP status alone mis-maps every one of them.
-- **The two surfaces use different error shapes.** DI wraps in `{"error":{…}}`; Read is flat.
-  Read is the odd one out even within Computer Vision, because its routes live in `Ocr.json`.
+- **The error shapes are not what the specifications say.** Probing real containers found Computer
+  Vision Read wrapping *every* error in `{"error":{…}}`, including the ones its own `Ocr.json`
+  models as flat, and Document Intelligence wrapping everything *except* an unknown or expired
+  result id, which comes back flat as `{"code":"NotFound","message":"Analyze result does not
+  exist."}`. The gateway reproduces both, because being indistinguishable from the container is
+  the point. `ERROR_COMPAT=documented` restores the published shapes.
 
 The full derivation, with citations, is in [`docs/api-surface.md`](docs/api-surface.md).
 
