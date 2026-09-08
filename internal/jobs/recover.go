@@ -36,7 +36,10 @@ func (m *Manager) recover(ctx context.Context, atBoot bool) {
 		// crash leaves lease_until minutes in the future.
 		jobsToRecover, err = m.store.Abandoned(ctx, m.now(), recoverBatch)
 	} else {
-		jobsToRecover, err = m.store.Orphaned(ctx, m.now(), recoverBatch)
+		// Only rows that have been sitting for a while. A notStarted row that was committed
+		// moments ago is almost certainly still on its way to a worker, and reclaiming it would
+		// run the same analysis twice.
+		jobsToRecover, err = m.store.Orphaned(ctx, m.now(), m.now().Add(-2*leaseDuration), recoverBatch)
 	}
 	if err != nil {
 		m.log.Error("could not scan for orphaned jobs", "error", err)
@@ -80,8 +83,16 @@ func (m *Manager) recoverOne(ctx context.Context, r *surfaceRunner, job *store.J
 		return
 	}
 
-	if err := m.store.Requeue(ctx, job.ID, m.now()); err != nil {
+	// Claim it as we requeue, so the periodic pass does not pick the same row up again before a
+	// worker marks it running.
+	if err := m.store.Requeue(ctx, job.ID, m.now(), m.now().Add(leaseDuration)); err != nil {
 		log.Error("could not requeue orphaned job", "error", err)
+		return
+	}
+
+	if !m.claim(job.ID) {
+		// Another path already has it. Undo the requeue marker only if nothing else will run it;
+		// the claim holder will, so leave the row alone.
 		return
 	}
 
@@ -89,6 +100,7 @@ func (m *Manager) recoverOne(ctx context.Context, r *surfaceRunner, job *store.J
 	select {
 	case r.admits <- struct{}{}:
 	case <-ctx.Done():
+		m.unclaim(job.ID)
 		return
 	}
 	select {
@@ -96,6 +108,7 @@ func (m *Manager) recoverOne(ctx context.Context, r *surfaceRunner, job *store.J
 		log.Info("requeued orphaned job")
 	case <-ctx.Done():
 		<-r.admits
+		m.unclaim(job.ID)
 	}
 }
 
@@ -105,20 +118,22 @@ func (m *Manager) sweep(ctx context.Context) {
 	defer t.Stop()
 
 	// Run once at startup so a pod that was down past several TTLs does not serve stale results.
-	m.sweepOnce(ctx)
+	// Reclaiming is skipped on this pass: Recover covers it, explicitly and before the listener
+	// opens, and doing both would race for the same rows.
+	m.sweepOnce(ctx, false)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			m.sweepOnce(ctx)
+			m.sweepOnce(ctx, true)
 		}
 	}
 }
 
 // sweepOnce expires jobs past their TTL, reclaims crash debris, and evicts under disk pressure.
-func (m *Manager) sweepOnce(ctx context.Context) {
+func (m *Manager) sweepOnce(ctx context.Context, reclaim bool) {
 	now := m.now()
 
 	expired, err := m.store.Expired(ctx, now, 512)
@@ -141,9 +156,13 @@ func (m *Manager) sweepOnce(ctx context.Context) {
 		m.log.Info("removed orphaned temporary files", "count", n)
 	}
 
-	// Catch workers that died while this process kept running. The boot pass cannot cover these
-	// because their leases were still valid when it ran.
-	m.recover(ctx, false)
+	m.sweepOrphanBlobs(ctx, now)
+
+	if reclaim {
+		// Catch workers that died while this process kept running. The boot pass cannot cover
+		// these because their leases were still valid when it ran.
+		m.recover(ctx, false)
+	}
 
 	m.evictUnderPressure(ctx)
 }
@@ -161,24 +180,35 @@ func (m *Manager) evictUnderPressure(ctx context.Context) {
 	m.log.Warn("volume above high-water mark; evicting oldest completed results",
 		"used", used, "highWatermark", m.cfg.DiskHighWatermark)
 
-	candidates, err := m.store.EvictionCandidates(ctx, 256)
+	candidates, err := m.store.EvictionCandidates(ctx, m.now(), 256)
 	if err != nil {
 		m.log.Error("could not list eviction candidates", "error", err)
 		return
 	}
-	var evicted int
+	var evicted, live int
+	now := m.now()
 	for _, job := range candidates {
+		unexpired := job.ExpiresAt.After(now)
 		if err := m.store.Delete(ctx, job.ID); err != nil {
 			m.log.Warn("could not evict job", "job", job.ID, "error", err)
 			continue
 		}
 		evicted++
+		if unexpired {
+			// A result a client could still legitimately have fetched. Expired ones are offered
+			// first precisely so this stays rare, but under real pressure it is the only lever
+			// left, and it is worth saying out loud.
+			live++
+			m.log.Warn("evicted a result that had not yet expired", "job", job.ID,
+				"expiresAt", job.ExpiresAt.Format(time.RFC3339))
+		}
 		if used, ok := m.store.DiskUsage(); ok && used < m.cfg.DiskHighWatermark {
 			break
 		}
 	}
 	if evicted > 0 {
-		m.log.Warn("evicted completed results to reclaim space", "count", evicted)
+		m.log.Warn("evicted completed results to reclaim space",
+			"count", evicted, "stillFetchable", live)
 	}
 }
 
@@ -192,4 +222,36 @@ func (m *Manager) DiskPressure() bool {
 	// Refuse only well past the eviction threshold: between the two, the sweeper is expected to
 	// make room without the client noticing.
 	return used >= m.cfg.DiskHighWatermark+((1-m.cfg.DiskHighWatermark)/2)
+}
+
+// sweepOrphanBlobs reclaims artifacts whose job row is gone.
+//
+// Delete removes the row before the blobs, so a partial unlink leaks files rather than stranding a
+// row that points at a result which no longer exists. This collects that leak. Only blobs older
+// than an hour are considered, so a submit whose row is still being committed is never touched.
+func (m *Manager) sweepOrphanBlobs(ctx context.Context, now time.Time) {
+	const batch = 512
+	ids, err := m.store.Blob.IDs(batch)
+	if err != nil {
+		m.log.Warn("could not scan the blob store for orphans", "error", err)
+		return
+	}
+	cutoff := now.Add(-time.Hour).Unix()
+	var removed int
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			return
+		}
+		if m.store.Exists(ctx, id) || !m.store.Blob.OlderThan(id, cutoff) {
+			continue
+		}
+		if err := m.store.Blob.RemoveAll(id); err != nil {
+			m.log.Warn("could not remove orphaned artifacts", "job", id, "error", err)
+			continue
+		}
+		removed++
+	}
+	if removed > 0 {
+		m.log.Info("reclaimed artifacts with no job row", "count", removed)
+	}
 }

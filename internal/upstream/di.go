@@ -197,8 +197,19 @@ func (c *DIClient) trySync(ctx context.Context, ac *affinityClient, doc Document
 		res.UpstreamOpID = id
 		return res, nil
 
-	case http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusNotImplemented:
+	case http.StatusMethodNotAllowed, http.StatusNotImplemented:
 		drain(resp)
+		return nil, ErrSyncUnavailable
+
+	case http.StatusNotFound:
+		// A 404 here is ambiguous, and getting it wrong is expensive in one direction: latching
+		// the capability off is process-wide and permanent, so a single request naming a model
+		// that does not exist would disable the synchronous route for every later job until the
+		// pod restarts. Only a 404 that means "this route is not served" counts.
+		apiErr := c.readErrorBody(resp)
+		if resourceScoped404(apiErr) {
+			return nil, apiErr
+		}
 		return nil, ErrSyncUnavailable
 
 	case http.StatusInternalServerError:
@@ -304,6 +315,29 @@ func (c *DIClient) FetchArtifact(ctx context.Context, modelID, resultID, suffix 
 		return "", 0, "", derr
 	}
 	return p, n, ct, nil
+}
+
+// resourceScoped404 reports whether a 404 is about the thing being asked for rather than about the
+// route existing at all.
+//
+// A container that does not serve :syncAnalyze answers with Kestrel's unrouted 404 — no body, or a
+// body whose text says the request path matched no endpoint. A container that does serve it but
+// was handed an unknown model answers with a well-formed Document Intelligence error naming that
+// model. The first justifies latching the capability off; the second is just a bad request.
+func resourceScoped404(e *azerr.APIError) bool {
+	if e == nil || e.Code == "" {
+		return false
+	}
+	if looksLikeMissingEndpoint(e) {
+		return false
+	}
+	switch e.InnerCode {
+	case azerr.InnerModelNotFound, azerr.InnerOperationNotFound:
+		return true
+	}
+	// A well-formed NotFound with a message is the service talking about a resource; a bodyless or
+	// unparseable 404 never reaches here, because readErrorBody yields a synthesised code instead.
+	return e.Code == azerr.CodeNotFound && e.Message != ""
 }
 
 // looksLikeMissingEndpoint reports whether a 500 is really "this route does not exist".

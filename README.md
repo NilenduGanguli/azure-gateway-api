@@ -129,8 +129,10 @@ disk and no secret is ever logged.
 | `RESULT_TTL` | `24h` | How long a result stays fetchable, matching Azure |
 | `GC_INTERVAL` | `5m` | Sweeper period |
 | `ARTIFACT_FETCH_TIMEOUT` | `2m` | Aggregate budget for one job's result files. Bounds a wedged container so it cannot outlast the shutdown grace |
+| `UPLOAD_TIMEOUT` | `10m` | How long a client may take to stream its request body while holding an admission slot |
 | `DISK_HIGH_WATERMARK` | `0.90` | Fraction of the volume above which completed results are evicted |
-| `MAX_REQUEST_BYTES` | `524288000` | 500 MB, the Document Intelligence S0 ceiling |
+| `MAX_REQUEST_BYTES` | `524288000` | 500 MB, the Document Intelligence S0 ceiling, on the **upload** |
+| `MAX_RESULT_BYTES` | `536870912` | Ceiling on an upstream **response**. Separate from the upload cap so lowering one does not silently break the other |
 | `POLL_RETRY_AFTER` | `1` | Integer seconds on the 202 and in-progress polls |
 | `BUSY_RETRY_AFTER` | `5` | Integer seconds on a 429 |
 | `SHUTDOWN_GRACE` | `30s` | Time allowed for in-flight work at shutdown |

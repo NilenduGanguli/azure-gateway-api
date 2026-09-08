@@ -28,11 +28,14 @@ const (
 	// Sync202 degrades to an asynchronous operation, as the DI container has been observed doing
 	// under memory pressure.
 	Sync202
-	// Sync404 omits the route, as image builds without it do.
+	// Sync404 omits the route entirely, the way an image build without it does: Kestrel answers an
+	// unrouted path with a bodyless 404, not with a Document Intelligence error object.
 	Sync404
 	// Sync500Unhandled answers with the UnhandledEndpointException older builds return instead of
 	// a clean 404.
 	Sync500Unhandled
+	// SyncModelNotFound serves the route but rejects the model, which is request-scoped.
+	SyncModelNotFound
 )
 
 // Options configures a fake container.
@@ -61,6 +64,10 @@ type Options struct {
 	StatusUnhealthy bool
 	// RequireAPIKey rejects calls without Ocp-Apim-Subscription-Key.
 	RequireAPIKey string
+	// SyncErrorStatus, when non-zero, makes the synchronous route fail with this status and an
+	// unparseable body — HTML, as an nginx sidecar produces — plus a Retry-After the gateway must
+	// not relay onto a non-retriable status.
+	SyncErrorStatus int
 }
 
 // Container is a fake Azure container.
@@ -241,9 +248,31 @@ func (c *Container) serveSync(w http.ResponseWriter, r *http.Request, di bool) {
 		time.Sleep(c.opts.Latency)
 	}
 
+	if c.opts.SyncErrorStatus != 0 {
+		w.Header().Set("Retry-After", "120")
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(c.opts.SyncErrorStatus)
+		_, _ = w.Write([]byte("<html><head><title>413 Request Entity Too Large</title></head></html>"))
+		return
+	}
+
 	switch c.opts.Sync {
 	case Sync404:
-		writeDIError(w, http.StatusNotFound, "NotFound", "Resource not found.")
+		// Kestrel's unrouted response: no body at all. This is what distinguishes "this build does
+		// not serve the route" from "this build serves it and your model does not exist".
+		w.WriteHeader(http.StatusNotFound)
+		return
+	case SyncModelNotFound:
+		// The route exists; the model does not. Request-scoped, so it must not disable the route.
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"error": map[string]any{
+				"code": "NotFound", "message": "Resource not found.",
+				"innererror": map[string]string{
+					"code":    "ModelNotFound",
+					"message": "The requested model wasn't found. It was deleted or still building.",
+				},
+			},
+		})
 		return
 	case Sync500Unhandled:
 		writeDIError(w, http.StatusInternalServerError, "InternalServerError",

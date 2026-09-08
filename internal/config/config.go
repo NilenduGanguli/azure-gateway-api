@@ -82,10 +82,22 @@ type Config struct {
 	// per-request timeout, which outlasts any shutdown grace and gets the pod SIGKILLed.
 	ArtifactFetchTimeout time.Duration
 
+	// UploadTimeout bounds how long a client may take to stream its request body while holding an
+	// admission slot.
+	//
+	// Without it a handful of connections trickling a byte at a time occupy every slot on a
+	// surface indefinitely and the gateway stops accepting real work — the slot is taken before
+	// the body can be read, because the body has to go somewhere.
+	UploadTimeout time.Duration
+
 	ResultTTL         time.Duration
 	GCInterval        time.Duration
 	DiskHighWatermark float64
 	MaxRequestBytes   int64
+	// MaxResultBytes caps an upstream response. It is separate from MaxRequestBytes because they
+	// bound opposite directions: lowering the upload limit to reject big submissions would
+	// otherwise also start failing every large analysis the container legitimately returns.
+	MaxResultBytes int64
 
 	// PollRetryAfter is the integer-seconds Retry-After emitted on the 202 and on in-progress
 	// polls. Never zero: azure-core's default polling interval is 30s when the header is absent,
@@ -115,6 +127,7 @@ func Load() (*Config, error) {
 		QueueDepth:            envInt("QUEUE_DEPTH", 0),
 		DiskHighWatermark:     envFloat("DISK_HIGH_WATERMARK", 0.90),
 		MaxRequestBytes:       int64(envInt("MAX_REQUEST_BYTES", 500*1024*1024)),
+		MaxResultBytes:        int64(envInt("MAX_RESULT_BYTES", 512*1024*1024)),
 		PollRetryAfter:        envInt("POLL_RETRY_AFTER", 1),
 		BusyRetryAfter:        envInt("BUSY_RETRY_AFTER", 5),
 		LogLevel:              strings.ToLower(env("LOG_LEVEL", "info")),
@@ -146,6 +159,9 @@ func Load() (*Config, error) {
 		collect(err)
 	}
 	if c.ArtifactFetchTimeout, err = envDuration("ARTIFACT_FETCH_TIMEOUT", 2*time.Minute); err != nil {
+		collect(err)
+	}
+	if c.UploadTimeout, err = envDuration("UPLOAD_TIMEOUT", 10*time.Minute); err != nil {
 		collect(err)
 	}
 	if c.DI.Timeout, err = envDuration("DI_UPSTREAM_TIMEOUT", 15*time.Minute); err != nil {
@@ -191,6 +207,9 @@ func Load() (*Config, error) {
 	if c.MaxRequestBytes <= 0 {
 		collect(errors.New("MAX_REQUEST_BYTES must be positive"))
 	}
+	if c.MaxResultBytes <= 0 {
+		collect(errors.New("MAX_RESULT_BYTES must be positive"))
+	}
 	if c.PollRetryAfter < 1 {
 		collect(errors.New("POLL_RETRY_AFTER must be at least 1 second"))
 	}
@@ -205,6 +224,9 @@ func Load() (*Config, error) {
 	}
 	if c.ArtifactFetchTimeout <= 0 {
 		collect(errors.New("ARTIFACT_FETCH_TIMEOUT must be positive"))
+	}
+	if c.UploadTimeout <= 0 {
+		collect(errors.New("UPLOAD_TIMEOUT must be positive"))
 	}
 
 	if len(errs) > 0 {
@@ -314,6 +336,20 @@ func (c *Config) Redacted() map[string]any {
 		"logLevel":              c.LogLevel,
 		"logFormat":             c.LogFormat,
 	}
+}
+
+// safeURL strips any userinfo before a URL is rendered.
+//
+// /_gw/config and /_gw/health are unauthenticated, and an upstream configured as
+// http://user:pass@host:5000 would otherwise publish that credential to anyone who can reach the
+// gateway.
+func safeURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.User == nil {
+		return raw
+	}
+	u.User = url.User(u.User.Username() + ":***")
+	return u.String()
 }
 
 func env(key, def string) string {

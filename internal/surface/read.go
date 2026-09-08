@@ -16,7 +16,6 @@ func (s *Server) registerRead(mux *http.ServeMux) {
 	mux.HandleFunc("POST "+readPrefix+"/syncAnalyze", s.readSyncAnalyze)
 	mux.HandleFunc("GET "+readPrefix+"/analyzeResults/{operationId}", s.readPoll)
 	mux.HandleFunc("HEAD "+readPrefix+"/analyzeResults/{operationId}", s.readPoll)
-	mux.HandleFunc("DELETE "+readPrefix+"/analyzeResults/{operationId}", s.readDelete)
 }
 
 // readAnalyze accepts an asynchronous read.
@@ -48,13 +47,11 @@ func readOperationLocation(base, id string) string {
 // operation id, so it load-balances correctly across replicas with no affinity and no shared
 // result store.
 func (s *Server) readSyncAnalyze(w http.ResponseWriter, r *http.Request) {
-	s.passthrough(w, r, azerr.SurfaceRead, jobs.SurfaceRead, readPrefix+"/syncAnalyze")
+	s.passthrough(w, r, azerr.SurfaceRead, jobs.SurfaceRead, upstream.Request{
+		Query: upstreamQuery(r.URL.Query()),
+	})
 }
 
 func (s *Server) readPoll(w http.ResponseWriter, r *http.Request) {
 	s.poll(w, r, azerr.SurfaceRead, jobs.SurfaceRead, r.PathValue("operationId"))
-}
-
-func (s *Server) readDelete(w http.ResponseWriter, r *http.Request) {
-	s.deleteResult(w, r, azerr.SurfaceRead, jobs.SurfaceRead, r.PathValue("operationId"))
 }

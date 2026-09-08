@@ -74,6 +74,10 @@ func RequestID(base *slog.Logger) Middleware {
 			log := base.With("requestId", rid)
 			if cid := r.Header.Get(HeaderClientRequestID); cid != "" {
 				log = log.With("clientRequestId", cid)
+				// Echo it back, as the service does. No SDK requires the echo, but correlating a
+				// client's own trace id against a gateway log line is the first thing anyone
+				// debugging a stuck operation reaches for.
+				w.Header().Set(HeaderClientRequestID, cid)
 			}
 			next.ServeHTTP(w, r.WithContext(logging.WithLogger(r.Context(), log)))
 		})

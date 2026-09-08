@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // Kind identifies which artifact of a job a blob holds.
@@ -270,6 +271,60 @@ func (b *BlobStore) SweepTemp(minAgeSeconds int64, now int64) (int, error) {
 	return removed, err
 }
 
+// IDs walks the blob tree and reports the distinct job ids it finds, up to limit.
+//
+// It exists so the sweeper can reclaim blobs whose row is gone. Delete removes the row first, so
+// a partial blob removal leaks files rather than stranding a row — a leak this can collect.
+func (b *BlobStore) IDs(limit int) ([]string, error) {
+	seen := make(map[string]struct{})
+	out := make([]string, 0, limit)
+	err := filepath.WalkDir(b.root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || len(out) >= limit {
+			return nil
+		}
+		name := d.Name()
+		if strings.Contains(name, ".tmp-") {
+			return nil
+		}
+		id, _, ok := strings.Cut(name, ".")
+		if !ok || id == "" {
+			return nil
+		}
+		if _, dup := seen[id]; dup {
+			return nil
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+		return nil
+	})
+	return out, err
+}
+
+// OlderThan reports whether every artifact for an id predates the cutoff, so an id whose blobs
+// were written moments ago — by a submit whose row is still committing — is left alone.
+func (b *BlobStore) OlderThan(id string, cutoff int64) bool {
+	entries, err := os.ReadDir(b.dir(id))
+	if err != nil {
+		return false
+	}
+	prefix := sanitize(id) + "."
+	var found bool
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), prefix) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			return false
+		}
+		if info.ModTime().Unix() > cutoff {
+			return false
+		}
+		found = true
+	}
+	return found
+}
+
 // syncDir fsyncs a directory so a rename into it survives a crash.
 func syncDir(dir string) error {
 	d, err := os.Open(dir)
@@ -278,9 +333,14 @@ func syncDir(dir string) error {
 	}
 	defer func() { _ = d.Close() }()
 	if err := d.Sync(); err != nil {
-		// Some filesystems reject fsync on a directory. The rename is still ordered on every
-		// filesystem this runs on, so this is reported but not fatal.
-		return nil
+		// Some filesystems legitimately reject fsync on a directory; those errors are expected and
+		// harmless. Anything else is a real durability failure and must not be reported as a
+		// successful, durable write — the 202 the caller is about to receive rests on it.
+		if errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOTSUP) ||
+			errors.Is(err, syscall.EBADF) || errors.Is(err, syscall.EISDIR) {
+			return nil
+		}
+		return fmt.Errorf("store: sync dir %s: %w", dir, err)
 	}
 	return nil
 }

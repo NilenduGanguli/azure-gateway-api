@@ -293,31 +293,43 @@ func (s *Store) Heartbeat(ctx context.Context, id string, leaseUntil time.Time) 
 }
 
 // Succeed records a completed job. The result envelope is already on disk at resultPath.
+// It reports ok=false when no row matched, which means the job was deleted while it ran — by a
+// client DELETE or by disk-pressure eviction. The caller must then discard the artifacts it just
+// wrote, or they stay on the volume with nothing referencing them.
 func (s *Store) Succeed(ctx context.Context, id, resultPath string, resultBytes int64,
-	mode UpstreamMode, upstreamMS int64, hasPDF bool, figures string, now time.Time) error {
+	mode UpstreamMode, upstreamMS int64, hasPDF bool, figures string, now time.Time) (bool, error) {
 	pdf := 0
 	if hasPDF {
 		pdf = 1
 	}
-	_, err := s.w.ExecContext(ctx, `
+	res, err := s.w.ExecContext(ctx, `
 		UPDATE jobs SET status = ?, result_path = ?, result_bytes = ?, upstream_mode = ?,
 		                upstream_ms = ?, has_pdf = ?, figures = ?, updated_at = ?,
 		                lease_owner = '', lease_until = 0, input_path = ''
 		WHERE id = ?`,
 		string(StatusSucceeded), resultPath, resultBytes, string(mode), upstreamMS,
 		pdf, figures, now.Unix(), id)
-	return err
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
 // Fail records a terminal failure with the Azure-shaped error object to serve to the client.
+// Like Succeed, it reports ok=false when the row is already gone.
 func (s *Store) Fail(ctx context.Context, id, errorJSON string, mode UpstreamMode,
-	upstreamStatus int, upstreamMS int64, now time.Time) error {
-	_, err := s.w.ExecContext(ctx, `
+	upstreamStatus int, upstreamMS int64, now time.Time) (bool, error) {
+	res, err := s.w.ExecContext(ctx, `
 		UPDATE jobs SET status = ?, error_json = ?, upstream_mode = ?, upstream_status = ?,
 		                upstream_ms = ?, updated_at = ?, lease_owner = '', lease_until = 0
 		WHERE id = ?`,
 		string(StatusFailed), errorJSON, string(mode), upstreamStatus, upstreamMS, now.Unix(), id)
-	return err
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
 // SetUpstreamOp records the upstream operation URL for a job that degraded to async, so a
@@ -330,11 +342,15 @@ func (s *Store) SetUpstreamOp(ctx context.Context, id, opURL string, mode Upstre
 }
 
 // Requeue returns a job to notStarted so it can be picked up again after a crash.
-func (s *Store) Requeue(ctx context.Context, id string, now time.Time) error {
+//
+// It takes a lease even though no worker holds the job yet. That lease is what stops the periodic
+// reclaim pass from picking the same row up again in the window between requeueing it and a worker
+// marking it running — which would run the analysis twice against the container.
+func (s *Store) Requeue(ctx context.Context, id string, now, leaseUntil time.Time) error {
 	_, err := s.w.ExecContext(ctx, `
-		UPDATE jobs SET status = ?, lease_owner = '', lease_until = 0, updated_at = ?
+		UPDATE jobs SET status = ?, lease_owner = ?, lease_until = ?, updated_at = ?
 		WHERE id = ?`,
-		string(StatusNotStarted), now.Unix(), id)
+		string(StatusNotStarted), "requeued", leaseUntil.Unix(), now.Unix(), id)
 	return err
 }
 
@@ -344,12 +360,19 @@ func (s *Store) Requeue(ctx context.Context, id string, now time.Time) error {
 // The lease filter is what makes this safe to run periodically — it will not reclaim a job that
 // another worker in this process is still heartbeating. TTL-expired jobs are excluded for the same
 // reason as in Abandoned.
-func (s *Store) Orphaned(ctx context.Context, now time.Time, limit int) ([]*Job, error) {
+// notStartedBefore excludes rows a live submit may still be handing to a worker, and the lease
+// check excludes rows this process has already requeued but not yet started, so a periodic pass
+// cannot run the same analysis a second time.
+func (s *Store) Orphaned(ctx context.Context, now, notStartedBefore time.Time, limit int) ([]*Job, error) {
 	rows, err := s.r.QueryContext(ctx, `
 		SELECT `+jobColumns+` FROM jobs
-		WHERE ((status = ?) OR (status = ? AND lease_until < ?)) AND expires_at >= ?
+		WHERE ((status = ? AND created_at < ? AND lease_until < ?)
+		       OR (status = ? AND lease_until < ?))
+		  AND expires_at >= ?
 		ORDER BY created_at ASC LIMIT ?`,
-		string(StatusNotStarted), string(StatusRunning), now.Unix(), now.Unix(), limit)
+		string(StatusNotStarted), notStartedBefore.Unix(), now.Unix(),
+		string(StatusRunning), now.Unix(),
+		now.Unix(), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -380,11 +403,23 @@ func (s *Store) Abandoned(ctx context.Context, now time.Time, limit int) ([]*Job
 	return collectJobs(rows)
 }
 
-// Expired returns jobs past their TTL, oldest first.
+// Expired returns jobs past their TTL that are safe to delete, oldest first.
+//
+// A job that is still running is excluded even when expired: deleting it out from under its worker
+// leaves the worker writing a result into a blob store with no row to reference it, and the
+// artifacts it goes on to fetch are unreachable from that moment. Once its lease lapses the
+// recovery pass reclaims it and it becomes terminal, after which this picks it up.
 func (s *Store) Expired(ctx context.Context, now time.Time, limit int) ([]*Job, error) {
-	rows, err := s.r.QueryContext(ctx,
-		`SELECT `+jobColumns+` FROM jobs WHERE expires_at < ? ORDER BY expires_at ASC LIMIT ?`,
-		now.Unix(), limit)
+	rows, err := s.r.QueryContext(ctx, `
+		SELECT `+jobColumns+` FROM jobs
+		WHERE expires_at < ?
+		  AND (status IN (?, ?) OR (status = ? AND lease_until < ?) OR status = ?)
+		ORDER BY expires_at ASC LIMIT ?`,
+		now.Unix(),
+		string(StatusSucceeded), string(StatusFailed),
+		string(StatusRunning), now.Unix(),
+		string(StatusNotStarted),
+		limit)
 	if err != nil {
 		return nil, err
 	}
@@ -392,13 +427,19 @@ func (s *Store) Expired(ctx context.Context, now time.Time, limit int) ([]*Job, 
 	return collectJobs(rows)
 }
 
-// EvictionCandidates returns completed jobs to drop when the volume is near full, oldest first.
-// Only terminal jobs are eligible: evicting a running job would break a promise still in flight.
-func (s *Store) EvictionCandidates(ctx context.Context, limit int) ([]*Job, error) {
+// EvictionCandidates returns completed jobs to drop when the volume is near full.
+//
+// Only terminal jobs are eligible — evicting a running job would break a promise still in flight —
+// and already-expired ones are offered first, because a poll on those returns 404 either way.
+// Only once those are exhausted does this start on results a client could still legitimately
+// fetch, which is a real cost and is logged as such by the caller.
+func (s *Store) EvictionCandidates(ctx context.Context, now time.Time, limit int) ([]*Job, error) {
 	rows, err := s.r.QueryContext(ctx, `
 		SELECT `+jobColumns+` FROM jobs
-		WHERE status IN (?, ?) ORDER BY updated_at ASC LIMIT ?`,
-		string(StatusSucceeded), string(StatusFailed), limit)
+		WHERE status IN (?, ?)
+		ORDER BY (expires_at >= ?) ASC, updated_at ASC
+		LIMIT ?`,
+		string(StatusSucceeded), string(StatusFailed), now.Unix(), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -430,12 +471,26 @@ func collectJobs(rows *sql.Rows) ([]*Job, error) {
 }
 
 // Delete removes a job row and every artifact belonging to it.
+//
+// The row goes first, and deliberately so. Removing blobs first meant a partial failure — one
+// unlinked result and one stubborn figure — left the row behind pointing at a result that no
+// longer existed, and a poll on it then produced a 500 with no top-level status, which is the
+// shape that crashes Java clients outright. Row-first inverts the failure: the worst case is an
+// orphaned blob, which SweepOrphans reclaims and which no client can observe.
 func (s *Store) Delete(ctx context.Context, id string) error {
-	if err := s.Blob.RemoveAll(id); err != nil {
+	if _, err := s.w.ExecContext(ctx, `DELETE FROM jobs WHERE id = ?`, id); err != nil {
 		return err
 	}
-	_, err := s.w.ExecContext(ctx, `DELETE FROM jobs WHERE id = ?`, id)
-	return err
+	return s.Blob.RemoveAll(id)
+}
+
+// Exists reports whether a job row is present.
+func (s *Store) Exists(ctx context.Context, id string) bool {
+	var n int
+	if err := s.r.QueryRowContext(ctx, `SELECT 1 FROM jobs WHERE id = ? LIMIT 1`, id).Scan(&n); err != nil {
+		return false
+	}
+	return n == 1
 }
 
 // Counts summarises job states for the admin surface and metrics.

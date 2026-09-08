@@ -160,8 +160,12 @@ func TestJobLifecycle(t *testing.T) {
 		t.Errorf("attempts is %d, want 1", got.Attempts)
 	}
 
-	if err := s.Succeed(ctx, job.ID, "/data/blobs/x.res", 1234, ModeSync, 55, true, "1.1", now); err != nil {
+	ok, err := s.Succeed(ctx, job.ID, "/data/blobs/x.res", 1234, ModeSync, 55, true, "1.1", now)
+	if err != nil {
 		t.Fatalf("succeed: %v", err)
+	}
+	if !ok {
+		t.Fatal("Succeed reported no matching row for a job that exists")
 	}
 	got, _ = s.Get(ctx, job.ID)
 	if got.Status != StatusSucceeded || got.ResultBytes != 1234 || got.Mode != ModeSync {
@@ -200,7 +204,7 @@ func TestOrphanedFindsBothStates(t *testing.T) {
 		t.Fatalf("mark running: %v", err)
 	}
 
-	got, err := s.Orphaned(ctx, now, 10)
+	got, err := s.Orphaned(ctx, now, now.Add(time.Minute), 10)
 	if err != nil {
 		t.Fatalf("orphaned: %v", err)
 	}
@@ -275,5 +279,178 @@ func TestStatsCountsBySurfaceAndStatus(t *testing.T) {
 	}
 	if counts["read"].Running != 1 {
 		t.Errorf("read counts wrong: %+v", counts["read"])
+	}
+}
+
+// TestSucceedReportsAMissingRow covers the case where a job is deleted while it runs — by a client
+// DELETE or by disk-pressure eviction. The worker must learn that its result references nothing,
+// or the artifacts it just wrote stay on the volume forever.
+func TestSucceedReportsAMissingRow(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	ok, err := s.Succeed(ctx, "00000000-0000-4000-8000-00000000dead", "/x", 1, ModeSync, 1, false, "", now)
+	if err != nil {
+		t.Fatalf("succeed: %v", err)
+	}
+	if ok {
+		t.Error("Succeed reported a row was updated for an id that does not exist")
+	}
+
+	ok, err = s.Fail(ctx, "00000000-0000-4000-8000-00000000dead", "{}", ModeSync, 500, 1, now)
+	if err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+	if ok {
+		t.Error("Fail reported a row was updated for an id that does not exist")
+	}
+}
+
+// TestDeleteRemovesTheRowBeforeTheBlobs is a regression test.
+//
+// Removing blobs first meant a partial failure left the row behind pointing at a result that no
+// longer existed, and a poll on it produced a 500 with no top-level status — the shape that
+// crashes Java clients. Row-first inverts the failure into an orphaned blob, which the sweeper
+// reclaims and which no client can observe.
+func TestDeleteRemovesTheRowBeforeTheBlobs(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	id := "00000000-0000-4000-8000-00000000d001"
+
+	if err := s.Create(ctx, &Job{
+		ID: id, Surface: "di", Status: StatusSucceeded,
+		CreatedAt: now, UpdatedAt: now, ExpiresAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := s.Blob.WriteAll(id, KindResult, []byte(`{"a":1}`)); err != nil {
+		t.Fatalf("write blob: %v", err)
+	}
+	if err := s.Delete(ctx, id); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if s.Exists(ctx, id) {
+		t.Error("the row survived Delete")
+	}
+	if _, _, err := s.Blob.Open(id, KindResult); err == nil {
+		t.Error("the blob survived Delete")
+	}
+}
+
+// TestExpiredLeavesRunningJobsAlone checks that the TTL sweeper cannot delete a job out from under
+// its worker, which would leave the worker writing a result no row references.
+func TestExpiredLeavesRunningJobsAlone(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Expired, but a worker is actively heartbeating it.
+	live := "00000000-0000-4000-8000-00000000r001"
+	if err := s.Create(ctx, &Job{
+		ID: live, Surface: "di", Status: StatusNotStarted,
+		CreatedAt: now.Add(-2 * time.Hour), UpdatedAt: now, ExpiresAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := s.MarkRunning(ctx, live, "worker-0", now.Add(time.Minute), now); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+
+	// Expired and terminal: safe to remove.
+	done := "00000000-0000-4000-8000-00000000r002"
+	if err := s.Create(ctx, &Job{
+		ID: done, Surface: "di", Status: StatusSucceeded,
+		CreatedAt: now.Add(-2 * time.Hour), UpdatedAt: now, ExpiresAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	got, err := s.Expired(ctx, now, 10)
+	if err != nil {
+		t.Fatalf("expired: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != done {
+		ids := make([]string, len(got))
+		for i, j := range got {
+			ids[i] = j.ID
+		}
+		t.Fatalf("Expired returned %v; a running job with a live lease must be left alone", ids)
+	}
+}
+
+// TestEvictionPrefersExpiredResults checks the ordering that keeps disk-pressure eviction from
+// taking a result a client could still legitimately fetch while an already-404 one sits next to it.
+func TestEvictionPrefersExpiredResults(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// The unexpired one is older, so a plain updated_at ordering would offer it first.
+	fresh := "00000000-0000-4000-8000-00000000v001"
+	stale := "00000000-0000-4000-8000-00000000v002"
+	if err := s.Create(ctx, &Job{
+		ID: fresh, Surface: "di", Status: StatusSucceeded,
+		CreatedAt: now.Add(-3 * time.Hour), UpdatedAt: now.Add(-3 * time.Hour),
+		ExpiresAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := s.Create(ctx, &Job{
+		ID: stale, Surface: "di", Status: StatusSucceeded,
+		CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour),
+		ExpiresAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	got, err := s.EvictionCandidates(ctx, now, 10)
+	if err != nil {
+		t.Fatalf("eviction candidates: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d candidates, want 2", len(got))
+	}
+	if got[0].ID != stale {
+		t.Errorf("first candidate is %s; the already-expired result must be offered first",
+			got[0].ID)
+	}
+}
+
+// TestOrphanedIgnoresFreshNotStartedRows checks the guard that keeps the periodic reclaim pass
+// from racing a live submit: a row committed moments ago is still on its way to a worker, and
+// reclaiming it would run the same analysis twice against the container.
+func TestOrphanedIgnoresFreshNotStartedRows(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	fresh := "00000000-0000-4000-8000-00000000n001"
+	old := "00000000-0000-4000-8000-00000000n002"
+	if err := s.Create(ctx, &Job{
+		ID: fresh, Surface: "di", Status: StatusNotStarted,
+		CreatedAt: now, UpdatedAt: now, ExpiresAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := s.Create(ctx, &Job{
+		ID: old, Surface: "di", Status: StatusNotStarted,
+		CreatedAt: now.Add(-10 * time.Minute), UpdatedAt: now.Add(-10 * time.Minute),
+		ExpiresAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	got, err := s.Orphaned(ctx, now, now.Add(-4*time.Minute), 10)
+	if err != nil {
+		t.Fatalf("orphaned: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != old {
+		ids := make([]string, len(got))
+		for i, j := range got {
+			ids[i] = j.ID
+		}
+		t.Fatalf("Orphaned returned %v; a just-committed row must not be reclaimed", ids)
 	}
 }

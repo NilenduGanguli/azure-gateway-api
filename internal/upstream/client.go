@@ -331,7 +331,7 @@ func drain(resp *http.Response) {
 // checkStatus fetches the container's /status endpoint, which validates its billing key without
 // consuming a model query.
 func (b *base) checkStatus(ctx context.Context) Health {
-	h := Health{Name: b.name, URL: b.baseURL, SyncAnalyze: "unknown"}
+	h := Health{Name: b.name, URL: redactUserinfo(b.baseURL), SyncAnalyze: "unknown"}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
@@ -394,8 +394,20 @@ func (b *base) unreachable(ctx context.Context, err error) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
 	}
+	// The transport error text embeds the full upstream URL, which is internal topology. It is
+	// logged by the caller; the client is told only which surface failed.
 	return azerr.Internal(b.surface,
-		fmt.Sprintf("The %s container is unreachable: %v", b.name, err))
+		fmt.Sprintf("The %s container is unreachable.", b.name))
+}
+
+// redactUserinfo removes credentials from a URL before it is shown on an unauthenticated endpoint.
+func redactUserinfo(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.User == nil {
+		return raw
+	}
+	u.User = url.User(u.User.Username() + ":***")
+	return u.String()
 }
 
 // ErrSyncUnavailable reports that a container does not serve its synchronous analyze route.

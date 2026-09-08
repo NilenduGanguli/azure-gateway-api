@@ -2,11 +2,14 @@ package surface
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/NilenduGanguli/azure-gateway-api/internal/azerr"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/ids"
@@ -32,9 +35,9 @@ func (s *Server) registerDI(mux *http.ServeMux) {
 	mux.HandleFunc("GET "+diPrefix+"/documentModels/{modelId}/analyzeResults/{resultId}/pdf", s.diPDF)
 	mux.HandleFunc("GET "+diPrefix+"/documentModels/{modelId}/analyzeResults/{resultId}/figures/{figureId}", s.diFigure)
 
-	mux.HandleFunc("GET "+diPrefix+"/info", s.diMetadata)
-	mux.HandleFunc("GET "+diPrefix+"/documentModels", s.diMetadata)
-	mux.HandleFunc("GET "+diPrefix+"/documentModels/{modelId}", s.diMetadata)
+	mux.HandleFunc("GET "+diPrefix+"/info", s.diInfo)
+	mux.HandleFunc("GET "+diPrefix+"/documentModels", s.diListModels)
+	mux.HandleFunc("GET "+diPrefix+"/documentModels/{modelId}", s.diGetModel)
 }
 
 // diAction dispatches the colon-suffixed analyze verbs.
@@ -114,8 +117,9 @@ func (s *Server) diSyncAnalyze(w http.ResponseWriter, r *http.Request, modelID s
 		err.WriteTo(w, azerr.SurfaceDI)
 		return
 	}
-	s.passthrough(w, r, azerr.SurfaceDI, jobs.SurfaceDI,
-		diPrefix+"/documentModels/"+url.PathEscape(modelID)+":syncAnalyze")
+	s.passthrough(w, r, azerr.SurfaceDI, jobs.SurfaceDI, upstream.Request{
+		ModelID: modelID, Query: upstreamQuery(r.URL.Query()),
+	})
 }
 
 func (s *Server) diPoll(w http.ResponseWriter, r *http.Request) {
@@ -171,9 +175,52 @@ func (s *Server) diArtifact(w http.ResponseWriter, r *http.Request, kind store.K
 	}
 }
 
-// diMetadata proxies the read-only model and capability endpoints.
-func (s *Server) diMetadata(w http.ResponseWriter, r *http.Request) {
-	s.proxyGET(w, r, azerr.SurfaceDI, jobs.SurfaceDI, r.URL.Path)
+// diInfo proxies GET /documentintelligence/info.
+func (s *Server) diInfo(w http.ResponseWriter, r *http.Request) {
+	s.proxyGET(w, r, azerr.SurfaceDI, jobs.SurfaceDI, diPrefix+"/info")
+}
+
+// diListModels proxies GET /documentintelligence/documentModels.
+func (s *Server) diListModels(w http.ResponseWriter, r *http.Request) {
+	s.proxyGET(w, r, azerr.SurfaceDI, jobs.SurfaceDI, diPrefix+"/documentModels")
+}
+
+// diGetModel proxies GET /documentintelligence/documentModels/{modelId}.
+//
+// The path is rebuilt from the routed component and re-escaped rather than taken from the request.
+// Forwarding the raw path would let a caller shape the URL the gateway signs with its own upstream
+// key, and the gateway is the only party holding that credential.
+func (s *Server) diGetModel(w http.ResponseWriter, r *http.Request) {
+	modelID := r.PathValue("modelId")
+	if !validModelID(modelID) {
+		azerr.InvalidParameter(azerr.SurfaceDI, "modelId", "the value is not a valid model name").
+			WriteTo(w, azerr.SurfaceDI)
+		return
+	}
+	s.proxyGET(w, r, azerr.SurfaceDI, jobs.SurfaceDI,
+		diPrefix+"/documentModels/"+url.PathEscape(modelID))
+}
+
+// validModelID applies the contract's own constraint: maxLength 64, pattern
+// ^[a-zA-Z0-9][a-zA-Z0-9._~-]{1,63}$.
+func validModelID(s string) bool {
+	if len(s) < 2 || len(s) > 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		alnum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		if i == 0 {
+			if !alnum {
+				return false
+			}
+			continue
+		}
+		if !alnum && c != '.' && c != '_' && c != '~' && c != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 // requireAPIVersion enforces the query parameter every SDK sends.
@@ -201,11 +248,15 @@ func upstreamQuery(q url.Values) url.Values {
 	return out
 }
 
-// passthrough streams a synchronous request to the container and the response back.
+// passthrough serves a client-facing synchronous analyze.
+//
+// It is not a blind relay. The container's synchronous route is not contractually synchronous —
+// it has been observed degrading to 202 under memory pressure — and relaying that 202 would hand
+// the caller an empty body with no way to reach a result the container has already been paid to
+// produce. The upstream client resolves that case by polling the operation out; this handler only
+// ever emits a terminal answer.
 func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, surface azerr.Surface,
-	surfaceName, path string) {
-
-	log := logging.From(r.Context())
+	surfaceName string, req upstream.Request) {
 
 	release, err := s.deps.Jobs.Admit(surfaceName)
 	if err != nil {
@@ -214,29 +265,168 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, surface aze
 	}
 	defer release()
 
-	client, ok := s.deps.Jobs.Analyzer(surfaceName).(passthroughClient)
+	// Admission alone is sized MaxInflight+QueueDepth. The container's own concurrency limit is
+	// MaxInflight, so a synchronous call takes a container slot too.
+	releaseUpstream, err := s.deps.Jobs.AdmitUpstream(surfaceName)
+	if err != nil {
+		azerr.TooBusy(surface, s.deps.Config.BusyRetryAfter).WriteTo(w, surface)
+		return
+	}
+	defer releaseUpstream()
+
+	client, ok := s.deps.Jobs.Analyzer(surfaceName).(upstream.SyncAnalyzer)
 	if !ok {
-		azerr.Internal(surface, "This surface does not support synchronous passthrough.").
+		azerr.Internal(surface, "This surface does not support synchronous analysis.").
 			WriteTo(w, surface)
 		return
 	}
 
+	s.setUploadDeadline(w, r)
+
 	body := http.MaxBytesReader(w, r.Body, s.deps.Config.MaxRequestBytes)
-	resp, err := client.Passthrough(r.Context(), r.Method, path, upstreamQuery(r.URL.Query()),
-		r.Header.Get("Content-Type"), body, r.ContentLength)
+	outcome, err := client.SyncAnalyze(r.Context(), req, r.Header.Get("Content-Type"),
+		body, r.ContentLength)
 	if err != nil {
-		log.Warn("synchronous passthrough failed", "path", path, "error", err)
-		azerr.Internal(surface, "The upstream container is unreachable.").WriteTo(w, surface)
+		s.writeUpstreamError(w, r, surface, err)
 		return
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer outcome.Close()
 
-	copyResponse(w, resp)
+	if outcome.Resolved != nil {
+		s.writeResolvedSync(w, r, surface, outcome)
+		return
+	}
+	s.relaySync(w, r, surface, outcome.Live)
 }
 
-// proxyGET forwards a small read-only request and returns the response verbatim.
+// writeUpstreamError renders a failed synchronous call in the surface's own error shape.
+//
+// An oversized body is reported as the documented 400 rather than the transport-level error
+// http.MaxBytesReader produces, and a body that ran past the cap is never mistaken for the
+// container being unreachable.
+func (s *Server) writeUpstreamError(w http.ResponseWriter, r *http.Request, surface azerr.Surface,
+	err error) {
+
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		azerr.ContentTooLarge(surface).WriteTo(w, surface)
+		return
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		// The caller hung up or the deadline passed; nothing useful to send.
+		logging.From(r.Context()).Info("synchronous call abandoned", "error", err)
+		return
+	}
+	if apiErr, ok := azerr.AsAPIError(err); ok {
+		apiErr.WriteTo(w, surface)
+		return
+	}
+	logging.From(r.Context()).Warn("synchronous call failed", "error", err)
+	azerr.Internal(surface, "").WriteTo(w, surface)
+}
+
+// writeResolvedSync serves an analysis the gateway had to poll out of a degraded 202.
+//
+// The envelope is the shape both surfaces use for a completed operation, which is also what the
+// Read documentation says its synchronous route returns: "the same object graph as the
+// asynchronous version".
+func (s *Server) writeResolvedSync(w http.ResponseWriter, r *http.Request, surface azerr.Surface,
+	outcome *upstream.SyncOutcome) {
+
+	reader, size, err := outcome.OpenResolved()
+	if err != nil {
+		azerr.Internal(surface, "The analysis completed but its result could not be read.").
+			WriteTo(w, surface)
+		return
+	}
+	defer func() { _ = reader.Close() }()
+
+	now := s.deps.Now().Format(jobs.TimeFormat)
+	prefix := fmt.Sprintf(
+		`{"status":"succeeded","createdDateTime":"%s","lastUpdatedDateTime":"%s","analyzeResult":`,
+		now, now)
+	const suffix = "}"
+
+	h := w.Header()
+	h.Set("Content-Type", "application/json; charset=utf-8")
+	h.Set("Content-Length", strconv.FormatInt(int64(len(prefix))+size+int64(len(suffix)), 10))
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodHead {
+		return
+	}
+	if _, err := io.WriteString(w, prefix); err != nil {
+		return
+	}
+	if _, err := io.Copy(w, reader); err != nil {
+		logging.From(r.Context()).Warn("synchronous result stream interrupted", "error", err)
+		return
+	}
+	_, _ = io.WriteString(w, suffix)
+}
+
+// relaySync forwards the container's own synchronous response.
+//
+// Successful bodies stream through untouched. Failures do not: the containers emit four different
+// error shapes on these routes, including a bare {"status":"Failed"} with no code or message and,
+// behind an nginx sidecar, HTML. Those are normalised into this surface's contract so a client's
+// SDK always has something it can parse.
+func (s *Server) relaySync(w http.ResponseWriter, r *http.Request, surface azerr.Surface,
+	resp *http.Response) {
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		copyResponse(w, resp)
+		return
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if parsed, ok := azerr.ParseUpstream(raw, resp.StatusCode); ok && parsed.Code != "" {
+		parsed.Status = resp.StatusCode
+		// Retry-After is deliberately not carried over: azure-core retries any response >= 400
+		// that carries it, ten times, bypassing its method allowlist. azerr re-adds it only for
+		// statuses where retrying is correct.
+		parsed.RetryAfter = 0
+		if retriableStatus(resp.StatusCode) {
+			parsed.RetryAfter = s.deps.Config.BusyRetryAfter
+		}
+		parsed.WriteTo(w, surface)
+		return
+	}
+	logging.From(r.Context()).Warn("upstream returned an unparseable error body",
+		"status", resp.StatusCode, "bytes", len(raw))
+	azerr.Internal(surface,
+		fmt.Sprintf("The upstream container returned HTTP %d.", resp.StatusCode)).
+		WriteTo(w, surface)
+}
+
+func retriableStatus(status int) bool {
+	switch status {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests,
+		http.StatusInternalServerError, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+// metadataTimeout bounds a read-only proxy call.
+//
+// These endpoints answer in milliseconds. Letting them inherit the analysis timeout meant a wedged
+// container could hold each one open for a quarter of an hour, and with no concurrency limit they
+// piled up without bound.
+const metadataTimeout = 10 * time.Second
+
+// proxyGET forwards a small read-only request.
+//
+// path is built by the caller from routed, validated components — never from r.URL.Path — because
+// the gateway signs this request with its own upstream credential.
 func (s *Server) proxyGET(w http.ResponseWriter, r *http.Request, surface azerr.Surface,
 	surfaceName, path string) {
+
+	release, err := s.deps.Jobs.AdmitMetadata(surfaceName)
+	if err != nil {
+		azerr.TooBusy(surface, s.deps.Config.BusyRetryAfter).WriteTo(w, surface)
+		return
+	}
+	defer release()
 
 	client, ok := s.deps.Jobs.Analyzer(surfaceName).(passthroughClient)
 	if !ok {
@@ -244,7 +434,11 @@ func (s *Server) proxyGET(w http.ResponseWriter, r *http.Request, surface azerr.
 			WriteTo(w, surface)
 		return
 	}
-	resp, err := client.PassthroughGET(r.Context(), path, upstreamQuery(r.URL.Query()))
+
+	ctx, cancel := context.WithTimeout(r.Context(), metadataTimeout)
+	defer cancel()
+
+	resp, err := client.PassthroughGET(ctx, path, upstreamQuery(r.URL.Query()))
 	if err != nil {
 		logging.From(r.Context()).Warn("metadata proxy failed", "path", path, "error", err)
 		azerr.Internal(surface, "The upstream container is unreachable.").WriteTo(w, surface)
@@ -252,7 +446,7 @@ func (s *Server) proxyGET(w http.ResponseWriter, r *http.Request, surface azerr.
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	copyResponse(w, resp)
+	s.relaySync(w, r, surface, resp)
 }
 
 // copyResponse relays an upstream response to the client.

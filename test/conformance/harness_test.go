@@ -101,6 +101,7 @@ func newHarness(t *testing.T, o harnessOpts) *harness {
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	manager.Start(ctx)
+	manager.Recover(ctx)
 	t.Cleanup(func() { cancel(); manager.Stop() })
 
 	mux := http.NewServeMux()

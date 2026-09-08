@@ -49,9 +49,15 @@ type surfaceRunner struct {
 	// the moment every worker is busy.
 	admits chan struct{}
 	queue  chan string
-	// workers is how many jobs actually run at once, and therefore how many concurrent calls the
-	// container sees.
+	// workers is how many jobs actually run at once.
 	workers int
+	// upstream bounds concurrent calls into the container. It is separate from admits because
+	// admits is sized MaxInflight+QueueDepth: with a queue configured, admission alone would let
+	// synchronous passthroughs put more work on the container than MaxInflight allows.
+	upstream chan struct{}
+	// metadata bounds the read-only proxy lane. Those calls are cheap and must not be able to
+	// starve analysis, nor pile up without limit against a wedged container.
+	metadata chan struct{}
 }
 
 // Manager runs jobs for both surfaces.
@@ -64,6 +70,15 @@ type Manager struct {
 
 	wg     sync.WaitGroup
 	cancel context.CancelFunc
+
+	// claims is the set of job ids this process already has queued or running.
+	//
+	// Nothing may enqueue an id twice. Two paths can reach the same row — a submit and the reclaim
+	// pass, or the boot reclaim and the periodic one — and each duplicate is a second billed
+	// analysis against the container for a result only one of them will store. Ordering the callers
+	// carefully is not enough; this makes it impossible.
+	claimMu sync.Mutex
+	claims  map[string]struct{}
 
 	// now is indirected so tests can control time.
 	now func() time.Time
@@ -91,6 +106,7 @@ func New(opts Options) *Manager {
 		log:     opts.Logger,
 		now:     nowFn,
 		runners: map[string]*surfaceRunner{},
+		claims:  map[string]struct{}{},
 	}
 	m.runners[SurfaceDI] = newRunner(SurfaceDI, opts.DI, opts.Config.DI.MaxInflight, opts.Config.QueueDepth)
 	m.runners[SurfaceRead] = newRunner(SurfaceRead, opts.Read, opts.Config.Read.MaxInflight, opts.Config.QueueDepth)
@@ -114,6 +130,8 @@ func newRunner(name string, a upstream.Analyzer, inflight, queueDepth int) *surf
 		admits:   make(chan struct{}, capacity),
 		queue:    make(chan string, capacity),
 		workers:  inflight,
+		upstream: make(chan struct{}, inflight),
+		metadata: make(chan struct{}, 4),
 	}
 }
 
@@ -130,12 +148,6 @@ func (m *Manager) Start(ctx context.Context) {
 			}(r, i)
 		}
 	}
-
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
-		m.recover(ctx, true)
-	}()
 
 	m.wg.Add(1)
 	go func() {
@@ -170,6 +182,12 @@ func (m *Manager) Drain(ctx context.Context) {
 	}
 }
 
+// Recover reclaims work abandoned by a previous process.
+//
+// It is called explicitly, before the listener opens, rather than from Start: a scan racing live
+// traffic can pick up a row a submit has just committed and not yet enqueued, and run it twice.
+func (m *Manager) Recover(ctx context.Context) { m.recover(ctx, true) }
+
 // Stop cancels the workers and waits for in-flight jobs to finish or abort.
 func (m *Manager) Stop() {
 	if m.cancel != nil {
@@ -197,6 +215,51 @@ func (m *Manager) Admit(surface string) (release func(), err error) {
 	}
 }
 
+// AdmitUpstream reserves one of the container's concurrency slots.
+//
+// Workers hold one for the duration of an analysis and synchronous passthroughs hold one for the
+// duration of their call, so the container never sees more than MaxInflight concurrent requests
+// regardless of how the admission queue is configured.
+func (m *Manager) AdmitUpstream(surface string) (release func(), err error) {
+	return acquire(m.runners[surface], func(r *surfaceRunner) chan struct{} { return r.upstream })
+}
+
+// AdmitMetadata reserves a slot on the read-only proxy lane.
+func (m *Manager) AdmitMetadata(surface string) (release func(), err error) {
+	return acquire(m.runners[surface], func(r *surfaceRunner) chan struct{} { return r.metadata })
+}
+
+func acquire(r *surfaceRunner, pick func(*surfaceRunner) chan struct{}) (func(), error) {
+	if r == nil {
+		return nil, ErrBusy
+	}
+	ch := pick(r)
+	select {
+	case ch <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-ch }) }, nil
+	default:
+		return nil, ErrBusy
+	}
+}
+
+// claim reserves a job id for this process, reporting false if it is already claimed.
+func (m *Manager) claim(id string) bool {
+	m.claimMu.Lock()
+	defer m.claimMu.Unlock()
+	if _, dup := m.claims[id]; dup {
+		return false
+	}
+	m.claims[id] = struct{}{}
+	return true
+}
+
+func (m *Manager) unclaim(id string) {
+	m.claimMu.Lock()
+	delete(m.claims, id)
+	m.claimMu.Unlock()
+}
+
 // Enqueue hands an admitted job to the workers.
 //
 // The caller must already hold a slot from Admit and must have committed the job row, because the
@@ -206,10 +269,15 @@ func (m *Manager) Enqueue(surface, jobID string) error {
 	if !ok {
 		return fmt.Errorf("jobs: unknown surface %q", surface)
 	}
+	if !m.claim(jobID) {
+		// Already queued or running here. Silently correct: the job is going to be processed.
+		return nil
+	}
 	select {
 	case r.queue <- jobID:
 		return nil
 	default:
+		m.unclaim(jobID)
 		// Unreachable while queue capacity matches admission capacity, but a silent drop here
 		// would strand a client polling forever, so it is reported rather than ignored.
 		return ErrBusy
@@ -221,10 +289,13 @@ func (m *Manager) Capacity() map[string]map[string]int {
 	out := map[string]map[string]int{}
 	for name, r := range m.runners {
 		out[name] = map[string]int{
-			"inFlight": len(r.admits),
-			"limit":    cap(r.admits),
-			"workers":  r.workers,
-			"queued":   len(r.queue),
+			"inFlight":      len(r.admits),
+			"limit":         cap(r.admits),
+			"workers":       r.workers,
+			"queued":        len(r.queue),
+			"upstreamInUse": len(r.upstream),
+			"upstreamLimit": cap(r.upstream),
+			"metadataInUse": len(r.metadata),
 		}
 	}
 	return out
@@ -258,6 +329,7 @@ func (m *Manager) run(ctx context.Context, r *surfaceRunner, owner, id string) {
 	log := m.log.With("job", id, "surface", r.name)
 
 	defer func() {
+		m.unclaim(id)
 		<-r.admits
 		if rec := recover(); rec != nil {
 			log.Error("worker panicked", "panic", rec)
@@ -283,6 +355,19 @@ func (m *Manager) run(ctx context.Context, r *surfaceRunner, owner, id string) {
 
 	stopHeartbeat := m.startHeartbeat(ctx, id)
 	defer stopHeartbeat()
+
+	// Hold a container slot for the analysis itself, so synchronous passthroughs and workers
+	// together never exceed MaxInflight against the upstream.
+	releaseUpstream, err := m.AdmitUpstream(r.name)
+	for err != nil {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+		releaseUpstream, err = m.AdmitUpstream(r.name)
+	}
+	defer releaseUpstream()
 
 	doc := upstream.Document{
 		ContentType: job.ContentType,
@@ -374,9 +459,19 @@ func (m *Manager) finish(ctx context.Context, r *surfaceRunner, job *store.Job, 
 
 	hasPDF, figures := m.fetchArtifacts(ctx, storeCtx, r, job, res)
 
-	if err := m.store.Succeed(storeCtx, job.ID, m.store.Blob.Path(job.ID, store.KindResult), size,
-		res.Mode, res.UpstreamMS, hasPDF, strings.Join(figures, ","), now); err != nil {
+	ok, err := m.store.Succeed(storeCtx, job.ID, m.store.Blob.Path(job.ID, store.KindResult), size,
+		res.Mode, res.UpstreamMS, hasPDF, strings.Join(figures, ","), now)
+	if err != nil {
 		return err
+	}
+	if !ok {
+		// The row went away while this job ran — a client DELETE, or disk-pressure eviction. The
+		// artifacts just written reference nothing, so they are removed here rather than left for
+		// the orphan sweep to find later.
+		m.log.Info("job completed but its row was already deleted; discarding the result",
+			"job", job.ID)
+		_ = m.store.Blob.RemoveAll(job.ID)
+		return nil
 	}
 	// The input is only needed to retry the upstream call, which can no longer happen.
 	_ = m.store.Blob.Remove(job.ID, store.KindInput)
@@ -551,9 +646,14 @@ func (m *Manager) failJob(ctx context.Context, r *surfaceRunner, id string, e *a
 	if err != nil {
 		payload = []byte(`{"code":"InternalServerError","message":"An unexpected error occurred."}`)
 	}
-	if err := m.store.Fail(ctx, id, string(payload), store.UpstreamMode(""),
-		upstreamStatus, upstreamMS, m.now()); err != nil {
+	ok, err := m.store.Fail(ctx, id, string(payload), store.UpstreamMode(""),
+		upstreamStatus, upstreamMS, m.now())
+	if err != nil {
 		m.log.Error("could not record job failure", "job", id, "error", err)
+	}
+	if !ok {
+		_ = m.store.Blob.RemoveAll(id)
+		return
 	}
 	_ = m.store.Blob.Remove(id, store.KindInput)
 }

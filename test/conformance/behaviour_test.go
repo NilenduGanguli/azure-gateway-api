@@ -416,6 +416,7 @@ func TestCrashRecoveryResumesAcceptedJobs(t *testing.T) {
 	defer cancel()
 	manager.Start(ctx)
 	defer manager.Stop()
+	manager.Recover(ctx)
 
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {

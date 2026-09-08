@@ -420,29 +420,70 @@ Two deviations from the plan above, both deliberate:
 
 ### Review outcomes
 
-An adversarial review pass — six reviewers with distinct lenses, then three verifiers per finding
-each trying to refute it — found **eight real defects**. Every one was reproduced before being
-fixed, and every one now has a regression test.
+An adversarial review — six reviewers with distinct lenses, then three verifiers per finding each
+trying to refute it — produced **32 confirmed defects** out of 47 candidates. All 32 are fixed, and
+every one was reproduced before it was.
 
-| # | Defect | Consequence |
-|---|---|---|
-| 1 | `jsonx` skipped the name/value separator with a fixed 64-byte lookahead | a pretty-printed upstream response produced an envelope that was invalid JSON |
-| 2 | recovery probed for the input document with `Open` and discarded the `*os.File` | one leaked descriptor per orphaned job, during recovery from a restart |
-| 3 | shutdown cancellation was wrapped into a surface-shaped error | a job whose 202 was already sent was marked terminally failed instead of resumed |
-| 4 | request contexts were derived from the signal context | `Shutdown` returned in ~1.5 ms and an in-flight synchronous call died with a 500 — the grace period existed and nothing used it |
-| 5 | boot recovery filtered `running` jobs on lease expiry | backwards for a crash: the lease is minutes in the *future*, so the scan skipped exactly the jobs it existed to rescue, and they stayed `running` forever |
-| 6 | recovery re-ran TTL-expired jobs | after an outage longer than the TTL, every stored job was resubmitted to produce results whose ids already 404 |
-| 7 | result-file fetching was uncancellable with no aggregate budget | a wedged container turned N figures into N × the per-request timeout, outlasting any grace period and getting the pod SIGKILLed |
-| 8 | `X-Forwarded-Host` was trusted by default and unvalidated | a caller could name its own `Operation-Location` host, sending its operation id somewhere else; a value with a path also shifted the segment positions `Azure.AI.FormRecognizer` counts backwards from |
+**Durability and shutdown**, the group that mattered most, because these compound: a rolling
+restart both killed in-flight work and then failed to reclaim it — precisely the scenario the
+gateway exists to survive.
 
-Defects 4 and 5 were the ones that mattered most, and they compounded: a rolling restart both killed
-in-flight work and then failed to reclaim it. That is precisely the scenario the gateway exists to
-survive.
+| Defect | Consequence |
+|---|---|
+| Request contexts derived from the signal context | `Shutdown` returned in ~1.5 ms; an in-flight synchronous call died with a 500. The grace period existed and nothing used it |
+| Boot recovery filtered `running` jobs on lease expiry | backwards for a crash — the lease is minutes in the *future*, so the scan skipped the jobs it existed to rescue and they stayed `running` until the TTL swept them |
+| Shutdown cancellation wrapped into a surface-shaped error | a job whose 202 was already sent was marked terminally failed instead of resumed |
+| Recovery re-ran TTL-expired jobs | after an outage longer than the TTL, every stored job was resubmitted to produce results whose ids already 404 |
+| Result-file fetching uncancellable, no aggregate budget | N figures × the per-request timeout — hours in production, outlasting any grace period |
+| Boot recovery raced live submits | a job committed but not yet enqueued could be run twice against the container |
+| TTL sweep could delete a `running` job | its worker then wrote a result no row referenced |
+| `Delete` removed blobs before the row | a partial failure left a row pointing at a missing result, and the poll on it produced the Java-killing shape below |
+| `Succeed`/`Fail` ignored `RowsAffected` | a job deleted mid-flight left its artifacts on the volume forever |
+| `syncDir` discarded every fsync error | a rename that might not survive power loss was reported as durable, and the 202 rests on that |
 
-Defect 8 changed a default. `TRUST_FORWARDED_HEADERS` is now **off**, forwarded authorities are
-validated as bare `host[:port]`, and `TRUSTED_FORWARDED_HOSTS` can pin them. Behind an OpenShift
-Route the request's own `Host` header is already correct; `PUBLIC_BASE_URL` remains the
-recommended setting for every other topology.
+**Client-visible correctness**
+
+| Defect | Consequence |
+|---|---|
+| Sync passthrough relayed a degraded 202 | the caller got an empty body and no operation id, for an analysis the container had already been paid to run |
+| A poll could answer 500 with no top-level `status` | Java's poller never checks the status code — it deserialises, finds no `status`, and throws an opaque NullPointerException |
+| Upstream error bodies relayed verbatim | HTML from an nginx sidecar, or a bare `{"status":"Failed"}`, reached clients that cannot parse either |
+| Upstream `Retry-After` relayed onto non-retriable statuses | azure-core retries *any* ≥400 carrying it, ten times |
+| `PUBLIC_BASE_URL` with a path accepted | shifted the segment positions `Azure.AI.FormRecognizer` counts backwards from |
+| `x-ms-client-request-id` consumed but never echoed | no way to correlate a client's trace with a gateway log line |
+| DELETE served on the Read surface | an endpoint its contract does not define |
+
+**Upstream state machine**
+
+| Defect | Consequence |
+|---|---|
+| Any 404 latched `:syncAnalyze` off process-wide | one request naming a missing model disabled the fast path for every later job until restart |
+| Transport errors capped at a fixed count | a live operation abandoned after ~40 s of container churn, however much timeout remained |
+| The poll deadline was only a loop guard | one hung poll ran a full upstream timeout past it, holding an admission slot |
+| `status` member read unbounded | unlike every other member read on that path |
+
+**Resource and security**
+
+| Defect | Consequence |
+|---|---|
+| `jsonx` skipped values with `encoding/json`'s tokenizer | it materialises every scalar: **309 MB peak for a 107 MB `content` string**. Four workers on large scans OOM the pod, and the recovery pass then crash-loops it. Now a byte scanner — 64 KB to scan 25 MB |
+| `jsonx` separator skip used a fixed 64-byte lookahead | a pretty-printed response produced an envelope that was invalid JSON |
+| Recovery probed for the input with `Open` and dropped the `*os.File` | a leaked descriptor per orphaned job, during restart recovery |
+| `X-Forwarded-Host` trusted by default and unvalidated | a caller could name its own `Operation-Location` host and send its operation id there |
+| Client-controlled path forwarded verbatim upstream | the caller shaped a URL the gateway signs with its own credential |
+| Admission slot taken before the body is read | a few trickling uploads took a whole surface offline |
+| `MAX_REQUEST_BYTES` doubled as the response ceiling | lowering the upload limit silently failed every large analysis |
+| Sync passthrough admitted against `MaxInflight+QueueDepth` | with a queue configured, the container saw more concurrency than it was given |
+| Metadata proxy had no concurrency limit and a 15-minute timeout | a wedged container turned cheap GETs into unbounded pile-up |
+| Upstream URL embedded in a client-visible error | internal topology disclosed |
+| `/_gw/config` and `/_gw/health` rendered upstream URLs verbatim | any userinfo credential published on an unauthenticated endpoint |
+| Oversized body on a passthrough yielded 500 "unreachable" | rather than the documented 400 |
+| Disk-pressure eviction took results in `updated_at` order | dropped ones a client could still fetch while already-expired ones sat next to them |
+
+Two defaults changed as a result. `TRUST_FORWARDED_HEADERS` is now **off**, forwarded authorities
+must be a bare `host[:port]`, and `TRUSTED_FORWARDED_HOSTS` can pin them — behind an OpenShift
+Route the request's own `Host` is already correct. And `MAX_RESULT_BYTES` is now separate from
+`MAX_REQUEST_BYTES`, because they bound opposite directions.
 
 ### Coverage
 

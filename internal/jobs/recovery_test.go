@@ -104,6 +104,7 @@ func TestRecoveryDoesNotReRunExpiredJobs(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	m.Start(ctx)
+	m.Recover(ctx)
 	time.Sleep(400 * time.Millisecond)
 	got := analyzer.calls.Load()
 	cancel()
@@ -224,5 +225,88 @@ func TestFailedJobStoresAnAzureShapedError(t *testing.T) {
 	}
 	if e.Code == "" || e.Message == "" {
 		t.Errorf("stored error lacks code or message: %+v", e)
+	}
+}
+
+// TestRecoveryNeverRunsAJobTwice is a regression test for a hole the first recovery fix opened.
+//
+// Recover requeues an abandoned row to notStarted, and the periodic reclaim pass then saw that
+// same still-notStarted row before any worker had marked it running — so the analysis went to the
+// container twice. Requeue now takes a lease, which the periodic pass respects.
+func TestRecoveryNeverRunsAJobTwice(t *testing.T) {
+	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	analyzer := &countingAnalyzer{}
+	m, st := newTestManager(t, analyzer, now)
+
+	id := "00000000-0000-4000-8000-0000000000dd"
+	if err := st.Create(context.Background(), &store.Job{
+		ID: id, Surface: SurfaceDI, ModelID: "prebuilt-layout", Status: store.StatusNotStarted,
+		CreatedAt: now.Add(-25 * time.Hour), UpdatedAt: now.Add(-25 * time.Hour),
+		ExpiresAt: now.Add(time.Hour), Query: "api-version=2024-11-30",
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := st.Blob.WriteAll(id, store.KindInput, []byte("%PDF-1.7 fake")); err != nil {
+		t.Fatalf("write input: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.Start(ctx)
+	m.Recover(ctx)
+
+	// Drive the periodic pass repeatedly while the job is still in flight — the exact window in
+	// which the row is notStarted-or-running with no completed worker.
+	for i := 0; i < 5; i++ {
+		m.sweepOnce(context.Background(), true)
+		time.Sleep(50 * time.Millisecond)
+	}
+	got := analyzer.calls.Load()
+	cancel()
+	m.Stop()
+
+	if got != 1 {
+		t.Errorf("the container saw %d analyses for one job; recovery must not resubmit work that "+
+			"is already claimed", got)
+	}
+}
+
+// TestSweepAndBootRecoveryCannotBothEnqueue reproduces the ordering that failed inside the image
+// build but not on the developer's machine: the sweeper's startup pass reached an abandoned row
+// before the explicit boot recovery did, and the container ran the analysis twice.
+//
+// Ordering the callers is not a sufficient fix — a submit and a reclaim can collide the same way —
+// so the manager keeps a claim set and refuses to enqueue an id it already has.
+func TestSweepAndBootRecoveryCannotBothEnqueue(t *testing.T) {
+	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	analyzer := &countingAnalyzer{}
+	m, st := newTestManager(t, analyzer, now)
+
+	id := "00000000-0000-4000-8000-0000000000ee"
+	if err := st.Create(context.Background(), &store.Job{
+		ID: id, Surface: SurfaceDI, ModelID: "prebuilt-layout", Status: store.StatusNotStarted,
+		CreatedAt: now.Add(-25 * time.Hour), UpdatedAt: now.Add(-25 * time.Hour),
+		ExpiresAt: now.Add(time.Hour), Query: "api-version=2024-11-30",
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := st.Blob.WriteAll(id, store.KindInput, []byte("%PDF-1.7 fake")); err != nil {
+		t.Fatalf("write input: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.Start(ctx)
+
+	// Deliberately the losing order: a reclaiming sweep lands first, then boot recovery.
+	m.sweepOnce(context.Background(), true)
+	m.Recover(ctx)
+	m.sweepOnce(context.Background(), true)
+
+	time.Sleep(300 * time.Millisecond)
+	got := analyzer.calls.Load()
+	cancel()
+	m.Stop()
+
+	if got != 1 {
+		t.Errorf("the container saw %d analyses for one job, want exactly 1", got)
 	}
 }

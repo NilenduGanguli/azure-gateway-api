@@ -117,6 +117,9 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request, p submitParams) 
 	id := ids.New()
 	now := s.deps.Now()
 
+	// The slot is already held, so a body that never finishes arriving would hold it forever.
+	s.setUploadDeadline(w, r)
+
 	written, err := s.deps.Store.Blob.WriteFrom(id, store.KindInput, r.Body,
 		s.deps.Config.MaxRequestBytes)
 	if err != nil {
@@ -245,9 +248,19 @@ func (s *Server) streamResult(w http.ResponseWriter, r *http.Request, surface az
 
 	f, size, err := s.deps.Store.Blob.Open(job.ID, store.KindResult)
 	if err != nil {
+		// A succeeded row whose result blob is gone. This must not become a bare 500: Java's
+		// poller never checks the poll status code, so a body without a top-level "status" throws
+		// an opaque NullPointerException. The operation is reported as failed instead, at 200,
+		// which every client family handles.
 		logging.From(r.Context()).Error("result blob missing for a succeeded job",
 			"job", job.ID, "error", err)
-		azerr.Internal(surface, "The stored result could not be read.").WriteTo(w, surface)
+		lost := azerr.Internal(surface, "The stored result is no longer available.").OperationError()
+		httpx.WriteJSON(w, http.StatusOK, envelope{
+			Status:              string(store.StatusFailed),
+			CreatedDateTime:     job.CreatedAt.Format(jobs.TimeFormat),
+			LastUpdatedDateTime: s.deps.Now().Format(jobs.TimeFormat),
+			Error:               &lost,
+		})
 		return
 	}
 	defer func() { _ = f.Close() }()
@@ -298,5 +311,23 @@ func methodGuard(surface azerr.Surface, allowed string, next http.HandlerFunc) h
 			return
 		}
 		next(w, r)
+	}
+}
+
+// setUploadDeadline bounds how long a client may take to stream its request body.
+//
+// An admission slot is necessarily taken before the body is read — the body has to be written
+// somewhere, and that is the work being admitted — so without a deadline a few connections
+// trickling bytes hold every slot on a surface and the gateway stops accepting real work while
+// looking perfectly healthy.
+func (s *Server) setUploadDeadline(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Config.UploadTimeout <= 0 {
+		return
+	}
+	rc := http.NewResponseController(w)
+	if err := rc.SetReadDeadline(time.Now().Add(s.deps.Config.UploadTimeout)); err != nil {
+		// Not every ResponseWriter supports deadlines (httptest's does not). The bound is a
+		// hardening measure, not a correctness requirement, so this is noted and not fatal.
+		logging.From(r.Context()).Debug("request read deadline unsupported", "error", err)
 	}
 }

@@ -83,6 +83,13 @@ func inspectOperation(path string, size int64, surface azerr.Surface) (*operatio
 		return nil, fmt.Errorf("upstream: scan response: %w", err)
 	}
 	if found {
+		// Bounded like every other member read here. A status is a short enum string; an upstream
+		// that sent a multi-megabyte one would otherwise be allocated in full.
+		const maxStatusBytes = 1 << 10
+		if statusEnd-statusStart > maxStatusBytes {
+			return nil, fmt.Errorf("upstream: status member is %d bytes, which is not a status",
+				statusEnd-statusStart)
+		}
 		raw := make([]byte, statusEnd-statusStart)
 		if _, err := f.ReadAt(raw, statusStart); err != nil && !errors.Is(err, io.EOF) {
 			return nil, fmt.Errorf("upstream: read status: %w", err)
@@ -189,10 +196,16 @@ func (b *base) pollUntilTerminal(ctx context.Context, ac *affinityClient, cfg po
 	backoff := minBackoff
 	misses := 0
 	transient := 0
+	var lastTransientErr error
 	started := time.Now()
 
 	for {
 		if time.Now().After(cfg.Deadline) {
+			if transient > 0 {
+				return nil, azerr.Internal(b.surface, fmt.Sprintf(
+					"The %s container was unreachable for the remainder of the configured timeout "+
+						"(%d consecutive failures, last: %v).", b.name, transient, lastTransientErr))
+			}
 			return nil, azerr.Internal(b.surface, fmt.Sprintf(
 				"The %s container did not complete the analysis within the configured timeout.", b.name))
 		}
@@ -203,28 +216,37 @@ func (b *base) pollUntilTerminal(ctx context.Context, ac *affinityClient, cfg po
 		}
 		backoff = nextBackoff(backoff, maxBackoff)
 
-		req, err := b.newRequest(ctx, http.MethodGet, cfg.URL, nil)
+		// Bound each request by whatever is left of the job's deadline. Without this the deadline
+		// is only a loop guard: a single hung poll runs to the client's own timeout and holds an
+		// admission slot for a full upstream timeout past the point the job should have failed.
+		reqCtx, cancelReq := context.WithDeadline(ctx, cfg.Deadline)
+		req, err := b.newRequest(reqCtx, http.MethodGet, cfg.URL, nil)
 		if err != nil {
+			cancelReq()
 			return nil, err
 		}
 		resp, err := ac.http.Do(req)
 		if err != nil {
+			cancelReq()
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return nil, ctxErr
 			}
+			// Keep retrying until the job's own deadline. Capping transport errors at a fixed
+			// count abandoned a live operation after well under a minute of container churn —
+			// which is exactly the pod rescheduling this gateway exists to ride out — no matter
+			// how much of the configured timeout was left.
 			transient++
-			if transient > 10 {
-				return nil, azerr.Internal(b.surface, fmt.Sprintf(
-					"The %s container became unreachable while the analysis was in flight: %v", b.name, err))
-			}
+			lastTransientErr = err
 			continue
 		}
 
 		switch {
 		case resp.StatusCode == http.StatusOK:
 			transient = 0
+			lastTransientErr = nil
 			path, size, derr := b.downloadBody(resp, cfg.Prefix)
 			drain(resp)
+			cancelReq()
 			if derr != nil {
 				return nil, derr
 			}
@@ -264,6 +286,7 @@ func (b *base) pollUntilTerminal(ctx context.Context, ac *affinityClient, cfg po
 
 		case resp.StatusCode == http.StatusNotFound:
 			drain(resp)
+			cancelReq()
 			// The poll reached a replica that does not know this operation. Router affinity has
 			// been lost — the pod was rescheduled, or the cookie was not honoured — so keep
 			// polling in the hope of landing on the owner, bounded by the budget.
@@ -278,14 +301,13 @@ func (b *base) pollUntilTerminal(ctx context.Context, ac *affinityClient, cfg po
 
 		case resp.StatusCode >= 500:
 			drain(resp)
+			cancelReq()
 			transient++
-			if transient > 10 {
-				return nil, azerr.Internal(b.surface, fmt.Sprintf(
-					"The %s container returned HTTP %d repeatedly while polling.", b.name, resp.StatusCode))
-			}
+			lastTransientErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 			continue
 
 		default:
+			cancelReq()
 			return nil, b.readErrorBody(resp)
 		}
 	}
