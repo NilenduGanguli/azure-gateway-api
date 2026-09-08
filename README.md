@@ -62,8 +62,12 @@ none of its own.
 ### Check what your containers actually serve, first
 
 ```bash
-make probe
+DI_UPSTREAM_URL=http://layout:5000 READ_UPSTREAM_URL=http://ocr:5000 ./scripts/probe-containers.sh
 ```
+
+Plain `sh` and `curl`, nothing else — it runs on a jump host or inside a debug pod without building
+anything. `make probe` is the same thing; `make probe-go` runs the equivalent built into the binary.
+It prints a short report ending in a verdict you can act on or paste into an issue.
 
 This matters more than it sounds. The gateway's happy path depends on
 `POST /documentintelligence/documentModels/{modelId}:syncAnalyze`, a route that appears in the
@@ -74,6 +78,19 @@ and supersedes every published article where they disagree.
 
 The gateway handles all three outcomes on its own — the probe just tells you which one you are
 living with, and lets you skip a wasted call per job by setting `DI_SYNC_ANALYZE=off`.
+
+```
+VERDICT
+  DI   :syncAnalyze     AVAILABLE
+  DI   200 body shape   envelope (.analyzeResult present)
+  READ syncAnalyze      AVAILABLE
+  READ host has "vision" no
+
+  -> keep DI_SYNC_ANALYZE=auto. The fast path works on this build.
+```
+
+It sends a blank 200×120 PNG, never one of your documents, and never prints an API key. Cost is
+about four analyses per container.
 
 ---
 
@@ -216,6 +233,13 @@ make check       # gofmt, go vet, staticcheck, go test -race
 make test        # the suite on its own
 make probe       # interrogate real containers
 make sdk-test    # drive a running gateway with the real Azure SDKs
+```
+
+To try the probe without a cluster, hold the fakes open and point it at them:
+
+```bash
+MOCKAZURE_LIVE=1 go test ./internal/mockazure -run TestLiveMocks &
+set -a; . /tmp/mockurls.env; set +a && ./scripts/probe-containers.sh
 ```
 
 `internal/mockazure` fakes both containers **including their failure modes** — a synchronous route

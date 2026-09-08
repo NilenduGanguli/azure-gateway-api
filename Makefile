@@ -44,7 +44,11 @@ image: ## Build the container image for linux/amd64
 	  -t $(IMAGE):$(VERSION) -t $(IMAGE):latest .
 
 .PHONY: probe
-probe: build ## Interrogate the configured containers (needs DI_UPSTREAM_URL and READ_UPSTREAM_URL)
+probe: ## Interrogate the configured containers (needs DI_UPSTREAM_URL and READ_UPSTREAM_URL)
+	./scripts/probe-containers.sh
+
+.PHONY: probe-go
+probe-go: build ## Same probe via the gateway binary, if you would rather not run the shell script
 	./bin/gateway probe
 
 .PHONY: run
