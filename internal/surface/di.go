@@ -1,6 +1,7 @@
 package surface
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -409,6 +410,23 @@ func (s *Server) relaySync(w http.ResponseWriter, r *http.Request, surface azerr
 		return
 	}
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+
+	// A bodyless upstream error is relayed as-is. Both containers answer some routes that way —
+	// /info and /documentModels were bodyless 404s on a probed build — and inventing a body would
+	// misrepresent them.
+	if len(bytes.TrimSpace(raw)) == 0 {
+		for k, vs := range resp.Header {
+			if !skipRelayHeader(k) && k != "Content-Length" {
+				for _, v := range vs {
+					w.Header().Add(k, v)
+				}
+			}
+		}
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(resp.StatusCode)
+		return
+	}
+
 	if parsed, ok := azerr.ParseUpstream(raw, resp.StatusCode); ok && parsed.Code != "" {
 		parsed.Status = resp.StatusCode
 		// Retry-After is deliberately not carried over: azure-core retries any response >= 400
@@ -421,11 +439,11 @@ func (s *Server) relaySync(w http.ResponseWriter, r *http.Request, surface azerr
 		parsed.WriteTo(w, surface)
 		return
 	}
+	// Unparseable but not empty — HTML from an nginx sidecar, say. Give the client something its
+	// SDK can parse, at the status the container actually returned.
 	logging.From(r.Context()).Warn("upstream returned an unparseable error body",
 		"status", resp.StatusCode, "bytes", len(raw))
-	azerr.Internal(surface,
-		fmt.Sprintf("The upstream container returned HTTP %d.", resp.StatusCode)).
-		WriteTo(w, surface)
+	azerr.ForStatus(surface, resp.StatusCode, "").WriteTo(w, surface)
 }
 
 func retriableStatus(status int) bool {

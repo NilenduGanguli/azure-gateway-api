@@ -1,6 +1,7 @@
 package conformance
 
 import (
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -266,5 +267,53 @@ func TestHungSyncRouteFallsBackQuickly(t *testing.T) {
 	if after := countCalls(h.di.Requests(), ":syncAnalyze"); after != before {
 		t.Errorf("the hung route was probed again on a later job (%d then %d); the capability "+
 			"should have latched off", before, after)
+	}
+}
+
+// TestProxyPreservesUpstreamStatus is a regression test.
+//
+// A probed layout-4.0 build answers /info and /documentModels with a bodyless 404 — it declares
+// neither route in its swagger. The proxy could not parse an empty body, so it synthesised a 500,
+// turning the container's "this route does not exist" into "the gateway is broken". The status is
+// now preserved, and an empty upstream body stays empty rather than being invented.
+func TestProxyPreservesUpstreamStatus(t *testing.T) {
+	h := newHarness(t, harnessOpts{di: mockazure.Options{MetadataMissing: true}})
+
+	for _, path := range []string{
+		"/documentintelligence/info?api-version=" + apiVersion,
+		"/documentintelligence/documentModels?api-version=" + apiVersion,
+	} {
+		resp := h.get(path)
+		data, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("%s returned %d, want the container's own 404", path, resp.StatusCode)
+		}
+		if len(data) != 0 {
+			t.Errorf("%s invented a %d-byte body for a bodyless upstream response: %s",
+				path, len(data), data)
+		}
+	}
+}
+
+// TestProxyNormalisesUnparseableUpstreamBody checks the other half: a non-empty body the SDKs
+// cannot parse — HTML from an nginx sidecar — becomes a well-formed error at the container's own
+// status, not a 500.
+func TestProxyNormalisesUnparseableUpstreamBody(t *testing.T) {
+	h := newHarness(t, harnessOpts{
+		di: mockazure.Options{SyncErrorStatus: http.StatusRequestEntityTooLarge},
+	})
+
+	resp := h.post(diSync, "%PDF-1.7 fake")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Errorf("got %d, want the container's own %d",
+			resp.StatusCode, http.StatusRequestEntityTooLarge)
+	}
+	body := decode(t, resp)
+	if body["error"] == nil {
+		t.Errorf("body is not a Document Intelligence error object: %v", body)
 	}
 }

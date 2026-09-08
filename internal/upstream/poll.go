@@ -316,8 +316,13 @@ func (b *base) pollUntilTerminal(ctx context.Context, ac *affinityClient, cfg po
 			continue
 
 		default:
+			// Read the body before releasing the request context. Cancelling first aborts the
+			// still-in-flight body, so a chunked or slow error response arrives truncated,
+			// ParseUpstream fails on it, and the container's own diagnosis is replaced by a
+			// generic message — losing exactly the detail this path exists to preserve.
+			apiErr := b.readErrorBody(resp)
 			cancelReq()
-			return nil, b.readErrorBody(resp)
+			return nil, apiErr
 		}
 	}
 }

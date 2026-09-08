@@ -68,6 +68,9 @@ type Options struct {
 	StatusUnhealthy bool
 	// RequireAPIKey rejects calls without Ocp-Apim-Subscription-Key.
 	RequireAPIKey string
+	// MetadataMissing makes /info and /documentModels answer a bodyless 404, as a probed
+	// layout-4.0 build does — it declares neither route in its swagger.
+	MetadataMissing bool
 	// SyncErrorStatus, when non-zero, makes the synchronous route fail with this status and an
 	// unparseable body — HTML, as an nginx sidecar produces — plus a Retry-After the gateway must
 	// not relay onto a non-retriable status.
@@ -192,12 +195,20 @@ func NewDI(opts Options) *Container {
 
 	mux.HandleFunc("GET /documentintelligence/info", func(w http.ResponseWriter, r *http.Request) {
 		c.record(r.URL.Path)
+		if c.opts.MetadataMissing {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"customDocumentModels": map[string]int{"count": 0, "limit": 20000},
 		})
 	})
 	mux.HandleFunc("GET /documentintelligence/documentModels", func(w http.ResponseWriter, r *http.Request) {
 		c.record(r.URL.Path)
+		if c.opts.MetadataMissing {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"value": []map[string]string{{"modelId": "prebuilt-layout"}},
 		})

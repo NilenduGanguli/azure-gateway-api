@@ -471,6 +471,49 @@ func Unavailable(s Surface, message string, retryAfter int) *APIError {
 		WithRetryAfter(retryAfter)
 }
 
+// ForStatus builds an error that preserves an upstream status whose body could not be parsed.
+//
+// Preserving the status is the point. Synthesising a 500 for every unparseable upstream response
+// turns a container's 404 into a server error, which is both wrong and actively misleading: on a
+// probed build /info and /documentModels answer a bodyless 404, and a client must see that 404.
+func ForStatus(s Surface, status int, detail string) *APIError {
+	if detail == "" {
+		detail = fmt.Sprintf("The upstream container returned HTTP %d.", status)
+	}
+	code := CodeInternalServerError
+	switch {
+	case status == http.StatusNotFound:
+		code = CodeNotFound
+	case status == http.StatusUnauthorized:
+		code = CodeUnauthorized
+	case status == http.StatusForbidden:
+		code = CodeForbidden
+	case status == http.StatusMethodNotAllowed:
+		code = CodeMethodNotAllowed
+	case status == http.StatusConflict:
+		code = CodeConflict
+	case status == http.StatusUnsupportedMediaType:
+		code = CodeUnsupportedMediaType
+	case status == http.StatusServiceUnavailable:
+		code = CodeServiceUnavailable
+	case status >= 400 && status < 500:
+		code = CodeInvalidRequest
+	}
+	if s == SurfaceRead {
+		readCode := ReadInternalServerError
+		switch {
+		case status == http.StatusUnsupportedMediaType:
+			readCode = ReadUnsupportedMediaType
+		case status == http.StatusUnauthorized:
+			readCode = ReadUnauthorized
+		case status >= 400 && status < 500:
+			readCode = ReadBadArgument
+		}
+		return &APIError{Status: status, Code: readCode, Message: detail}
+	}
+	return &APIError{Status: status, Code: code, Message: detail}
+}
+
 // Internal reports an unexpected gateway-side failure.
 func Internal(s Surface, message string) *APIError {
 	if s == SurfaceRead {
