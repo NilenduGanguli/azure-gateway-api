@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/NilenduGanguli/azure-gateway-api/internal/azerr"
+	"github.com/NilenduGanguli/azure-gateway-api/internal/config"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/store"
 )
 
@@ -121,7 +122,17 @@ func (b *base) syncAnalyze(ctx context.Context, path string, q url.Values, conte
 	return &SyncOutcome{Resolved: res, release: ac.close}, nil
 }
 
-// SyncAnalyze runs the Document Intelligence synchronous route for a client that called ours.
+// SyncAnalyze serves a client that called the synchronous route.
+//
+// It honours DI_SYNC_ANALYZE and the capability latch, which the client-facing path previously
+// ignored. That mattered: on a build whose :syncAnalyze is declared and never answers, setting
+// DI_SYNC_ANALYZE=off correctly steered background jobs away from it while a client calling
+// :syncAnalyze directly still hung for the full timeout.
+//
+// When the route is disabled or known absent, the call is submitted to :analyze and polled out
+// instead. The client still gets one synchronous answer — it simply arrives by the route that
+// works. The 202-degradation handling in syncAnalyze covers both cases, because :analyze always
+// answers 202.
 func (c *DIClient) SyncAnalyze(ctx context.Context, req Request, contentType string,
 	body io.Reader, contentLength int64) (*SyncOutcome, error) {
 
@@ -129,7 +140,13 @@ func (c *DIClient) SyncAnalyze(ctx context.Context, req Request, contentType str
 		return nil, azerr.BadRequest(azerr.SurfaceDI, "A model id is required.")
 	}
 	fam := prefix(req.Prefix)
-	path := fam + "/documentModels/" + escapeSegment(req.ModelID) + ":syncAnalyze"
+
+	verb := ":syncAnalyze"
+	if c.mode == config.SyncOff || syncCapability(c.capability.Load()) == syncUnavailable {
+		verb = ":analyze"
+	}
+	path := fam + "/documentModels/" + escapeSegment(req.ModelID) + verb
+
 	return c.syncAnalyze(ctx, path, cloneQuery(req.Query), contentType, body, contentLength,
 		func(opID string) string { return c.pollURLIn(fam, req.ModelID, opID, req.Query) },
 		c.blindBudget)

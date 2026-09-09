@@ -317,3 +317,43 @@ func TestProxyNormalisesUnparseableUpstreamBody(t *testing.T) {
 		t.Errorf("body is not a Document Intelligence error object: %v", body)
 	}
 }
+
+// TestSyncOffSteersTheClientRouteAway is a regression test.
+//
+// DI_SYNC_ANALYZE=off correctly kept background jobs off a :syncAnalyze route that never answers,
+// but the client-facing passthrough ignored the setting and called it anyway — so on the build
+// this exists for, a client hit exactly the hang the operator had configured around. The
+// passthrough now submits to :analyze and polls the operation out instead, so the caller still
+// gets one synchronous answer.
+func TestSyncOffSteersTheClientRouteAway(t *testing.T) {
+	h := newHarness(t, harnessOpts{
+		di: mockazure.Options{Sync: mockazure.SyncHang, PollsBeforeSuccess: 1},
+		tweak: func(c *config.Config) {
+			c.DISyncMode = config.SyncOff
+			c.DI.Timeout = 30 * time.Second
+		},
+	})
+
+	started := time.Now()
+	resp := h.post(diSync, "%PDF-1.7 fake")
+	defer func() { _ = resp.Body.Close() }()
+	elapsed := time.Since(started)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d, want 200 — the call should have been served via :analyze",
+			resp.StatusCode)
+	}
+	if elapsed > 20*time.Second {
+		t.Errorf("took %v; with DI_SYNC_ANALYZE=off the hanging route must not be called", elapsed)
+	}
+	if h.di.Called(":syncAnalyze") {
+		t.Error("the client-facing passthrough called :syncAnalyze despite DI_SYNC_ANALYZE=off")
+	}
+	if !h.di.Called(":analyze") {
+		t.Error("the call was not routed through :analyze")
+	}
+	body := decode(t, resp)
+	if body["status"] != "succeeded" || body["analyzeResult"] == nil {
+		t.Errorf("resolved response is not a completed envelope: %v", body)
+	}
+}

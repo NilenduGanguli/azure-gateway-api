@@ -193,26 +193,42 @@ func NewDI(opts Options) *Container {
 			_, _ = w.Write([]byte("\x89PNG\r\n\x1a\nfake-figure-" + r.PathValue("figureId")))
 		})
 
-	mux.HandleFunc("GET /documentintelligence/info", func(w http.ResponseWriter, r *http.Request) {
-		c.record(r.URL.Path)
-		if c.opts.MetadataMissing {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"customDocumentModels": map[string]int{"count": 0, "limit": 20000},
+	// Served on both families, as the containers do.
+	for _, fam := range []string{"/documentintelligence", "/formrecognizer"} {
+		mux.HandleFunc("GET "+fam+"/info", func(w http.ResponseWriter, r *http.Request) {
+			c.record(r.URL.Path)
+			if c.opts.MetadataMissing {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"customDocumentModels": map[string]int{"count": 0, "limit": 20000},
+			})
 		})
-	})
-	mux.HandleFunc("GET /documentintelligence/documentModels", func(w http.ResponseWriter, r *http.Request) {
-		c.record(r.URL.Path)
-		if c.opts.MetadataMissing {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"value": []map[string]string{{"modelId": "prebuilt-layout"}},
+		mux.HandleFunc("GET "+fam+"/documentModels", func(w http.ResponseWriter, r *http.Request) {
+			c.record(r.URL.Path)
+			if c.opts.MetadataMissing {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"value": []map[string]string{{"modelId": "prebuilt-layout"}},
+			})
 		})
-	})
+		mux.HandleFunc("GET "+fam+"/documentModels/{modelId}",
+			func(w http.ResponseWriter, r *http.Request) {
+				c.record(r.URL.Path)
+				if c.opts.MetadataMissing {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				writeJSON(w, http.StatusOK, map[string]any{
+					"modelId":     r.PathValue("modelId"),
+					"description": "Prebuilt layout model",
+					"apiVersion":  "2024-11-30",
+				})
+			})
+	}
 
 	c.addCommon(mux)
 	c.server = httptest.NewServer(mux)

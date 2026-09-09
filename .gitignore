@@ -1,7 +1,9 @@
-# build output
+# Build output. Anchored to the repository root on purpose: an unanchored "gateway" also matches
+# the cmd/gateway DIRECTORY, which silently kept the program's entrypoint out of every commit and
+# left the published repo unable to build.
 /bin/
 /dist/
-gateway
+/gateway
 
 # local runtime data (PVC contents)
 /data/

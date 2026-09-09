@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -179,6 +180,22 @@ func isPending(s string) bool {
 		strings.EqualFold(s, string(statusNotStarted))
 }
 
+// transportCause reduces a transport failure to its underlying cause.
+//
+// net/http wraps every request failure in a *url.Error whose message embeds the entire request
+// URL. That message is relayed to the client in the poll timeout, which handed any caller who
+// waited out a container outage the gateway's internal upstream address — host, port, path, and
+// the userinfo username when the upstream is configured with credentials in the URL. Only the
+// cause ("connection refused", "context deadline exceeded") is useful to a client, and it is the
+// part that carries no topology.
+func transportCause(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) && ue.Err != nil {
+		return ue.Err
+	}
+	return err
+}
+
 // pollConfig parameterises the affinity poll loop.
 type pollConfig struct {
 	// URL is the poll target, always rebuilt against the configured upstream base rather than
@@ -245,7 +262,7 @@ func (b *base) pollUntilTerminal(ctx context.Context, ac *affinityClient, cfg po
 			// which is exactly the pod rescheduling this gateway exists to ride out — no matter
 			// how much of the configured timeout was left.
 			transient++
-			lastTransientErr = err
+			lastTransientErr = transportCause(err)
 			continue
 		}
 

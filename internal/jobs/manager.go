@@ -535,7 +535,7 @@ func (m *Manager) fetchArtifacts(liveCtx, storeCtx context.Context, r *surfaceRu
 
 	if outputs["pdf"] {
 		if !abort("pdf") {
-			path, _, ct, err := di.FetchArtifact(actx, job.ModelID, res.UpstreamOpID, "/pdf", query)
+			path, _, ct, err := di.FetchArtifact(actx, job.Prefix, job.ModelID, res.UpstreamOpID, "/pdf", query)
 			switch {
 			case err != nil:
 				log.Warn("could not fetch searchable pdf", "error", err)
@@ -561,7 +561,7 @@ func (m *Manager) fetchArtifacts(liveCtx, storeCtx context.Context, r *surfaceRu
 			if abort("figure " + figID) {
 				break
 			}
-			path, _, _, err := di.FetchArtifact(actx, job.ModelID, res.UpstreamOpID,
+			path, _, _, err := di.FetchArtifact(actx, job.Prefix, job.ModelID, res.UpstreamOpID,
 				"/figures/"+url.PathEscape(figID), query)
 			if err != nil {
 				log.Warn("could not fetch figure", "figure", figID, "error", err)

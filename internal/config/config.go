@@ -70,6 +70,10 @@ type Config struct {
 	// DIBlindPollBudget caps consecutive 404s tolerated while polling a degraded DI operation
 	// whose owning replica cannot be reached through router affinity.
 	DIBlindPollBudget int
+	// ReadBlindPollBudget is the equivalent of DIBlindPollBudget for the Read surface. Read
+	// reaches the affinity poll only on the rare degraded-202 path, but a DI-named variable
+	// silently governing Read behaviour is a surprise an operator should not have to discover.
+	ReadBlindPollBudget int
 	// DISyncProbeTimeout bounds the attempt on the undocumented :syncAnalyze route.
 	//
 	// It is deliberately far shorter than DI_UPSTREAM_TIMEOUT. The route is declared in some
@@ -136,6 +140,7 @@ func Load() (*Config, error) {
 		AllowNetworkFS:        envBool("ALLOW_NETWORK_FS", false),
 		DISyncMode:            SyncMode(strings.ToLower(env("DI_SYNC_ANALYZE", string(SyncAuto)))),
 		DIBlindPollBudget:     envInt("DI_BLIND_POLL_BUDGET", 60),
+		ReadBlindPollBudget:   envInt("READ_BLIND_POLL_BUDGET", 60),
 		QueueDepth:            envInt("QUEUE_DEPTH", 0),
 		DiskHighWatermark:     envFloat("DISK_HIGH_WATERMARK", 0.90),
 		MaxRequestBytes:       int64(envInt("MAX_REQUEST_BYTES", 500*1024*1024)),
@@ -337,15 +342,18 @@ func (c *Config) Redacted() map[string]any {
 		"addr":                  c.Addr,
 		"publicBaseUrl":         c.PublicBaseURL,
 		"trustForwardedHeaders": c.TrustForwardedHeaders,
+		"trustedForwardedHosts": c.TrustedForwardedHosts,
 		"dataDir":               c.DataDir,
 		"allowNetworkFs":        c.AllowNetworkFS,
-		"diUpstreamUrl":         c.DI.BaseURL,
+		"diUpstreamUrl":         safeURL(c.DI.BaseURL),
 		"diUpstreamApiKey":      redact(c.DI.APIKey),
 		"diMaxInflight":         c.DI.MaxInflight,
 		"diUpstreamTimeout":     c.DI.Timeout.String(),
 		"diSyncAnalyze":         string(c.DISyncMode),
 		"diBlindPollBudget":     c.DIBlindPollBudget,
-		"readUpstreamUrl":       c.Read.BaseURL,
+		"readBlindPollBudget":   c.ReadBlindPollBudget,
+		"diSyncProbeTimeout":    c.DISyncProbeTimeout.String(),
+		"readUpstreamUrl":       safeURL(c.Read.BaseURL),
 		"readUpstreamApiKey":    redact(c.Read.APIKey),
 		"readMaxInflight":       c.Read.MaxInflight,
 		"readSyncTimeout":       c.Read.Timeout.String(),
@@ -354,9 +362,13 @@ func (c *Config) Redacted() map[string]any {
 		"gcInterval":            c.GCInterval.String(),
 		"diskHighWatermark":     c.DiskHighWatermark,
 		"maxRequestBytes":       c.MaxRequestBytes,
+		"maxResultBytes":        c.MaxResultBytes,
+		"uploadTimeout":         c.UploadTimeout.String(),
+		"artifactFetchTimeout":  c.ArtifactFetchTimeout.String(),
 		"pollRetryAfterSeconds": c.PollRetryAfter,
 		"busyRetryAfterSeconds": c.BusyRetryAfter,
 		"shutdownGrace":         c.ShutdownGrace.String(),
+		"errorCompat":           c.ErrorCompat,
 		"logLevel":              c.LogLevel,
 		"logFormat":             c.LogFormat,
 	}

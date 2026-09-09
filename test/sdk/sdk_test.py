@@ -212,14 +212,17 @@ def test_unknown_operation_is_a_clean_404():
             "document intelligence",
             f"{GATEWAY}/documentintelligence/documentModels/prebuilt-layout/analyzeResults/"
             f"00000000-0000-4000-8000-000000000000?api-version=2024-11-30",
-            lambda b: isinstance(b.get("error"), dict) and b["error"].get("code") == "NotFound",
-            'wrapped {"error":{"code":"NotFound",...}}',
+            # Shapes below are what the containers were *observed* to return, which is the
+            # inverse of what the published references show for each service. The gateway
+            # matches the containers, so this test does too.
+            lambda b: "error" not in b and b.get("code") == "NotFound" and "message" in b,
+            'flat {"code":"NotFound","message":...} with no envelope',
         ),
         (
             "computer vision read",
             f"{GATEWAY}/vision/v3.2/read/analyzeResults/00000000-0000-4000-8000-000000000000",
-            lambda b: "error" not in b and "code" in b and "message" in b,
-            'flat {"code":...,"message":...} with no envelope',
+            lambda b: isinstance(b.get("error"), dict) and "code" in b["error"],
+            'wrapped {"error":{"code":...,"message":...}}',
         ),
     ]
     for name, url, predicate, expected in cases:

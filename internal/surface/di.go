@@ -65,9 +65,15 @@ func (s *Server) registerDI(mux *http.ServeMux) {
 	mux.HandleFunc("GET "+frPrefix+"/documentModels/{modelId}/analyzeResults/{resultId}/pdf", s.diPDF)
 	mux.HandleFunc("GET "+frPrefix+"/documentModels/{modelId}/analyzeResults/{resultId}/figures/{figureId}", s.diFigure)
 
-	mux.HandleFunc("GET "+diPrefix+"/info", s.diInfo)
-	mux.HandleFunc("GET "+diPrefix+"/documentModels", s.diListModels)
-	mux.HandleFunc("GET "+diPrefix+"/documentModels/{modelId}", s.diGetModel)
+	// The metadata routes are registered on both families too. A legacy SDK pinned to
+	// /formrecognizer calls GetResourceDetails and GetDocumentModel on its own prefix, and
+	// serving those only under /documentintelligence answered it a bodyless 404 from the
+	// catch-all — a client-visible difference from the containers, which serve both.
+	for _, fam := range []string{diPrefix, frPrefix} {
+		mux.HandleFunc("GET "+fam+"/info", s.diInfo)
+		mux.HandleFunc("GET "+fam+"/documentModels", s.diListModels)
+		mux.HandleFunc("GET "+fam+"/documentModels/{modelId}", s.diGetModel)
+	}
 }
 
 // diAction dispatches the colon-suffixed analyze verbs.
@@ -207,17 +213,17 @@ func (s *Server) diArtifact(w http.ResponseWriter, r *http.Request, kind store.K
 	}
 }
 
-// diInfo proxies GET /documentintelligence/info.
+// diInfo proxies GET {family}/info.
 func (s *Server) diInfo(w http.ResponseWriter, r *http.Request) {
-	s.proxyGET(w, r, azerr.SurfaceDI, jobs.SurfaceDI, diPrefix+"/info")
+	s.proxyGET(w, r, azerr.SurfaceDI, jobs.SurfaceDI, prefixOf(r)+"/info")
 }
 
-// diListModels proxies GET /documentintelligence/documentModels.
+// diListModels proxies GET {family}/documentModels.
 func (s *Server) diListModels(w http.ResponseWriter, r *http.Request) {
-	s.proxyGET(w, r, azerr.SurfaceDI, jobs.SurfaceDI, diPrefix+"/documentModels")
+	s.proxyGET(w, r, azerr.SurfaceDI, jobs.SurfaceDI, prefixOf(r)+"/documentModels")
 }
 
-// diGetModel proxies GET /documentintelligence/documentModels/{modelId}.
+// diGetModel proxies GET {family}/documentModels/{modelId}.
 //
 // The path is rebuilt from the routed component and re-escaped rather than taken from the request.
 // Forwarding the raw path would let a caller shape the URL the gateway signs with its own upstream
@@ -230,7 +236,7 @@ func (s *Server) diGetModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.proxyGET(w, r, azerr.SurfaceDI, jobs.SurfaceDI,
-		diPrefix+"/documentModels/"+url.PathEscape(modelID))
+		prefixOf(r)+"/documentModels/"+url.PathEscape(modelID))
 }
 
 // validModelID applies the contract's own constraint: maxLength 64, pattern

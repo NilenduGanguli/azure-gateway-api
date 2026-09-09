@@ -51,6 +51,7 @@ func (m *Manager) recover(ctx context.Context, atBoot bool) {
 	m.log.Info("reclaiming jobs that stopped progressing",
 		"count", len(jobsToRecover), "atBoot", atBoot)
 
+	claimed := make([]*store.Job, 0, len(jobsToRecover))
 	for _, job := range jobsToRecover {
 		if ctx.Err() != nil {
 			return
@@ -60,11 +61,28 @@ func (m *Manager) recover(ctx context.Context, atBoot bool) {
 			m.log.Warn("orphaned job names an unknown surface", "job", job.ID, "surface", job.Surface)
 			continue
 		}
-		m.recoverOne(ctx, r, job)
+		if m.recoverOne(ctx, r, job) {
+			claimed = append(claimed, job)
+		}
 	}
+	if len(claimed) == 0 {
+		return
+	}
+	m.log.Info("claimed jobs for re-running", "count", len(claimed))
+
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		m.feed(ctx, claimed)
+	}()
 }
 
-func (m *Manager) recoverOne(ctx context.Context, r *surfaceRunner, job *store.Job) {
+// recoverOne claims one abandoned job and returns true if it is now this process's to run.
+//
+// It deliberately does no blocking: claiming is a database update and a map insert, both fast.
+// Waiting for an admission slot happens later, in feed, because Recover runs before the listener
+// opens and must not hold it shut.
+func (m *Manager) recoverOne(ctx context.Context, r *surfaceRunner, job *store.Job) bool {
 	log := m.log.With("job", job.ID, "surface", job.Surface, "attempts", job.Attempts)
 
 	// Without the input document the upstream call cannot be repeated. That happens when the
@@ -74,41 +92,54 @@ func (m *Manager) recoverOne(ctx context.Context, r *surfaceRunner, job *store.J
 		log.Warn("orphaned job has no input document; failing it")
 		m.failJob(ctx, r, job.ID, azerr.Internal(r.analyzer.Surface(),
 			"The analysis was interrupted and could not be resumed."), 0, 0)
-		return
+		return false
 	}
 	if job.Attempts >= maxAttempts {
 		log.Warn("orphaned job exhausted its attempts; failing it")
 		m.failJob(ctx, r, job.ID, azerr.Internal(r.analyzer.Surface(),
 			"The analysis was interrupted repeatedly and could not be completed."), 0, 0)
-		return
+		return false
 	}
 
 	// Claim it as we requeue, so the periodic pass does not pick the same row up again before a
 	// worker marks it running.
 	if err := m.store.Requeue(ctx, job.ID, m.now(), m.now().Add(leaseDuration)); err != nil {
 		log.Error("could not requeue orphaned job", "error", err)
-		return
+		return false
 	}
 
-	if !m.claim(job.ID) {
-		// Another path already has it. Undo the requeue marker only if nothing else will run it;
-		// the claim holder will, so leave the row alone.
-		return
-	}
+	// The claim is what makes it safe for the listener to open before this work has run: a submit
+	// arriving now cannot enqueue the same id.
+	return m.claim(job.ID)
+}
 
-	// Wait for capacity rather than refusing: this job's 202 has already been sent.
-	select {
-	case r.admits <- struct{}{}:
-	case <-ctx.Done():
-		m.unclaim(job.ID)
-		return
-	}
-	select {
-	case r.queue <- job.ID:
-		log.Info("requeued orphaned job")
-	case <-ctx.Done():
-		<-r.admits
-		m.unclaim(job.ID)
+// feed hands claimed jobs to the workers, waiting for capacity as it goes.
+//
+// This is the part that blocks, and it runs in the background for that reason. Recovering more
+// jobs than there are slots is normal after an outage, and each can take minutes; doing it inline
+// would keep the listener shut and leave SIGTERM unhandled for the duration, which reads to
+// Kubernetes as a pod that failed to start.
+func (m *Manager) feed(ctx context.Context, claimed []*store.Job) {
+	for _, job := range claimed {
+		r, ok := m.runners[job.Surface]
+		if !ok {
+			m.unclaim(job.ID)
+			continue
+		}
+		select {
+		case r.admits <- struct{}{}:
+		case <-ctx.Done():
+			m.unclaim(job.ID)
+			return
+		}
+		select {
+		case r.queue <- job.ID:
+			m.log.Info("requeued orphaned job", "job", job.ID, "surface", job.Surface)
+		case <-ctx.Done():
+			<-r.admits
+			m.unclaim(job.ID)
+			return
+		}
 	}
 }
 

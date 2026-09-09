@@ -325,7 +325,11 @@ func (c *DIClient) pollURLIn(fam, modelID, resultID string, q url.Values) string
 //
 // These endpoints are only reachable while the upstream operation still exists, so they are
 // fetched eagerly at job completion rather than proxied on demand.
-func (c *DIClient) FetchArtifact(ctx context.Context, modelID, resultID, suffix string,
+//
+// pathPrefix is the job's own path family. The operation was created under it, and the container
+// scopes an operation id to the family it was issued in — fetching from the other one answers 404,
+// so a legacy /formrecognizer job silently lost its searchable PDF and every figure.
+func (c *DIClient) FetchArtifact(ctx context.Context, pathPrefix, modelID, resultID, suffix string,
 	q url.Values) (path string, size int64, contentType string, err error) {
 
 	pq := url.Values{}
@@ -333,7 +337,7 @@ func (c *DIClient) FetchArtifact(ctx context.Context, modelID, resultID, suffix 
 		pq.Set("api-version", v)
 	}
 	target := c.joinURL(
-		DIPathPrefix+"/documentModels/"+escapeSegment(modelID)+"/analyzeResults/"+
+		prefix(pathPrefix)+"/documentModels/"+escapeSegment(modelID)+"/analyzeResults/"+
 			escapeSegment(resultID)+suffix, pq)
 
 	req, err := c.newRequest(ctx, http.MethodGet, target, nil)

@@ -336,14 +336,15 @@ func (s *Store) Fail(ctx context.Context, id, errorJSON string, mode UpstreamMod
 	return n > 0, err
 }
 
-// SetUpstreamOp records the upstream operation URL for a job that degraded to async, so a
-// restart can resume polling rather than re-submitting and double-billing.
-func (s *Store) SetUpstreamOp(ctx context.Context, id, opURL string, mode UpstreamMode) error {
-	_, err := s.w.ExecContext(ctx,
-		`UPDATE jobs SET upstream_op_url = ?, upstream_mode = ? WHERE id = ?`,
-		opURL, string(mode), id)
-	return err
-}
+// upstream_op_url is read back into Job.UpstreamOp but is never written, and deliberately so.
+//
+// It was added to let a restart resume polling a degraded 202 instead of re-submitting. That
+// cannot work here: the containers keep their result store instance-local, and polls only find
+// an operation because the job's own connection pool and cookie jar pin them to the replica that
+// owns it. Neither survives the process. A resumed poll would land on an arbitrary replica, spend
+// its blind-poll budget on 404s, and then fail a job that a re-submit would have completed — so
+// recovery re-submits from the persisted input, and the column stays inert. It is kept rather
+// than dropped because migrating an existing PVC database is a worse trade than an unused column.
 
 // Requeue returns a job to notStarted so it can be picked up again after a crash.
 //

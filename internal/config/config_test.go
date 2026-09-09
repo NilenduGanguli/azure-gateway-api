@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -154,9 +155,14 @@ func TestWarningsFlagsTheVisionHostBug(t *testing.T) {
 // TestRedactedHidesEverySecret guards the /_gw/config endpoint, which is unauthenticated.
 func TestRedactedHidesEverySecret(t *testing.T) {
 	const secret = "super-secret-upstream-key"
+	const urlSecret = "s3cretInTheUrl"
 	setEnv(t, map[string]string{
 		"DI_UPSTREAM_API_KEY":   secret,
 		"READ_UPSTREAM_API_KEY": secret,
+		// Userinfo in an upstream URL is a legal configuration — validateUpstream checks only
+		// scheme and host — so /_gw/config, which is unauthenticated, must not echo it back.
+		"DI_UPSTREAM_URL":   "http://diuser:" + urlSecret + "@layout:5000",
+		"READ_UPSTREAM_URL": "http://rduser:" + urlSecret + "@ocr:5000",
 	})
 	c, err := Load()
 	if err != nil {
@@ -164,7 +170,16 @@ func TestRedactedHidesEverySecret(t *testing.T) {
 	}
 	rendered := strings.ToLower(renderConfig(c.Redacted()))
 	if strings.Contains(rendered, strings.ToLower(secret)) {
-		t.Fatalf("a secret survived redaction:\n%s", rendered)
+		t.Fatalf("an API key survived redaction:\n%s", rendered)
+	}
+	if strings.Contains(rendered, strings.ToLower(urlSecret)) {
+		t.Fatalf("a credential embedded in an upstream URL survived redaction:\n%s", rendered)
+	}
+	// The host must still be legible; redaction is not omission.
+	for _, want := range []string{"layout:5000", "ocr:5000"} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("redaction removed the host %q as well as the credential", want)
+		}
 	}
 	for _, field := range []string{"diupstreamapikey", "readupstreamapikey"} {
 		if !strings.Contains(rendered, field) {
@@ -180,4 +195,65 @@ func renderConfig(m map[string]any) string {
 		fmt.Fprintf(&b, "%s=%v\n", k, v)
 	}
 	return b.String()
+}
+
+// TestRedactedCoversEveryField is a drift guard.
+//
+// /_gw/config is the operator's only view of effective configuration, and it is assembled by hand.
+// Seven settings — ERROR_COMPAT and DI_SYNC_PROBE_TIMEOUT among them — were added to Config and
+// never added to Redacted, so an operator inspecting a running gateway could not see values that
+// materially change its behaviour. Reflection over the struct makes that impossible to repeat:
+// add a field, and this fails until it is surfaced.
+func TestRedactedCoversEveryField(t *testing.T) {
+	setEnv(t, nil)
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	emitted := make(map[string]struct{}, len(c.Redacted()))
+	for k := range c.Redacted() {
+		emitted[strings.ToLower(k)] = struct{}{}
+	}
+
+	// Upstream is rendered as per-surface fields rather than a nested object, so its own field
+	// names are checked against the di*/read* prefixes instead.
+	nested := map[string]struct{}{"DI": {}, "Read": {}}
+
+	// A few keys are deliberately named for the environment variable an operator sets rather than
+	// for the Go field, which is more useful in the rendered view. Listing them here keeps that a
+	// conscious choice rather than an omission.
+	alias := map[string]string{
+		"DISyncMode":     "diSyncAnalyze",
+		"PollRetryAfter": "pollRetryAfterSeconds",
+		"BusyRetryAfter": "busyRetryAfterSeconds",
+	}
+
+	v := reflect.TypeOf(*c)
+	var missing []string
+	for i := 0; i < v.NumField(); i++ {
+		name := v.Field(i).Name
+		if _, skip := nested[name]; skip {
+			continue
+		}
+		key := name
+		if a, ok := alias[name]; ok {
+			key = a
+		}
+		if _, ok := emitted[strings.ToLower(key)]; !ok {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		t.Errorf("Config fields absent from Redacted(), so /_gw/config cannot show them: %v", missing)
+	}
+
+	for _, want := range []string{
+		"diupstreamurl", "diupstreamapikey", "dimaxinflight", "diupstreamtimeout",
+		"readupstreamurl", "readupstreamapikey", "readmaxinflight", "readsynctimeout",
+	} {
+		if _, ok := emitted[want]; !ok {
+			t.Errorf("Redacted() is missing the per-surface key %q", want)
+		}
+	}
 }

@@ -3,6 +3,7 @@ package jobs
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -310,4 +311,61 @@ func TestSweepAndBootRecoveryCannotBothEnqueue(t *testing.T) {
 	if got != 1 {
 		t.Errorf("the container saw %d analyses for one job, want exactly 1", got)
 	}
+}
+
+// TestRecoverDoesNotBlockOnCapacity is a regression test for a hole the recovery-race fix opened.
+//
+// Recover is called before the listener opens, so that a submit cannot race the scan for the same
+// row. It then waited for an admission slot per job. After a real outage there are routinely more
+// abandoned jobs than slots and each can take minutes, so the listener stayed shut and SIGTERM
+// went unhandled for the duration — which Kubernetes reads as a pod that failed to start.
+//
+// Claiming is now synchronous and fast; waiting for capacity happens in the background.
+func TestRecoverDoesNotBlockOnCapacity(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	// The analyzer blocks forever, so every slot stays occupied.
+	analyzer := &countingAnalyzer{}
+	m, st := newTestManager(t, analyzer, now)
+
+	// Far more abandoned jobs than the four slots newTestManager configures.
+	const orphans = 40
+	for i := 0; i < orphans; i++ {
+		id := fmt.Sprintf("00000000-0000-4000-8000-%012d", i)
+		if err := st.Create(context.Background(), &store.Job{
+			ID: id, Surface: SurfaceDI, ModelID: "prebuilt-layout", Status: store.StatusNotStarted,
+			CreatedAt: now.Add(-2 * time.Hour), UpdatedAt: now.Add(-2 * time.Hour),
+			ExpiresAt: now.Add(time.Hour), Query: "api-version=2024-11-30",
+		}); err != nil {
+			t.Fatalf("create %s: %v", id, err)
+		}
+		if err := st.Blob.WriteAll(id, store.KindInput, []byte("%PDF-1.7 fake")); err != nil {
+			t.Fatalf("write input: %v", err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.Start(ctx)
+
+	done := make(chan time.Duration, 1)
+	go func() {
+		started := time.Now()
+		m.Recover(ctx)
+		done <- time.Since(started)
+	}()
+
+	select {
+	case took := <-done:
+		if took > 5*time.Second {
+			t.Errorf("Recover took %v with %d orphans and 4 slots; it must not wait for capacity",
+				took, orphans)
+		}
+	case <-time.After(10 * time.Second):
+		cancel()
+		m.Stop()
+		t.Fatal("Recover never returned: it is still blocking on admission slots, so the listener " +
+			"would never open and SIGTERM would go unhandled")
+	}
+
+	cancel()
+	m.Stop()
 }
