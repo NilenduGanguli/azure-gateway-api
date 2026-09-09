@@ -33,8 +33,16 @@ Verified, not remembered — re-run the commands if you doubt any of it.
 | Tests | `go test -race ./...` | 10/10 packages pass |
 | Image | `make image` | exit 0, ~5.7 MB, suite runs *inside* the build |
 | Git | `git status` | clean, pushed to `origin/main` |
+| Publishable | `git clone <url> /tmp/x && cd /tmp/x && go build ./...` | pass |
 
-97 test functions: 41 conformance, 56 unit. Coverage ~62% overall — the paths that carry the
+> **Do not substitute `git status` for that last row.** A `.gitignore` entry of `gateway` — meant
+> for the build output — also matched the `cmd/gateway` **directory**, so `cmd/gateway/main.go` was
+> never committed. `git status` called the tree clean the whole time, because an ignored file is
+> not untracked. Every local check above passed against a published repository that had no `main`
+> function in it. The only check that catches this class of error is building a fresh clone.
+> `git check-ignore -v <path>` tells you which rule is responsible.
+
+102 test functions: 45 conformance, 57 unit. Coverage ~62% overall — the paths that carry the
 guarantees are covered (`ids` 98%, `jsonx` 86%, `azerr` 80%, `store`/`jobs`/`surface` ~70%); the
 shortfall is `cmd/gateway` and `internal/probe`, which drive real I/O.
 

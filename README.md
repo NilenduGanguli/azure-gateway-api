@@ -133,7 +133,7 @@ disk and no secret is ever logged. The defaults below are the ones in
 | `READ_SYNC_TIMEOUT` | `10m` | Ceiling for one `syncAnalyze`. Your Route timeout must cover this |
 | `DI_SYNC_ANALYZE` | `auto` | `auto` probes and falls back, `force` requires the route, `off` never uses it |
 | `DI_SYNC_PROBE_TIMEOUT` | `60s` | Ceiling on the `:syncAnalyze` attempt alone. A build can declare that route and never answer it; without this, every job would burn the full upstream timeout before falling back |
-| `DI_BLIND_POLL_BUDGET` | `60` | Consecutive poll 404s tolerated before giving up on a degraded operation |
+| `DI_BLIND_POLL_BUDGET` / `READ_BLIND_POLL_BUDGET` | `60` | Consecutive poll 404s tolerated before giving up on a degraded operation |
 
 ### Capacity and backpressure
 
@@ -190,7 +190,7 @@ echoed back in `Operation-Location`.
 | GET · HEAD | `/documentModels/{modelId}/analyzeResults/{resultId}` |
 | DELETE | `/documentModels/{modelId}/analyzeResults/{resultId}` |
 | GET | `.../analyzeResults/{resultId}/pdf` · `.../figures/{figureId}` |
-| GET | `/documentintelligence/info` · `/documentModels` · `/documentModels/{modelId}` |
+| GET | `/info` · `/documentModels` · `/documentModels/{modelId}` |
 
 ### Computer Vision Read — `/vision/v3.2/read`
 

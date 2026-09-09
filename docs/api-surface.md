@@ -15,6 +15,7 @@ image `mcr.microsoft.com/azure-cognitive-services/vision/read:3.2-model-2022-04-
 | `[DOC]` | learn.microsoft.com / MicrosoftDocs source |
 | `[SDK]` | Read from official SDK source (azure-core, azure-ai-documentintelligence, azure-cognitiveservices-vision-computervision, Azure.AI.FormRecognizer, Azure.AI.DocumentIntelligence, azure-sdk-for-java, @azure/core-lro) |
 | `[FIELD]` | Reproducible third-party / MS Q&A observation against a real container |
+| `[OBSERVED]` | Measured against the operator's own running containers by `scripts/probe-containers.sh`. **Outranks `[SPEC]` and `[DOC]` wherever they disagree** — the gateway matches the container, not the reference. |
 | `[UNVERIFIED]` | Nobody has pinned it; probe listed in §11 |
 
 ### Five corrections that override the naive reading of the docs
@@ -24,6 +25,30 @@ image `mcr.microsoft.com/azure-cognitive-services/vision/read:3.2-model-2022-04-
 3. **SDKs do NOT uniformly poll `Operation-Location` verbatim.** Three of the four families do; two named clients rebuild the URL from their own configured endpoint. See §4.
 4. **The two surfaces' error bodies differ in *shape*, not per status code.** Each swagger declares exactly one `default` error response covering every non-2xx. See §6.
 5. **The dominant failure mode on both surfaces is HTTP 200**, with `"status":"failed"` in the body. A gateway that switches on HTTP status alone will mis-map every analysis failure.
+
+### What the probe overturned `[OBSERVED]`
+
+`scripts/probe-containers.sh` was run against the operator's real containers. Two findings
+contradict the specifications recorded below, and **the gateway follows the containers**. The rest
+of this document still describes the *published* contract, which is what makes the divergence
+worth stating rather than silently editing away.
+
+| Claim in the specs | What the containers actually do |
+|---|---|
+| DI errors are wrapped: `{"error":{"code":...}}` (§6.1) | **Flat**: `{"code":"NotFound","message":"Analyze result does not exist."}` — no envelope |
+| CV Read errors are flat: `{"code":...,"message":...}` (§6.2) | **Wrapped**: `{"error":{"code":"BadArgument","message":...}}` |
+
+The two surfaces' shapes are **the inverse** of their references — the mistake this table exists to
+stop a future reader making. The gateway emits the observed shapes by default and can be switched
+back to the documented ones with `ERROR_COMPAT=documented`, which exists only so a client that was
+written against the published reference is not stranded.
+
+Also observed, and material to §7: DI's `:syncAnalyze` **is routed but never answers** on this
+image. It accepts the request and then hangs until the client's timeout rather than returning 200,
+202, 404, or 405. `DI_SYNC_ANALYZE=auto` latches this on first use and falls back to `:analyze`
+plus polling; `DI_SYNC_ANALYZE=off` skips the attempt entirely. A route that is present in the
+image's routing table is therefore **not** evidence that it works — correction 1 above is true
+about the image and false about the behaviour.
 
 ---
 
