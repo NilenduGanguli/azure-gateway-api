@@ -323,9 +323,10 @@ func (c *Config) Warnings() []string {
 			"TRUSTED_FORWARDED_HOSTS set: any caller can set X-Forwarded-Host and have its "+
 			"Operation-Location point elsewhere. Set PUBLIC_BASE_URL, or list the allowed hosts")
 	}
-	if c.PublicBaseURL == "" && !c.TrustForwardedHeaders {
+	if c.PublicBaseURL == "" && !c.TrustForwardedHeaders && len(c.TrustedForwardedHosts) == 0 {
 		out = append(out, "PUBLIC_BASE_URL is unset and forwarded headers are not trusted; "+
-			"Operation-Location will be derived from the request Host header")
+			"Operation-Location will be derived from the request Host header, which any caller "+
+			"can set. Set PUBLIC_BASE_URL, or list the allowed hosts in TRUSTED_FORWARDED_HOSTS")
 	}
 	return out
 }

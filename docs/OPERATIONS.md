@@ -481,7 +481,7 @@ holds its connection for the whole analysis.
 | `ERROR_COMPAT` | `observed` | `observed` reproduces what the containers actually emit: everything wrapped in `{"error":{…}}`, except the DI unknown-or-expired result id, which comes back flat as `{"code":"NotFound","message":"Analyze result does not exist."}`. `documented` follows the swagger — DI wrapped, Read flat. Nothing else is accepted. |
 | `PUBLIC_BASE_URL` | *(derived from the request)* | Scheme and authority for `Operation-Location`. **The recommended setting.** Rejected at startup if it carries a path, query or fragment, because `Azure.AI.FormRecognizer` 4.x locates the model and result ids by counting path segments backwards. |
 | `TRUST_FORWARDED_HEADERS` | `false` | Honour `X-Forwarded-Proto`/`X-Forwarded-Host`. Off by default: with it on and no allowlist, any caller can set `X-Forwarded-Host` and have the gateway mint an `Operation-Location` pointing at its own host — and the client's SDK then sends the operation id there. |
-| `TRUSTED_FORWARDED_HOSTS` | *(empty)* | Comma-separated authorities a forwarded header may name. An entry with no port matches that host on any port. |
+| `TRUSTED_FORWARDED_HOSTS` | *(empty)* | Comma-separated authorities this gateway may advertise in `Operation-Location`. Constrains **both** `X-Forwarded-Host` and the plain `Host` header — an allowlist that governed only the forwarded header bought nothing, since a caller can simply omit it. An entry with no port matches that host on any port; bracket IPv6 literals (`[::1]`). A request whose authority is not listed gets a configuration error rather than a header pointing somewhere else. Empty means any authority that parses is advertised. |
 
 ### Observability and process
 

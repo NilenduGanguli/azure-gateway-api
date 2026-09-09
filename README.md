@@ -163,7 +163,7 @@ disk and no secret is ever logged. The defaults below are the ones in
 |---|---|---|
 | `PUBLIC_BASE_URL` | *(derived)* | Scheme and authority for `Operation-Location`, no path. **The recommended setting** — correct behind any proxy topology |
 | `TRUST_FORWARDED_HEADERS` | `false` | Honour `X-Forwarded-Proto` / `X-Forwarded-Host`. Off by default: with it on and no allowlist, a caller can name its own poll host |
-| `TRUSTED_FORWARDED_HOSTS` | | Comma-separated authorities a forwarded header may name |
+| `TRUSTED_FORWARDED_HOSTS` | | Comma-separated authorities this gateway may advertise. Constrains both `X-Forwarded-Host` and the plain `Host` header |
 | `ERROR_COMPAT` | `observed` | `observed` reproduces the error shapes these containers really emit; `documented` follows the swagger and SDK models. They differ on **both** surfaces |
 
 ### Process

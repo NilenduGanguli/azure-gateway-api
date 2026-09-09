@@ -243,3 +243,43 @@ func TestValidAuthorityAcceptsIPv6Literals(t *testing.T) {
 		}
 	}
 }
+
+// TestAllowlistConstrainsThePlainHostHeader is a regression test.
+//
+// TRUSTED_FORWARDED_HOSTS is the operator's statement of what this gateway may advertise, and it
+// was applied only to X-Forwarded-Host. A caller reaching the gateway directly and omitting that
+// header had its Host trusted verbatim, so the allowlist an operator set on the warning's advice
+// bought nothing: the attacker just stopped sending the header it guarded.
+func TestAllowlistConstrainsThePlainHostHeader(t *testing.T) {
+	r := BaseURLResolver{TrustForwarded: true, AllowedHosts: []string{"gw.example", "[::1]"}}
+
+	for _, tc := range []struct {
+		name, host, forwarded, want string
+	}{
+		{"allowed host", "gw.example", "", "http://gw.example"},
+		{"allowed host with a port", "gw.example:8080", "", "http://gw.example:8080"},
+		{"allowed IPv6 literal", "[::1]:8080", "", "http://[::1]:8080"},
+		{"attacker Host, no forwarded header", "evil.example", "", ""},
+		{"attacker Host under an allowed forwarded host", "evil.example", "gw.example", "http://gw.example"},
+		{"attacker forwarded host", "gw.example", "evil.example", "http://gw.example"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/x", nil)
+			req.Host = tc.host
+			if tc.forwarded != "" {
+				req.Header.Set("X-Forwarded-Host", tc.forwarded)
+			}
+			if got := r.Resolve(req); got != tc.want {
+				t.Errorf("Resolve = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	// With no allowlist the previous behaviour is unchanged.
+	open := BaseURLResolver{TrustForwarded: true}
+	req := httptest.NewRequest(http.MethodPost, "/x", nil)
+	req.Host = "anything.example"
+	if got := open.Resolve(req); got != "http://anything.example" {
+		t.Errorf("with no allowlist Resolve = %q, want the request host", got)
+	}
+}

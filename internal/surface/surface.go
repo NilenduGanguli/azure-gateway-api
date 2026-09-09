@@ -266,13 +266,20 @@ func (s *Server) streamResult(w http.ResponseWriter, r *http.Request, surface az
 		// which every client family handles.
 		logging.From(r.Context()).Error("result blob missing for a succeeded job",
 			"job", job.ID, "error", err)
-		lost := azerr.Internal(surface, "The stored result is no longer available.").OperationError()
-		httpx.WriteJSON(w, http.StatusOK, envelope{
+		out := envelope{
 			Status:              string(store.StatusFailed),
 			CreatedDateTime:     job.CreatedAt.Format(jobs.TimeFormat),
 			LastUpdatedDateTime: s.deps.Now().Format(jobs.TimeFormat),
-			Error:               &lost,
-		})
+		}
+		// Only the DI envelope has an error member. ReadOperationResult has none in any of v3.0,
+		// v3.1 or v3.2 — a failed Read operation is just {"status":"failed", ...} — so adding one
+		// would put a field on the wire that no Read SDK models and that the containers never
+		// send. See azerr.OperationError's own contract.
+		if surface != azerr.SurfaceRead {
+			lost := azerr.Internal(surface, "The stored result is no longer available.").OperationError()
+			out.Error = &lost
+		}
+		httpx.WriteJSON(w, http.StatusOK, out)
 		return
 	}
 	defer func() { _ = f.Close() }()

@@ -219,6 +219,14 @@ func (b BaseURLResolver) Resolve(r *http.Request) string {
 			host = v
 		}
 	}
+	// The allowlist governs what this gateway may advertise, so it must also constrain the plain
+	// Host header. It did not: an operator who followed the warning's advice and listed the allowed
+	// hosts still had every direct caller's Host header trusted verbatim, and could be made to mint
+	// an Operation-Location pointing anywhere simply by omitting X-Forwarded-Host. An empty list
+	// keeps the previous behaviour.
+	if !b.hostAllowed(host) {
+		return ""
+	}
 	if !validAuthority(host) {
 		// Nothing safe to advertise. A relative Operation-Location makes Python join it onto its
 		// own endpoint and produce a doubled path, so an empty authority is never emitted; the
@@ -234,17 +242,34 @@ func (b BaseURLResolver) hostAllowed(host string) bool {
 	if len(b.AllowedHosts) == 0 {
 		return true
 	}
-	h, _, hasPort := strings.Cut(host, ":")
+	h, hasPort := hostWithoutPort(host)
 	for _, allowed := range b.AllowedHosts {
 		if strings.EqualFold(allowed, host) {
 			return true
 		}
-		// An allowlist entry with no port matches the same host on any port.
-		if !strings.Contains(allowed, ":") && hasPort && strings.EqualFold(allowed, h) {
+		// An allowlist entry with no port matches the same host on any port. A bracketed IPv6
+		// entry is full of colons and is compared whole.
+		bare := !strings.Contains(allowed, ":") || strings.HasPrefix(allowed, "[")
+		if bare && hasPort && strings.EqualFold(allowed, h) {
 			return true
 		}
 	}
 	return false
+}
+
+// hostWithoutPort strips a trailing :port, leaving a bracketed IPv6 literal intact.
+func hostWithoutPort(authority string) (host string, hadPort bool) {
+	if strings.HasPrefix(authority, "[") {
+		if end := strings.LastIndexByte(authority, ']'); end >= 0 {
+			return authority[:end+1], end+1 < len(authority)
+		}
+		return authority, false
+	}
+	h, _, found := cutLast(authority, ':')
+	if !found {
+		return authority, false
+	}
+	return h, true
 }
 
 // validAuthority reports whether s is a bare host or host:port.

@@ -176,6 +176,11 @@ func serve() error {
 		return err
 	case <-signalCtx.Done():
 		log.Info("shutdown signal received", "grace", cfg.ShutdownGrace.String())
+		// Hand the signals back to the runtime now, rather than at return. While NotifyContext is
+		// still installed every further SIGINT/SIGTERM is captured and dropped — the context is
+		// already cancelled — so an operator watching a drain that will not finish had no way to
+		// end it but SIGKILL. A second Ctrl-C now does what it always should.
+		stopSignals()
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownGrace)
