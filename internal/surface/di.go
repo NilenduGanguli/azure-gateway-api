@@ -422,7 +422,14 @@ func (s *Server) relaySync(w http.ResponseWriter, r *http.Request, surface azerr
 	// misrepresent them.
 	if len(bytes.TrimSpace(raw)) == 0 {
 		for k, vs := range resp.Header {
-			if !skipRelayHeader(k) && k != "Content-Length" {
+			// Retry-After is dropped here for the same reason the parsed branch below drops it:
+			// azure-core retries ANY response >= 400 carrying it, ten times, bypassing its own
+			// method allowlist. Relaying the container's header verbatim turned a bodyless 404 —
+			// which is what a probed build answers for /info and /documentModels — into ten
+			// retries of a request that can never succeed. It would also relay an HTTP-date
+			// value, which the SDKs' integer-only parser rejects.
+			if !skipRelayHeader(k) && k != "Content-Length" &&
+				http.CanonicalHeaderKey(k) != "Retry-After" {
 				for _, v := range vs {
 					w.Header().Add(k, v)
 				}

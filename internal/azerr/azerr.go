@@ -539,9 +539,9 @@ func (e *APIError) OperationError() Error {
 	return out
 }
 
-// maxInnerDepth caps recursion when parsing an upstream innererror chain, which the schema
-// leaves unbounded.
-const maxInnerDepth = 3
+// The schema leaves the innererror chain unbounded, but the decode below is deliberately not
+// recursive: it reads exactly one level into an anonymous struct with no nested innererror. There
+// is therefore no depth to cap, and the surface the gateway emits carries at most one inner error.
 
 // ParseUpstream extracts an error from an upstream container response body, tolerating every
 // shape these containers are known to produce:

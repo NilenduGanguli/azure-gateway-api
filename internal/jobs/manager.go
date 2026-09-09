@@ -69,7 +69,16 @@ type Manager struct {
 
 	runners map[string]*surfaceRunner
 
+	// runCtx and cancel are the manager's own lifetime, derived from Start's argument.
+	//
+	// INVARIANT: every goroutine tracked by wg must observe runCtx, never the caller's context.
+	// Stop cancels only this derived context and then waits on wg, so a tracked goroutine that
+	// blocks on the *parent* can never be released by Stop — wg.Wait() hangs and the process has
+	// to be SIGKILLed. That is exactly how the boot-recovery feeder deadlocked shutdown: it held
+	// the caller's ctx while Stop cancelled the child, the workers exited, and nothing was left to
+	// drain the admission channel it was blocked sending to.
 	wg     sync.WaitGroup
+	runCtx context.Context
 	cancel context.CancelFunc
 
 	// claims is the set of job ids this process already has queued or running.
@@ -139,6 +148,7 @@ func newRunner(name string, a upstream.Analyzer, inflight, queueDepth int) *surf
 // Start launches the workers, the recovery pass and the sweeper.
 func (m *Manager) Start(ctx context.Context) {
 	ctx, m.cancel = context.WithCancel(ctx)
+	m.runCtx = ctx
 
 	for _, r := range m.runners {
 		for i := 0; i < r.workers; i++ {
@@ -187,7 +197,19 @@ func (m *Manager) Drain(ctx context.Context) {
 //
 // It is called explicitly, before the listener opens, rather than from Start: a scan racing live
 // traffic can pick up a row a submit has just committed and not yet enqueued, and run it twice.
+//
+// ctx bounds the scan only. The feeder it leaves behind runs under the manager's own context, so
+// Stop can release it — see the INVARIANT on Manager.wg.
 func (m *Manager) Recover(ctx context.Context) { m.recover(ctx, true) }
+
+// tracked returns the context every wg-tracked goroutine must use: the manager's own, falling back
+// to the caller's only when Start has not run (which is a programming error everywhere but tests).
+func (m *Manager) tracked(ctx context.Context) context.Context {
+	if m.runCtx != nil {
+		return m.runCtx
+	}
+	return ctx
+}
 
 // Stop cancels the workers and waits for in-flight jobs to finish or abort.
 func (m *Manager) Stop() {

@@ -21,14 +21,13 @@ import (
 	"time"
 
 	"github.com/NilenduGanguli/azure-gateway-api/internal/admin"
+	"github.com/NilenduGanguli/azure-gateway-api/internal/app"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/azerr"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/config"
-	"github.com/NilenduGanguli/azure-gateway-api/internal/httpx"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/jobs"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/logging"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/probe"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/store"
-	"github.com/NilenduGanguli/azure-gateway-api/internal/surface"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/upstream"
 )
 
@@ -128,30 +127,12 @@ func serve() error {
 	// and the job was then executed twice against the container.
 	manager.Recover(runCtx)
 
-	mux := http.NewServeMux()
-	surface.New(surface.Deps{
-		Config: cfg,
-		Store:  st,
-		Jobs:   manager,
-		BaseURL: httpx.BaseURLResolver{
-			Configured:     cfg.PublicBaseURL,
-			TrustForwarded: cfg.TrustForwardedHeaders,
-			AllowedHosts:   cfg.TrustedForwardedHosts,
+	handler := app.NewHandler(app.Deps{
+		Config: cfg, Store: st, Jobs: manager, Logger: log, Started: started,
+		Build: admin.BuildInfo{
+			Version: version, Commit: commit, Built: built, Go: runtime.Version(),
 		},
-	}).Register(mux)
-
-	admin.New(cfg, st, manager, admin.BuildInfo{
-		Version: version, Commit: commit, Built: built, Go: runtime.Version(),
-	}, started).Register(mux)
-
-	mux.HandleFunc("/", notFound)
-
-	handler := httpx.Chain(mux,
-		httpx.RequestID(log),
-		httpx.AccessLog(),
-		httpx.Recover(onPanic),
-		httpx.NoCache(),
-	)
+	})
 
 	srv := &http.Server{
 		Addr:    cfg.Addr,
@@ -175,8 +156,11 @@ func serve() error {
 		log.Info("gateway listening",
 			"addr", cfg.Addr,
 			"version", version,
-			"diUpstream", cfg.DI.BaseURL,
-			"readUpstream", cfg.Read.BaseURL,
+			// Redacted: an operator may carry credentials in the upstream URL, and this line
+			// goes to stdout, which in a cluster means the log aggregator. Every other rendering
+			// of these values already redacts; this one did not.
+			"diUpstream", config.SafeURL(cfg.DI.BaseURL),
+			"readUpstream", config.SafeURL(cfg.Read.BaseURL),
 			"dataDir", cfg.DataDir,
 			"diMaxInflight", cfg.DI.MaxInflight,
 			"readMaxInflight", cfg.Read.MaxInflight,
@@ -212,31 +196,6 @@ func serve() error {
 
 	log.Info("shutdown complete")
 	return nil
-}
-
-// notFound answers an unrouted path in the shape of whichever surface it looks like it was meant
-// for, so a client's SDK still sees a body it can parse rather than Go's plain-text 404.
-// notFound answers a path neither surface serves.
-//
-// Both containers answer an unrouted path with a bodyless 404, and matching them is safe: no SDK
-// parses an unrouted response as operation state. Routed endpoints always carry a body.
-func notFound(w http.ResponseWriter, r *http.Request) {
-	s := surfaceFor(r)
-	azerr.Unrouted(s).WriteTo(w, s)
-}
-
-func onPanic(w http.ResponseWriter, r *http.Request, _ any) {
-	s := surfaceFor(r)
-	azerr.Internal(s, "").WriteTo(w, s)
-}
-
-// surfaceFor guesses which error vocabulary a request expects from its path.
-func surfaceFor(r *http.Request) azerr.Surface {
-	if len(r.URL.Path) >= len(upstream.ReadPathPrefix) &&
-		r.URL.Path[:len(upstream.ReadPathPrefix)] == upstream.ReadPathPrefix {
-		return azerr.SurfaceRead
-	}
-	return azerr.SurfaceDI
 }
 
 func runProbe() error {

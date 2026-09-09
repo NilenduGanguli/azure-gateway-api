@@ -305,18 +305,10 @@ func (s *Server) deleteResult(w http.ResponseWriter, r *http.Request, surface az
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// methodGuard rejects a verb the route does not serve, in the surface's own error shape rather
-// than Go's default plain-text 405.
-func methodGuard(surface azerr.Surface, allowed string, next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != allowed && !(allowed == http.MethodGet && r.Method == http.MethodHead) {
-			w.Header().Set("Allow", allowed)
-			azerr.MethodNotAllowed(surface).WriteTo(w, surface)
-			return
-		}
-		next(w, r)
-	}
-}
+// A per-route method guard used to live here. It was never wired to a route, and could not have
+// helped: the "/" catch-all in internal/app absorbs every method mismatch before a route's own
+// guard would run. 405 is produced there instead, by asking the route table which verbs the path
+// does serve — see app.allowedMethods.
 
 // setUploadDeadline bounds how long a client may take to stream its request body.
 //

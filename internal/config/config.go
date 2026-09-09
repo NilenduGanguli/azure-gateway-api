@@ -345,7 +345,7 @@ func (c *Config) Redacted() map[string]any {
 		"trustedForwardedHosts": c.TrustedForwardedHosts,
 		"dataDir":               c.DataDir,
 		"allowNetworkFs":        c.AllowNetworkFS,
-		"diUpstreamUrl":         safeURL(c.DI.BaseURL),
+		"diUpstreamUrl":         SafeURL(c.DI.BaseURL),
 		"diUpstreamApiKey":      redact(c.DI.APIKey),
 		"diMaxInflight":         c.DI.MaxInflight,
 		"diUpstreamTimeout":     c.DI.Timeout.String(),
@@ -353,7 +353,7 @@ func (c *Config) Redacted() map[string]any {
 		"diBlindPollBudget":     c.DIBlindPollBudget,
 		"readBlindPollBudget":   c.ReadBlindPollBudget,
 		"diSyncProbeTimeout":    c.DISyncProbeTimeout.String(),
-		"readUpstreamUrl":       safeURL(c.Read.BaseURL),
+		"readUpstreamUrl":       SafeURL(c.Read.BaseURL),
 		"readUpstreamApiKey":    redact(c.Read.APIKey),
 		"readMaxInflight":       c.Read.MaxInflight,
 		"readSyncTimeout":       c.Read.Timeout.String(),
@@ -374,18 +374,22 @@ func (c *Config) Redacted() map[string]any {
 	}
 }
 
-// safeURL strips any userinfo before a URL is rendered.
+// SafeURL strips any password before a URL is rendered.
 //
 // /_gw/config and /_gw/health are unauthenticated, and an upstream configured as
 // http://user:pass@host:5000 would otherwise publish that credential to anyone who can reach the
 // gateway.
-func safeURL(raw string) string {
+// SafeURL renders an upstream URL with any password removed, for logs and /_gw/* output.
+//
+// It delegates to url.URL.Redacted rather than rebuilding the userinfo by hand: passing
+// "name:***" to url.User escapes the colon and the asterisks, so the "redacted" value rendered as
+// user%3A%2A%2A%2A — technically safe, but unreadable and not what any doc claimed.
+func SafeURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil || u.User == nil {
 		return raw
 	}
-	u.User = url.User(u.User.Username() + ":***")
-	return u.String()
+	return u.Redacted()
 }
 
 func env(key, def string) string {

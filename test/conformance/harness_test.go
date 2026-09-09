@@ -16,12 +16,11 @@ import (
 	"time"
 
 	"github.com/NilenduGanguli/azure-gateway-api/internal/admin"
+	"github.com/NilenduGanguli/azure-gateway-api/internal/app"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/config"
-	"github.com/NilenduGanguli/azure-gateway-api/internal/httpx"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/jobs"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/mockazure"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/store"
-	"github.com/NilenduGanguli/azure-gateway-api/internal/surface"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/upstream"
 )
 
@@ -96,28 +95,23 @@ func newHarness(t *testing.T, o harnessOpts) *harness {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	manager := jobs.New(jobs.Options{
 		Config: cfg, Store: st, Logger: log,
-		DI:   upstream.NewDI(cfg.DI, cfg.DISyncMode, cfg.DIBlindPollBudget, st.Blob.Root(), cfg.MaxRequestBytes, cfg.DISyncProbeTimeout),
-		Read: upstream.NewRead(cfg.Read, cfg.DIBlindPollBudget, st.Blob.Root(), cfg.MaxRequestBytes),
+		// These argument lists must match cmd/gateway/main.go exactly. They did not: Read was
+		// built with the DI poll budget, and both clients with the request-size limit where the
+		// binary passes the result-size limit.
+		DI:   upstream.NewDI(cfg.DI, cfg.DISyncMode, cfg.DIBlindPollBudget, st.Blob.Root(), cfg.MaxResultBytes, cfg.DISyncProbeTimeout),
+		Read: upstream.NewRead(cfg.Read, cfg.ReadBlindPollBudget, st.Blob.Root(), cfg.MaxResultBytes),
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	manager.Start(ctx)
 	manager.Recover(ctx)
 	t.Cleanup(func() { cancel(); manager.Stop() })
 
-	mux := http.NewServeMux()
-	surface.New(surface.Deps{
-		Config: cfg, Store: st, Jobs: manager,
-		BaseURL: httpx.BaseURLResolver{
-			Configured:     cfg.PublicBaseURL,
-			TrustForwarded: cfg.TrustForwardedHeaders,
-			AllowedHosts:   cfg.TrustedForwardedHosts,
-		},
-	}).Register(mux)
-	admin.New(cfg, st, manager, admin.BuildInfo{Version: "test"}, time.Now()).Register(mux)
-
-	handler := httpx.Chain(mux,
-		httpx.RequestID(log), httpx.Recover(func(http.ResponseWriter, *http.Request, any) {}),
-	)
+	// The same assembly the binary uses, so the suite cannot pass on a mux production does not
+	// have. Building it here by hand is what let the "/" catch-all diverge.
+	handler := app.NewHandler(app.Deps{
+		Config: cfg, Store: st, Jobs: manager, Logger: log, Started: time.Now(),
+		Build: admin.BuildInfo{Version: "test"},
+	})
 	gw := httptest.NewServer(handler)
 	t.Cleanup(gw.Close)
 

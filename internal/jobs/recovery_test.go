@@ -369,3 +369,55 @@ func TestRecoverDoesNotBlockOnCapacity(t *testing.T) {
 	cancel()
 	m.Stop()
 }
+
+// TestStopReleasesTheRecoveryFeederWithoutTheParentContext is a regression test for a shutdown
+// deadlock.
+//
+// The boot-recovery feeder is tracked by Manager.wg but was handed Recover's caller context. Stop
+// cancels only the manager's own derived context and then waits on wg, so the sequence main uses —
+// Drain, Stop, then cancel the run context — left the feeder blocked forever on an admission slot
+// that no surviving worker would ever drain. wg.Wait() never returned and the pod had to be
+// SIGKILLed after its termination grace expired.
+//
+// Every other test here masks it by cancelling the parent *before* Stop, which is the opposite of
+// main's order. This one reproduces main's order exactly, and needs a backlog larger than
+// MaxInflight + QueueDepth so the feeder is guaranteed to be mid-send when Stop arrives.
+func TestStopReleasesTheRecoveryFeederWithoutTheParentContext(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	m, st := newTestManager(t, &countingAnalyzer{}, now)
+
+	for i := 0; i < 40; i++ {
+		id := fmt.Sprintf("00000000-0000-4000-8000-%012d", i)
+		if err := st.Create(context.Background(), &store.Job{
+			ID: id, Surface: SurfaceDI, ModelID: "prebuilt-layout",
+			Status: store.StatusNotStarted, CreatedAt: now.Add(-2 * time.Hour),
+			UpdatedAt: now.Add(-2 * time.Hour), ExpiresAt: now.Add(time.Hour),
+			Query: "api-version=2024-11-30",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Blob.WriteAll(id, store.KindInput, []byte("%PDF-1.7 fake")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	runCtx, stopRun := context.WithCancel(context.Background())
+	defer stopRun()
+
+	// main.go's order, and only this order, exposes the bug.
+	m.Start(runCtx)
+	m.Recover(runCtx)
+	time.Sleep(300 * time.Millisecond)
+
+	stopped := make(chan struct{})
+	go func() { m.Stop(); close(stopped) }()
+
+	select {
+	case <-stopped:
+	case <-time.After(8 * time.Second):
+		stopRun() // unblock the feeder so the test can exit rather than hang the package
+		<-stopped
+		t.Fatal("Stop() blocked: a wg-tracked goroutine is waiting on a context Stop does not " +
+			"cancel, so shutdown hangs until the pod is SIGKILLed")
+	}
+}

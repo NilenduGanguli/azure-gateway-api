@@ -93,8 +93,7 @@ type Container struct {
 }
 
 type operation struct {
-	polls  int
-	failed bool
+	polls int
 }
 
 // URL returns the container's base URL.

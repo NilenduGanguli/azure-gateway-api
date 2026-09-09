@@ -70,10 +70,14 @@ func (m *Manager) recover(ctx context.Context, atBoot bool) {
 	}
 	m.log.Info("claimed jobs for re-running", "count", len(claimed))
 
+	// The feeder is tracked by m.wg, so it must observe the manager's own context — not the
+	// caller's. Stop cancels only the former, and a feeder blocked on an admission slot that Stop
+	// cannot release deadlocks shutdown outright. See the INVARIANT on Manager.wg.
+	feedCtx := m.tracked(ctx)
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
-		m.feed(ctx, claimed)
+		m.feed(feedCtx, claimed)
 	}()
 }
 

@@ -304,12 +304,6 @@ func (c *DIClient) analyzeAsync(ctx context.Context, ac *affinityClient, doc Doc
 	return res, nil
 }
 
-// pollURL rebuilds the poll target against the configured upstream base, keeping only the
-// api-version from the original query.
-func (c *DIClient) pollURL(modelID, resultID string, q url.Values) string {
-	return c.pollURLIn(DIPathPrefix, modelID, resultID, q)
-}
-
 // pollURLIn builds the poll target within a given path family.
 func (c *DIClient) pollURLIn(fam, modelID, resultID string, q url.Values) string {
 	pq := url.Values{}

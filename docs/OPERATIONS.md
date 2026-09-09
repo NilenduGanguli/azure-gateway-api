@@ -159,7 +159,7 @@ type: Opaque
 stringData:
   # The only two secrets. Empty is legal — the gateway logs a warning and calls the containers
   # unauthenticated. Keep credentials here rather than embedding them in the upstream URLs: URL
-  # userinfo is redacted to user:*** on /_gw/config and /_gw/health, but it is still a credential
+  # userinfo is redacted to user:xxxxx on /_gw/config, /_gw/health and the startup log, but it
   # sitting in a ConfigMap rather than a Secret.
   DI_UPSTREAM_API_KEY: "replace-me"
   READ_UPSTREAM_API_KEY: "replace-me"
@@ -557,7 +557,7 @@ through the public Route.
 | `GET /_gw/jobs/{id}` | One job view, or `404 {"error":"no such job"}`. |
 | `GET /_gw/metrics` | Prometheus text format, `version=0.0.4`. Hand-written; there is no client library in the binary. |
 | `GET /_gw/version` | `{"version","commit","built","go"}`. The first three come from the build's `-ldflags` (`-X main.version` and friends, set by the Makefile and Dockerfile); `go` is the toolchain version `runtime.Version()` reports at startup. |
-| `GET /_gw/config` | The effective configuration. Both API keys render as `***`, and any userinfo embedded in an upstream URL is stripped to `user:***` — `/_gw/health` does the same. Credentials still belong in `DI_UPSTREAM_API_KEY` / `READ_UPSTREAM_API_KEY` rather than in the URL. Every configuration field is surfaced here; `TestRedactedCoversEveryField` fails if one is added and not exposed. |
+| `GET /_gw/config` | The effective configuration. Both API keys render as `***`, and any password embedded in an upstream URL renders as `user:xxxxx` via `url.URL.Redacted` — `/_gw/health` and the startup log do the same. Credentials still belong in `DI_UPSTREAM_API_KEY` / `READ_UPSTREAM_API_KEY` rather than in the URL. Every configuration field is surfaced here; `TestRedactedCoversEveryField` fails if one is added and not exposed. |
 | `GET /status` | Container-shaped: `{"apiStatus":"Valid"…}` or `{"apiStatus":"Invalid","apiStatusMessage":"Upstream containers unreachable: …"}`, always at HTTP 200, because Microsoft's own batch tooling parses `apiStatus` and compares it against `Valid`. |
 | `GET /ready` | Container-shaped: `{"ready":"ready"}` at 200, or `{"ready":"notReady"}` at 503 — the exact pair Microsoft's compose healthcheck greps for. |
 
