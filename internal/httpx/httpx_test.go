@@ -218,3 +218,28 @@ func TestForwardedHostCannotBeHijacked(t *testing.T) {
 		}
 	})
 }
+
+// TestValidAuthorityAcceptsIPv6Literals is a regression test.
+//
+// The host:port split cut at the first colon, which an IPv6 literal is full of: "[::1]:8080"
+// became host "[" and port ":1]:8080" and was rejected. With PUBLIC_BASE_URL unset the gateway
+// derives Operation-Location from the request authority, so on an IPv6-reachable cluster every
+// submit answered 500 instead of 202.
+func TestValidAuthorityAcceptsIPv6Literals(t *testing.T) {
+	for _, s := range []string{
+		"[::1]", "[::1]:8080", "[2001:db8::1]:443", "[fe80::1]",
+		"gateway.svc", "gateway.svc:8080", "10.0.0.1", "10.0.0.1:5000",
+	} {
+		if !validAuthority(s) {
+			t.Errorf("validAuthority(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{
+		"", "[::1", "::1]:80", "[not-an-ip]:80", "host:notaport",
+		"host:123456", "host/path", "host?q", "host#f", "user@host",
+	} {
+		if validAuthority(s) {
+			t.Errorf("validAuthority(%q) = true, want false", s)
+		}
+	}
+}

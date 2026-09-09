@@ -7,6 +7,7 @@ package httpx
 import (
 	"encoding/json"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -258,7 +259,34 @@ func validAuthority(s string) bool {
 	if strings.ContainsAny(s, "/?#@\\ \t\r\n\"'<>") {
 		return false
 	}
-	host, port, hasPort := strings.Cut(s, ":")
+	// An IPv6 literal is bracketed and full of colons, so it has to be split off before the
+	// host:port cut. Cutting at the FIRST colon turned "[::1]:8080" into host "[" and port
+	// ":1]:8080" and rejected it — with PUBLIC_BASE_URL unset, a gateway reached over IPv6
+	// answered every submit 500 instead of 202.
+	host, port, hasPort := "", "", false
+	if strings.HasPrefix(s, "[") {
+		end := strings.LastIndexByte(s, ']')
+		if end < 0 {
+			return false
+		}
+		if net.ParseIP(s[1:end]) == nil {
+			return false
+		}
+		if rest := s[end+1:]; rest != "" {
+			if rest[0] != ':' {
+				return false
+			}
+			port, hasPort = rest[1:], true
+		}
+		host = s[:end+1]
+	} else {
+		host, port, hasPort = cutLast(s, ':')
+		// Outside brackets these characters can only mean a malformed or unbracketed IPv6
+		// authority, which is not something a client may assert.
+		if strings.ContainsAny(host, "[]:") {
+			return false
+		}
+	}
 	if host == "" {
 		return false
 	}
@@ -281,6 +309,15 @@ func validAuthority(s string) bool {
 		}
 	}
 	return true
+}
+
+// cutLast splits at the final separator, so a host containing the separator keeps it.
+func cutLast(s string, sep byte) (before, after string, found bool) {
+	i := strings.LastIndexByte(s, sep)
+	if i < 0 {
+		return s, "", false
+	}
+	return s[:i], s[i+1:], true
 }
 
 // firstForwarded takes the client-most value from a comma-separated forwarded header.

@@ -29,7 +29,11 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
 RUN CGO_ENABLED=0 go test ./...
 
 # Runtime stage.
-FROM gcr.io/distroless/static-debian12:nonroot
+# Pinned, not inherited. TARGETARCH below fixes the BINARY's architecture, but the image manifest
+# still takes the builder's default platform — so a plain `docker build .` on an Apple Silicon host
+# produced an arm64-labelled image containing an x86-64 binary, which the cluster pulls and cannot
+# execute. make image passes --platform too; this makes the bare command safe as well.
+FROM --platform=linux/amd64 gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=build /out/gateway /usr/local/bin/gateway
 

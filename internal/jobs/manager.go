@@ -427,7 +427,11 @@ func (m *Manager) run(ctx context.Context, r *surfaceRunner, owner, id string) {
 		}
 		apiErr, ok := azerr.AsAPIError(err)
 		if !ok {
-			apiErr = azerr.Internal(r.analyzer.Surface(), err.Error())
+			// The raw Go error is logged, never returned. It routinely names absolute PVC paths
+			// and internal packages ("open /data/blobs/ab/cd/....input: no such file"), and this
+			// message is served to any unauthenticated caller polling the operation.
+			log.Error("analysis failed with an unmapped error", "error", err)
+			apiErr = azerr.Internal(r.analyzer.Surface(), "")
 		}
 		log.Warn("analysis failed", "code", apiErr.Code, "message", apiErr.Message)
 		m.failJob(context.WithoutCancel(ctx), r, id, apiErr, 0, 0)

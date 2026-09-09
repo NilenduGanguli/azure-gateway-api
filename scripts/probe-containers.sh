@@ -385,6 +385,26 @@ else
 fi
 printf '  READ host has "vision" %s\n' "$WARN_VISION"
 echo
+
+# A run in which neither container answered anything must not read as a set of findings. Every
+# field above is still at its "not probed" default in that case, and the advice below would be
+# confidently wrong.
+di_answered=no; rd_answered=no
+case "$DI_SYNC" in "not probed"|"NO ANSWER"*) ;; *) di_answered=yes ;; esac
+case "$RD_SYNC" in "not probed"|"NO ANSWER"*) ;; *) rd_answered=yes ;; esac
+if [ "$di_answered" = no ] && [ "$rd_answered" = no ]; then
+  printf '  !! NO VERDICT. Neither container answered, so nothing below could be measured.\n'
+  printf '     Check the URLs, the API keys, and that the pods are running and reachable\n'
+  printf '     from where this script runs. Re-run once one of them responds.\n\n'
+  exit 3
+fi
+if [ "$di_answered" = no ] || [ "$rd_answered" = no ]; then
+  printf '  !! PARTIAL RUN. '
+  [ "$di_answered" = no ] && printf 'The DI container did not answer; its rows are unmeasured.\n'
+  [ "$rd_answered" = no ] && printf 'The Read container did not answer; its rows are unmeasured.\n'
+  printf '\n'
+fi
+
 case "$DI_SYNC" in
   AVAILABLE)         printf '  -> keep DI_SYNC_ANALYZE=auto. The fast path works on this build.\n' ;;
   "DEGRADES TO 202") printf '  -> keep DI_SYNC_ANALYZE=auto. The gateway polls the 202 out.\n' ;;
