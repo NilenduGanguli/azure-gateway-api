@@ -263,6 +263,10 @@ func (b *base) pollUntilTerminal(ctx context.Context, ac *affinityClient, cfg po
 			// how much of the configured timeout was left.
 			transient++
 			lastTransientErr = transportCause(err)
+			// Not a 404, so the run of them is broken. The budget counts CONSECUTIVE misses —
+			// evidence that this replica genuinely never saw the operation — and letting a
+			// transport blip carry the count forward turned unrelated churn into a wrong verdict.
+			misses = 0
 			continue
 		}
 
@@ -330,6 +334,7 @@ func (b *base) pollUntilTerminal(ctx context.Context, ac *affinityClient, cfg po
 			cancelReq()
 			transient++
 			lastTransientErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			misses = 0
 			continue
 
 		default:

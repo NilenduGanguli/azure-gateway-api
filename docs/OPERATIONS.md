@@ -67,10 +67,10 @@ VERDICT
 
 | Verdict line | Value | What to do |
 |---|---|---|
-| `DI :syncAnalyze` | `AVAILABLE` | Leave `DI_SYNC_ANALYZE=auto`. Jobs run stateless and nothing is pinned to a replica. |
+| `DI :syncAnalyze` | `AVAILABLE` | Leave `DI_SYNC_ANALYZE=auto`. Most jobs then run stateless with nothing pinned to a replica — but a submit asking for `output=pdf` or `output=figures` still skips the synchronous route entirely, because those artifacts are addressed by an operation id that only `:analyze` produces, and it runs the affinity-pinned poll path. |
 | | `DEGRADES TO 202` | Leave `auto`. The gateway polls the operation out with connection and cookie affinity; expect `upstreamMode: degraded-202` on `/_gw/jobs`. |
 | | `ABSENT (404)` / `ABSENT (500)` | Set `DI_SYNC_ANALYZE=off`. The gateway would latch it off by itself after the first job; setting it saves one wasted round trip on that job and makes the intent explicit. |
-| | `NO ANSWER: TIMED OUT …` | The route exists and hangs. In `auto` mode only the *first* job pays `DI_SYNC_PROBE_TIMEOUT` (60s) before the capability latches off process-wide — but set `DI_SYNC_ANALYZE=off` once you have confirmed it, so a restart does not pay that minute again. |
+| | `NO ANSWER: TIMED OUT …` | The route exists and hangs. In `auto` mode the capability latches off process-wide, but only once a probe has *returned* — so every job that starts before the first one finishes pays the 60s too, up to `DI_MAX_INFLIGHT` of them, and the whole first recovery batch pays it again after a restart. Set `DI_SYNC_ANALYZE=off` once you have confirmed it. |
 | `DI in swagger` | `declared` / `not declared` | On its own, decides nothing. A build can declare the route and never answer it, and DI's route is undocumented, so its absence here proves nothing either. Read it together with the line above. |
 | `DI 200 body shape` | `envelope (.analyzeResult present)` or `bare AnalyzeResult (no envelope)` | No configuration. `inspectOperation` in [`internal/upstream/poll.go`](../internal/upstream/poll.go) handles both: an object with no `status` member is treated as a bare result. |
 | `DI :analyze` | `202` | Expected. Anything else means the fallback path is broken too, and no DI job will complete. |
@@ -450,7 +450,7 @@ any route.
 |---|---|---|
 | `DI_UPSTREAM_TIMEOUT` | `15m` | One complete logical DI analysis, including any fallback polling. |
 | `READ_SYNC_TIMEOUT` | `10m` | One complete logical Read analysis. Your Route timeout must cover this. |
-| `DI_SYNC_PROBE_TIMEOUT` | `60s` | The attempt on the undocumented `:syncAnalyze` route *alone*. Deliberately far below `DI_UPSTREAM_TIMEOUT`, because a build can declare the route and never answer it. Silently clamped down to `DI_UPSTREAM_TIMEOUT` if you set it higher. |
+| `DI_SYNC_PROBE_TIMEOUT` | `60s` | How long a **background job** waits for the undocumented `:syncAnalyze` route to *answer*. Deliberately far below `DI_UPSTREAM_TIMEOUT`, because a build can declare the route and never answer it. It does not bound the result download that follows the answer, and it does not apply to the client-facing `:syncAnalyze` passthrough, which is a straight proxy bounded by `DI_UPSTREAM_TIMEOUT`. Silently clamped down to `DI_UPSTREAM_TIMEOUT` if you set it higher. |
 | `UPLOAD_TIMEOUT` | `10m` | How long a client may take to stream its request body while holding an admission slot. Applied as a read deadline on the connection. |
 | `ARTIFACT_FETCH_TIMEOUT` | `2m` | Aggregate budget for one job's whole result-file phase, so N figures cannot cost N × the per-request timeout. |
 | `SHUTDOWN_GRACE` | `30s` | Connection draining **and then** job draining share this single budget. `terminationGracePeriodSeconds` must exceed it. |
@@ -500,7 +500,7 @@ usually a resourcing problem, not a gateway one. Then:
 
 | Setting | Value | Why |
 |---|---|---|
-| `DI_SYNC_ANALYZE` | `off` | Skips a wasted 60-second attempt on the first job after every restart. |
+| `DI_SYNC_ANALYZE` | `off` | Skips a wasted 60-second attempt on every job that starts before the first probe returns — up to `DI_MAX_INFLIGHT` of them after each restart, plus the first recovery batch. |
 | `DI_UPSTREAM_TIMEOUT` | `30m` | The fallback path is `:analyze` plus polling; give it room or jobs fail with "did not complete the analysis within the configured timeout" while the container is still working. |
 | `haproxy.router.openshift.io/timeout` | `30m` | Only matters if clients use the synchronous passthrough routes; it must cover the timeout above. |
 | `POLL_RETRY_AFTER` | `5` | Client SDKs honour this between polls. At `1`, a job that takes ten minutes generates hundreds of pointless polls per client. |
@@ -579,7 +579,7 @@ These are the complete set exported by `admin.metrics`. All are gauges.
 | Metric | Labels | Meaning |
 |---|---|---|
 | `gateway_uptime_seconds` | — | Seconds since process start. A drop means a restart. |
-| `gateway_jobs_in_flight` | `surface` | Accepted jobs that have not reached a terminal state — the admission slots currently held. |
+| `gateway_jobs_in_flight` | `surface` | Admission slots currently held on that surface. Mostly accepted jobs that have not reached a terminal state, but a client-facing synchronous passthrough takes an admission slot for its duration too, and it is never a job and never reaches a terminal state. Read it as occupancy, not as a job count. |
 | `gateway_jobs_capacity` | `surface` | The admission ceiling, which is `MAX_INFLIGHT + QUEUE_DEPTH`, **not** `MAX_INFLIGHT`. |
 | `gateway_jobs_queued` | `surface` | Admitted jobs waiting for a worker. Always 0 when `QUEUE_DEPTH=0`. |
 | `gateway_jobs_total` | `surface`, `status` | Rows currently in the database by status: `notStarted`, `running`, `succeeded`, `failed`. A gauge of *stored* jobs, so it falls as the TTL sweeper runs — it is not a cumulative counter. |

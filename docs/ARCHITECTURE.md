@@ -112,6 +112,7 @@ all.
 | `internal/jobs` | admission and upstream semaphores, the worker pool, leases and heartbeats, the claim set, crash recovery, the TTL/eviction/orphan sweeper, artifact capture | `azerr`, `config`, `jsonx`, `store`, `upstream` |
 | `internal/surface` | the client-facing handlers; `di.go` and `read.go` sit over a shared submit/poll/passthrough core in `surface.go` | `azerr`, `config`, `httpx`, `ids`, `jobs`, `logging`, `store`, `upstream` |
 | `internal/admin` | `/_gw/{live,ready,health,version,config,jobs,metrics}` plus container-shaped `/status` and `/ready` | `config`, `httpx`, `jobs`, `store`, `upstream` |
+| `internal/app` | assembles the served handler: both surfaces, admin, the catch-all and the middleware chain. Exists so `cmd/gateway` and `test/conformance` cannot build different gateways — they did, and the suite could not see the difference | `admin`, `azerr`, `config`, `httpx`, `jobs`, `store`, `surface`, `upstream` |
 | `internal/probe` | the live-container capability probe behind `gateway probe` | `config` |
 | `internal/mockazure` | in-process fakes of both containers **including their failure modes** | — |
 
@@ -127,7 +128,8 @@ separate about forty lines (design spec, "Implementation notes").
 | `/formrecognizer/**` | same handlers, same file | served because a probe found the containers declaring that family; the prefix the caller arrived on is echoed in `Operation-Location`. All nine routes are registered on both families, metadata included — a legacy SDK pinned to `/formrecognizer` calls `GetResourceDetails` and `GetDocumentModel` on its own prefix, and serving those under `/documentintelligence` alone answered it the catch-all's bodyless 404 |
 | `/vision/v3.2/read/**` | `internal/surface/read.go` `registerRead` | `POST analyze`, `POST syncAnalyze`, `GET`/`HEAD analyzeResults/{operationId}` only — **no DELETE**, because the Read contract does not define one |
 | `/_gw/**`, `/status`, `/ready` | `internal/admin/admin.go` `Register` | `/_gw` can never collide with an Azure route; both containers claim `/status` and `/ready` at their root, so the gateway serves its own rather than picking a winner |
-| everything else | `cmd/gateway/main.go` `notFound` | bodyless 404, matching both containers' answer to an unrouted path (`azerr.Unrouted`) |
+| a routed path, wrong verb | `internal/app` `unrouted` | `405` with an `Allow` header, matching the containers |
+| everything else | `internal/app` `unrouted` | bodyless 404, matching both containers' answer to an unrouted path (`azerr.Unrouted`) |
 
 ---
 
@@ -713,10 +715,12 @@ These are the properties a future change must not break. Each names the file tha
 4. **A live operation id is never answered with 404.** Only an unknown, wrong-surface, or
    TTL-expired id gets one. `internal/surface/surface.go` (`poll`), `internal/azerr/azerr.go`
    (`NotFound`).
-5. **Every poll response is JSON with a top-level `status`, in every state including internal
-   failure.** A missing result blob degrades to a `200` `failed` envelope, never a bare 500.
-   `internal/surface/surface.go` (`poll`, `streamResult`), `internal/httpx/httpx.go` (`Recover`),
-   `cmd/gateway/main.go` (`onPanic`).
+5. **Every poll response the gateway composes is JSON with a top-level `status`.** A missing
+   result blob degrades to a `200` `failed` envelope, never a bare 500. The exception is a panic:
+   `internal/app` (`onPanic`) and `internal/httpx` (`Recover`) emit this surface's *error* body,
+   which has no `status` member — an SDK poller treats that as a failed request rather than as
+   operation state, which is the correct reading of a 500. `internal/surface/surface.go` (`poll`,
+   `streamResult`).
 6. **The status vocabulary is exactly `notStarted | running | succeeded | failed`.**
    `internal/store/db.go` (`Status` constants).
 7. **A submit returns exactly `202`; a poll of a known, unexpired operation on the right surface
@@ -821,11 +825,12 @@ Most of these have at least one named test; see `test/conformance/` (fidelity, b
 shutdown suites), `internal/jobs/recovery_test.go`, `internal/store/store_test.go` and
 `internal/jsonx/differential_test.go`, and the notes in
 [`docs/TESTING.md`](TESTING.md). Five are enforced by code and review only, with nothing asserting
-them: 2 (no test references the PRAGMAs or `SetMaxOpenConns`), 14 (`validModelID` is never exercised
-— the proxy tests only hit `/info` and `/documentModels`), 27 (nothing runs workers and synchronous
-passthroughs against the shared upstream semaphore together), 28 (no test references
+them: 2 (no test references the PRAGMAs or `SetMaxOpenConns`), 27 (nothing runs workers and
+synchronous passthroughs against the shared upstream semaphore together), 28 (no test references
 `setUploadDeadline` or `UPLOAD_TIMEOUT`), and the network-FS half of 38 (every test opens the store
-with `AllowNetworkFS: true`, so the refusal never runs).
+with `AllowNetworkFS: true`, so the refusal never runs). Invariant 14 *is* now exercised:
+`test/conformance/legacy_family_test.go` drives `/formrecognizer/documentModels/prebuilt-layout`,
+whose handler's first statement is the `validModelID` guard.
 
 ---
 
@@ -834,10 +839,12 @@ with `AllowNetworkFS: true`, so the refusal never runs).
 - The exact HTTP status and body of a cross-pod poll against an unshared container is not
   documented anywhere and has not been reproduced here; `docs/api-surface.md` §8.3 lists both
   plausible modes (hard 404, silent stall) and the gateway is built to survive either.
-- `internal/surface/surface.go` defines `methodGuard`, `internal/upstream/di.go` defines
-  `DIClient.pollURL`, and `internal/httpx/httpx.go` defines `AcceptsGzip`, but none of the three is
-  referenced by non-test code in this tree. Method mismatches on a registered path are handled by
-  `net/http.ServeMux` rather than by `methodGuard`.
+- Method mismatches are answered `405` with an `Allow` header, by `internal/app`. Go's `ServeMux`
+  would do this itself, but only while no pattern matches the request — and the `"/"` catch-all
+  matches everything, so for a long time every wrong verb collapsed into a bodyless `404`. The
+  catch-all now asks a routes-only mux which verbs the path does serve. `methodGuard` and
+  `DIClient.pollURL` were dead code and have been removed; `internal/httpx/httpx.go` still defines
+  `AcceptsGzip`, which nothing calls, because the gateway never compresses.
 - The Read surface has no `DELETE`, and nothing claims otherwise: the README's Computer Vision Read
   table lists only `POST /analyze`, `POST /syncAnalyze` and `GET`·`HEAD /analyzeResults/{operationId}`,
   and `test/conformance/sync_test.go:TestReadSurfaceHasNoDeleteRoute` asserts the route is not

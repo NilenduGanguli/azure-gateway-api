@@ -305,7 +305,8 @@ whose build runs the suite inside it.
 
 - it has never run against real containers end to end;
 - `make sdk-test` has never been executed, and that is the acceptance test that matters;
-- coverage is ~62%, below the 80% bar — the shortfall is `cmd/gateway` and `internal/probe`, which
-  drive real I/O.
+- coverage is 67.7%, below the 80% bar — the shortfall is `internal/probe` (0%) and
+  `internal/admin` (10%), which drive real I/O. `cmd/gateway` is excluded from the profile by the
+  Makefile's `-coverpkg=./internal/...`, so it is not part of the gap.
 
 [`docs/HANDOFF.md`](docs/HANDOFF.md) has the full picture.

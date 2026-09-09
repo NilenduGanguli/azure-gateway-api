@@ -25,8 +25,8 @@ different layers.
 | Conformance suite | `test/conformance` | A fully wired gateway — surfaces, admin, job manager, SQLite store, upstream clients — driven over real HTTP against the fakes. Asserts what unmodified Azure SDK clients depend on. |
 | Real-SDK harness | `test/sdk` | The official Python Azure client libraries pointed at a running gateway. Asserts the SDKs *accept* what the gateway emits. Has never been run against a live gateway (§5). |
 
-Counted today: **57 unit test functions** across the nine `internal` packages that have test files
-(one of them, `TestLiveMocks`, is gated off by default) and **45 conformance test functions**.
+Counted today: **63 unit test functions** across the `internal` packages that have test files
+(one of them, `TestLiveMocks`, is gated off by default) and **46 conformance test functions**.
 
 Five packages have no test file of their own: `cmd/gateway`, `internal/surface`, `internal/admin`,
 `internal/logging` and `internal/probe`. `internal/surface` — the client-facing handlers, and by far
@@ -289,19 +289,20 @@ Measured on the current tree, `total: (statements) 65.4%`. Per package, from the
 | Package | Statement coverage | Note |
 |---|---|---|
 | `internal/ids` | 97.4% | |
+| `internal/app` | 93.3% | The handler assembly the binary and the suite share. |
+| `internal/httpx` | 89.1% | |
 | `internal/mockazure` | 83.0% | The fakes are themselves covered by the suite that uses them. |
-| `internal/azerr` | 79.7% | |
+| `internal/azerr` | 82.7% | |
 | `internal/jsonx` | 76.6% | |
-| `internal/config` | 76.5% | |
-| `internal/store` | ~74.8% | |
-| `internal/jobs` | ~70% | |
-| `internal/surface` | 68.2% | No unit tests; entirely via `test/conformance`. |
-| `internal/httpx` | 67.6% | |
-| `internal/upstream` | ~64% | |
+| `internal/config` | 76.3% | |
+| `internal/store` | 74.9% | |
+| `internal/surface` | 71.3% | No unit tests beyond `relay_test.go`; otherwise via `test/conformance`. |
+| `internal/jobs` | 69.4% | |
+| `internal/upstream` | 66.5% | |
 | `internal/logging` | 20.0% | Only the context pair every request touches; see §6. |
 | `internal/admin` | 10.0% | Registered by the conformance harness, almost never called by it. |
 | `internal/probe` | 0.0% | See §6. |
-| **total** | **~65%** | Below the 80% bar the README's *Status* section names. |
+| **total** | **67.7%** | Below the 80% bar the README's *Status* section names. |
 
 Expect the total and the three approximate rows to move a fraction of a point between runs. The
 blocks that come and go are all teardown races: `base.unreachable`'s "the context was cancelled,
@@ -421,14 +422,15 @@ gateway being marked by its own homework. Until it runs, treat "wire-identical" 
 argued rather than demonstrated.
 
 One thing to fix before or while running it, found by reading the harness against the current
-code: `test_unknown_operation_is_a_clean_404` in `sdk_test.py` encodes the **documented** error
-shapes — wrapped for Document Intelligence, flat for Read — while the gateway's default
-`ERROR_COMPAT=observed` emits the **observed** ones, which are the other way round (see §2 and
-`internal/azerr/azerr.go`). Its predicates match `internal/azerr`'s `CompatDocumented` branch
-exactly. So against a default gateway those two checks will report FAIL for a gateway that is
-behaving correctly. Either run that harness against a gateway started with `ERROR_COMPAT=documented`,
-or update the two predicates to match `TestUnknownIDMatchesTheContainersNotTheSpec` in
-`test/conformance/fidelity_test.go`. The other checks are unaffected.
+code: `test_unknown_operation_is_a_clean_404` in `sdk_test.py` encodes the **observed** error
+shapes — flat for Document Intelligence, wrapped for Read — which is what the gateway's default
+`ERROR_COMPAT=observed` emits, and the inverse of what each service's published reference shows
+(see §2 and `internal/azerr/azerr.go`). It therefore passes against a default gateway and matches
+`TestUnknownIDMatchesTheContainersNotTheSpec` in `test/conformance/fidelity_test.go`.
+
+Run it against a gateway started with `ERROR_COMPAT=documented` and those two checks will fail,
+correctly: that mode exists only for a client written against the published reference, and the
+harness asserts the default.
 
 ---
 

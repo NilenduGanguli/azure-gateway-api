@@ -135,11 +135,12 @@ for the DI surface, which also hard-codes the container's own wording:
 |---|---|---|
 | DI unknown or TTL-expired result id | `azerr.NotFound(SurfaceDI)` | flat, `NotFound` / `Analyze result does not exist.` |
 | Any other DI error | `azerr.New`, `BadRequest`, `InvalidParameter`, … | wrapped |
-| Any Read error, including unknown id | `azerr.NotFound(SurfaceRead)`, `BadRequest`, `TooBusy`, … | wrapped, `BadArgument` (the Read enum contains no not-found code at all) |
+| Any Read error, including unknown id | `azerr.NotFound(SurfaceRead)`, `BadRequest`, `InvalidParameter` | wrapped, `BadArgument` (the Read enum contains no not-found code at all) |
+| Read overload / unavailable / bad media type | `azerr.TooBusy`, `Unavailable`, `UnsupportedMediaType` | wrapped, but `InvalidRequest` / `Unspecified` / `UnsupportedMediaType` respectively — **not** `BadArgument` |
 | Unrouted path, either surface | `azerr.Unrouted` | 404, `Content-Length: 0`, no body |
 
 `Unrouted` sets `bare`, and `WriteTo` short-circuits before rendering any body — so an unrouted path
-is bodyless regardless of compat mode. `cmd/gateway/main.go:notFound` is registered on `"/"` and
+is bodyless regardless of compat mode. `internal/app:unrouted` is registered on `"/"` and
 picks the surface from the path prefix (`surfaceFor`), so the bodyless 404 is what any unmatched
 path gets. This is safe precisely because it is unrouted: no SDK parses an unrouted response as
 operation state, and every *routed* endpoint still returns a body.
@@ -262,7 +263,7 @@ This is the setting the hung-route finding produced.
 
 | Setting | Default | Purpose |
 |---|---|---|
-| `DI_SYNC_PROBE_TIMEOUT` | **`60s`** | Ceiling on the `:syncAnalyze` attempt alone |
+| `DI_SYNC_PROBE_TIMEOUT` | **`60s`** | Ceiling on how long a background job waits for `:syncAnalyze` to *answer*. It does not bound the result download that follows, and it does not apply to the client-facing `:syncAnalyze` passthrough at all — that is a straight proxy and inherits `DI_UPSTREAM_TIMEOUT`. |
 | `DI_UPSTREAM_TIMEOUT` | `15m` | Ceiling on one complete logical analysis, fallback polling included |
 
 `trySync` wraps the attempt in its own `context.WithTimeout(ctx, c.probeTimeout)`, and reads the
@@ -408,8 +409,15 @@ One thing the gateway does *not* do: the two families accept different `api-vers
 container — `documentintelligence` takes `2024-11-30` and neighbours, `formrecognizer` takes
 `2022-03-31-preview` … `2023-07-31` `[IMAGE]`. `requireAPIVersion` only checks that the parameter is
 present and non-empty, then forwards it verbatim, so a mismatched pair produces the container's own
-*"api-version is invalid"* error rather than a gateway-side rejection. That is deliberate: it is the
-same answer the container gives.
+*"api-version is invalid"* error rather than a gateway-side rejection.
+
+The timing differs from a direct call, though, and only on the asynchronous submit. The gateway
+answers `202` with an `Operation-Location` before it has spoken to the container at all — that is
+the whole point of the design — so the container's `400` cannot be the response to the submit. It
+surfaces on the next poll instead, as a `failed` operation at HTTP `200` carrying the container's
+own message. A direct caller sees the 400 immediately; a gateway caller sees the same diagnosis one
+poll later. On the synchronous passthroughs, where the gateway holds no promise, it is relayed
+as-is.
 
 ### `/info` and `/documentModels` returning 404
 
@@ -533,7 +541,12 @@ the Read schema deliberately: generated SDK models ignore unknown properties, an
 diagnostics is exactly the dead end the container's own bare `{"status":"Failed"}` creates. The
 comment in `(*Server).poll` in `internal/surface/surface.go` says so. Related: the bare
 `{"status":"Failed"}` — capital F, no code, no message — that CV `syncAnalyze` produces is matched
-case-insensitively by `azerr.ParseUpstream` and by `isFailed`, and never reaches a client as-is.
+case-insensitively by `azerr.ParseUpstream` and by `isFailed` on every path that *interprets* it.
+It is not rewritten on the client-facing synchronous passthroughs: the container returns it at HTTP
+200, and `relaySync` streams every 2xx through untouched by design, so a client calling
+`:syncAnalyze` or `/read/syncAnalyze` directly receives that body verbatim. That is faithful — it is
+what the container itself would have sent — but a passthrough caller, unlike a polling one, gets no
+code and no message to act on.
 
 ---
 
@@ -567,7 +580,7 @@ truthful while it waits, which is what these bounds are for:
 
 | Setting | Default | Bounds |
 |---|---|---|
-| `DI_SYNC_PROBE_TIMEOUT` | `60s` | the `:syncAnalyze` attempt alone |
+| `DI_SYNC_PROBE_TIMEOUT` | `60s` | how long a background job waits for `:syncAnalyze` to answer (not the download, and not the client-facing passthrough) |
 | `DI_UPSTREAM_TIMEOUT` | `15m` | one complete DI analysis, fallback polling included |
 | `READ_SYNC_TIMEOUT` | `10m` | one complete Read analysis |
 | `ARTIFACT_FETCH_TIMEOUT` | `2m` | the whole result-file phase of one job |

@@ -410,10 +410,15 @@ func (s *Store) Abandoned(ctx context.Context, now time.Time, limit int) ([]*Job
 
 // Expired returns jobs past their TTL that are safe to delete, oldest first.
 //
-// A job that is still running is excluded even when expired: deleting it out from under its worker
-// leaves the worker writing a result into a blob store with no row to reference it, and the
-// artifacts it goes on to fetch are unreachable from that moment. Once its lease lapses the
-// recovery pass reclaims it and it becomes terminal, after which this picks it up.
+// A running job is excluded only while its LEASE is live. Deleting one out from under an active
+// worker leaves that worker writing a result into a blob store with no row to reference it, and
+// the artifacts it goes on to fetch are unreachable from that moment — so the live lease is the
+// guard, and once it lapses the worker is presumed dead and the row becomes collectable.
+//
+// Waiting instead for the recovery pass to make such a job terminal would strand it: Abandoned and
+// Orphaned both filter on expires_at >= now, so an already-expired running job is never reclaimed
+// and its row and blobs would sit on the PVC forever. An expired notStarted job is collected
+// unconditionally — nothing has begun, so there is nothing to pull out from under.
 func (s *Store) Expired(ctx context.Context, now time.Time, limit int) ([]*Job, error) {
 	rows, err := s.r.QueryContext(ctx, `
 		SELECT `+jobColumns+` FROM jobs

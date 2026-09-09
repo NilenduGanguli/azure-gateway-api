@@ -42,9 +42,12 @@ Verified, not remembered — re-run the commands if you doubt any of it.
 > function in it. The only check that catches this class of error is building a fresh clone.
 > `git check-ignore -v <path>` tells you which rule is responsible.
 
-102 test functions: 45 conformance, 57 unit. Coverage ~62% overall — the paths that carry the
-guarantees are covered (`ids` 98%, `jsonx` 86%, `azerr` 80%, `store`/`jobs`/`surface` ~70%); the
-shortfall is `cmd/gateway` and `internal/probe`, which drive real I/O.
+109 test functions: 46 conformance, 63 unit. Coverage 67.7% overall — the paths that carry the
+guarantees are covered (`ids` 97%, `app` 93%, `httpx` 89%, `azerr` 83%, `jsonx` 77%, `store` 75%,
+`surface` 71%, `jobs` 69%). The shortfall is `internal/probe` at 0% and `internal/admin` at 10%,
+both of which drive real I/O. `cmd/gateway` contributes nothing either way: the Makefile measures
+with `-coverpkg=./internal/...`, so it is not in the denominator. Figures from `make cover`;
+`docs/TESTING.md` carries the full table and is the one to update.
 
 ---
 
@@ -101,9 +104,10 @@ running gateway plus a Python venv. **Treat this as the acceptance test.** Note 
 written before the error shapes changed — verify it still asserts the right shapes before trusting
 a pass. See [`TESTING.md`](TESTING.md).
 
-**3. Coverage is ~62%, below the 80% bar.** `internal/surface` and `internal/admin` have no direct
-unit tests — they are covered only through the conformance suite. `cmd/gateway` and
-`internal/probe` are near zero.
+**3. Coverage is 67.7%, below the 80% bar.** `internal/admin` has no direct unit tests and is
+covered only incidentally through the conformance suite; `internal/probe` is at zero. `cmd/gateway`
+is outside the profile entirely (`-coverpkg=./internal/...`), so it is neither a contributor nor a
+shortfall.
 
 **4. The error-shape decision rests on one probe run against one deployment.** If other
 environments run different image builds they may not agree. `ERROR_COMPAT=documented` is the
