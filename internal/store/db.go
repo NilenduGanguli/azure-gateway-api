@@ -490,12 +490,20 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 }
 
 // Exists reports whether a job row is present.
-func (s *Store) Exists(ctx context.Context, id string) bool {
+func (s *Store) Exists(ctx context.Context, id string) (bool, error) {
 	var n int
-	if err := s.r.QueryRowContext(ctx, `SELECT 1 FROM jobs WHERE id = ? LIMIT 1`, id).Scan(&n); err != nil {
-		return false
+	err := s.r.QueryRowContext(ctx, `SELECT 1 FROM jobs WHERE id = ? LIMIT 1`, id).Scan(&n)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
 	}
-	return n == 1
+	if err != nil {
+		// The error is returned rather than folded into "absent". This is the only guard on a
+		// destructive path: reporting a live job's row as missing made the orphan sweeper delete
+		// every artifact of a succeeded, unexpired job whose result a client was still entitled
+		// to fetch.
+		return false, fmt.Errorf("store: job exists: %w", err)
+	}
+	return n == 1, nil
 }
 
 // Counts summarises job states for the admin surface and metrics.

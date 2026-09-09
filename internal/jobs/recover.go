@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/NilenduGanguli/azure-gateway-api/internal/azerr"
@@ -89,6 +90,22 @@ func (m *Manager) recover(ctx context.Context, atBoot bool) {
 func (m *Manager) recoverOne(ctx context.Context, r *surfaceRunner, job *store.Job) bool {
 	log := m.log.With("job", job.ID, "surface", job.Surface, "attempts", job.Attempts)
 
+	// Re-read the row. The scan that produced this snapshot is not part of the transaction that
+	// acts on it, and the periodic pass runs against live traffic: a job that finished in the gap
+	// would otherwise be overwritten here — the client, whose result was already stored, would be
+	// told "The analysis was interrupted and could not be resumed" for an analysis that succeeded.
+	fresh, err := m.store.Get(ctx, job.ID)
+	if err != nil {
+		if !errors.Is(err, store.ErrNoJob) {
+			log.Warn("could not re-read an orphaned job; leaving it for the next pass", "error", err)
+		}
+		return false
+	}
+	if fresh.Status == store.StatusSucceeded || fresh.Status == store.StatusFailed {
+		return false
+	}
+	job = fresh
+
 	// Without the input document the upstream call cannot be repeated. That happens when the
 	// crash landed between storing the result and committing the row, or when a previous attempt
 	// already consumed it.
@@ -105,16 +122,20 @@ func (m *Manager) recoverOne(ctx context.Context, r *surfaceRunner, job *store.J
 		return false
 	}
 
-	// Claim it as we requeue, so the periodic pass does not pick the same row up again before a
-	// worker marks it running.
-	if err := m.store.Requeue(ctx, job.ID, m.now(), m.now().Add(leaseDuration)); err != nil {
-		log.Error("could not requeue orphaned job", "error", err)
+	// Claim BEFORE requeueing. The claim is what makes it safe for the listener to open before
+	// this work has run: a submit arriving now cannot enqueue the same id. Requeueing first meant
+	// that losing the claim race — to a worker that had already picked the job up — had already
+	// reverted the row to notStarted, and store.Heartbeat is guarded on status = 'running', so
+	// that worker's heartbeats silently updated zero rows and its lease never refreshed again.
+	if !m.claim(job.ID) {
 		return false
 	}
-
-	// The claim is what makes it safe for the listener to open before this work has run: a submit
-	// arriving now cannot enqueue the same id.
-	return m.claim(job.ID)
+	if err := m.store.Requeue(ctx, job.ID, m.now(), m.now().Add(leaseDuration)); err != nil {
+		log.Error("could not requeue orphaned job", "error", err)
+		m.unclaim(job.ID)
+		return false
+	}
+	return true
 }
 
 // feed hands claimed jobs to the workers, waiting for capacity as it goes.
@@ -266,18 +287,40 @@ func (m *Manager) DiskPressure() bool {
 // than an hour are considered, so a submit whose row is still being committed is never touched.
 func (m *Manager) sweepOrphanBlobs(ctx context.Context, now time.Time) {
 	const batch = 512
-	ids, err := m.store.Blob.IDs(batch)
+	m.cursorMu.Lock()
+	cursor := m.blobCursor
+	m.cursorMu.Unlock()
+
+	ids, err := m.store.Blob.IDs(cursor, batch)
 	if err != nil {
 		m.log.Warn("could not scan the blob store for orphans", "error", err)
 		return
 	}
+	// Advance the cursor so the next sweep starts where this one stopped, and wrap when a short
+	// batch says the end of the tree has been reached.
+	m.cursorMu.Lock()
+	if len(ids) < batch {
+		m.blobCursor = ""
+	} else {
+		m.blobCursor = ids[len(ids)-1]
+	}
+	m.cursorMu.Unlock()
+
 	cutoff := now.Add(-time.Hour).Unix()
 	var removed int
 	for _, id := range ids {
 		if ctx.Err() != nil {
 			return
 		}
-		if m.store.Exists(ctx, id) || !m.store.Blob.OlderThan(id, cutoff) {
+		exists, err := m.store.Exists(ctx, id)
+		if err != nil {
+			// Never delete on an unanswered question. A read failure here once meant "no such
+			// job", and the artifacts of a live one were removed.
+			m.log.Warn("could not confirm whether a blob is orphaned; leaving it",
+				"job", id, "error", err)
+			continue
+		}
+		if exists || !m.store.Blob.OlderThan(id, cutoff) {
 			continue
 		}
 		if err := m.store.Blob.RemoveAll(id); err != nil {

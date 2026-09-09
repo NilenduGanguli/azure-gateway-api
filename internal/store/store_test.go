@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -331,7 +332,9 @@ func TestDeleteRemovesTheRowBeforeTheBlobs(t *testing.T) {
 	if err := s.Delete(ctx, id); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	if s.Exists(ctx, id) {
+	if exists, err := s.Exists(ctx, id); err != nil {
+		t.Fatalf("exists: %v", err)
+	} else if exists {
 		t.Error("the row survived Delete")
 	}
 	if _, _, err := s.Blob.Open(id, KindResult); err == nil {
@@ -452,5 +455,55 @@ func TestOrphanedIgnoresFreshNotStartedRows(t *testing.T) {
 			ids[i] = j.ID
 		}
 		t.Fatalf("Orphaned returned %v; a just-committed row must not be reclaimed", ids)
+	}
+}
+
+// TestBlobIDsRotatesPastTheFirstBatch is a regression test for an orphan reclaimer that could not
+// reach most of the store.
+//
+// IDs walks the blob tree lexically and stops at `limit`. With no cursor it therefore returned the
+// same lexicographically smallest batch on every call, so the sweeper examined those ids forever
+// and every orphan beyond them accumulated on the PVC indefinitely.
+func TestBlobIDsRotatesPastTheFirstBatch(t *testing.T) {
+	s := newTestStore(t)
+
+	const total = 25
+	want := make(map[string]bool, total)
+	for i := 0; i < total; i++ {
+		id := fmt.Sprintf("00000000-0000-4000-8000-%012d", i)
+		if err := s.Blob.WriteAll(id, KindInput, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+		want[id] = false
+	}
+
+	const batch = 10
+	cursor := ""
+	for round := 0; round < 10; round++ {
+		ids, err := s.Blob.IDs(cursor, batch)
+		if err != nil {
+			t.Fatalf("IDs: %v", err)
+		}
+		for _, id := range ids {
+			if _, known := want[id]; !known {
+				t.Fatalf("IDs returned an id that was never written: %q", id)
+			}
+			want[id] = true
+		}
+		if len(ids) < batch {
+			break
+		}
+		cursor = ids[len(ids)-1]
+	}
+
+	var missed []string
+	for id, seen := range want {
+		if !seen {
+			missed = append(missed, id)
+		}
+	}
+	if len(missed) > 0 {
+		t.Errorf("%d of %d ids were never returned; the reclaimer can never collect them (e.g. %q)",
+			len(missed), total, missed[0])
 	}
 }

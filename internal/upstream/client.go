@@ -61,18 +61,40 @@ type Result struct {
 	// UpstreamOpID is the container's own operation id, set only when the asynchronous path ran.
 	// It is what the result-file endpoints are addressed by.
 	UpstreamOpID string
+
+	// affinity is the job's connection pool and cookie jar, kept alive past Analyze whenever an
+	// upstream operation exists. The result-file endpoints are addressed by that operation's id,
+	// which is meaningful only to the replica that minted it — fetching the searchable PDF or a
+	// figure over the shared pool lands on an arbitrary replica and 404s.
+	affinity *affinityClient
 }
 
 // Size is the length of the analyzeResult member.
 func (r *Result) Size() int64 { return r.End - r.Start }
 
-// Cleanup removes the temporary upstream response. It is safe to call more than once.
+// Cleanup removes the temporary upstream response and releases the job's affinity client. It is
+// safe to call more than once.
 func (r *Result) Cleanup() {
-	if r == nil || r.Path == "" {
+	if r == nil {
+		return
+	}
+	if r.affinity != nil {
+		r.affinity.close()
+		r.affinity = nil
+	}
+	if r.Path == "" {
 		return
 	}
 	_ = os.Remove(r.Path)
 	r.Path = ""
+}
+
+// client returns the HTTP client a follow-up call about this result must use.
+func (r *Result) client(fallback *http.Client) *http.Client {
+	if r != nil && r.affinity != nil {
+		return r.affinity.http
+	}
+	return fallback
 }
 
 // Request carries the per-call parameters that vary between surfaces.
@@ -303,22 +325,21 @@ func (b *base) translate(e *azerr.APIError, status int) *azerr.APIError {
 }
 
 // genericError synthesises a well-formed error for an unparseable upstream failure.
+//
+// The container's own status is preserved. Collapsing the range — every 4xx to 400, every 5xx to
+// 500 — is what azerr.ForStatus exists to prevent: it turned the container's 404 for an unknown
+// model into "InvalidRequest", and its 503 during a rolling restart into a flat 500, telling the
+// client the request was malformed or the gateway broken when neither was true and the correct
+// answer was retriable.
 func (b *base) genericError(status int) *azerr.APIError {
-	switch {
-	case status == http.StatusUnsupportedMediaType:
+	switch status {
+	case http.StatusUnsupportedMediaType:
 		return azerr.UnsupportedMediaType(b.surface)
-	case status == http.StatusRequestEntityTooLarge:
+	case http.StatusRequestEntityTooLarge:
 		return azerr.ContentTooLarge(b.surface)
-	case status >= 500:
-		return azerr.Internal(b.surface,
-			fmt.Sprintf("The %s container returned HTTP %d.", b.name, status))
-	case status >= 400:
-		return azerr.BadRequest(b.surface,
-			fmt.Sprintf("The %s container rejected the request with HTTP %d.", b.name, status))
-	default:
-		return azerr.Internal(b.surface,
-			fmt.Sprintf("The %s container returned an unexpected HTTP %d.", b.name, status))
 	}
+	return azerr.ForStatus(b.surface, status,
+		fmt.Sprintf("The %s container returned HTTP %d.", b.name, status))
 }
 
 // drain empties and closes a response body so the connection can be reused. Leaking a body would

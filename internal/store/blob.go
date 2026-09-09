@@ -275,7 +275,12 @@ func (b *BlobStore) SweepTemp(minAgeSeconds int64, now int64) (int, error) {
 //
 // It exists so the sweeper can reclaim blobs whose row is gone. Delete removes the row first, so
 // a partial blob removal leaks files rather than stranding a row — a leak this can collect.
-func (b *BlobStore) IDs(limit int) ([]string, error) {
+// after is a cursor: only ids sorting strictly after it are returned. The tree is sharded by the
+// id's leading characters and walked lexically, so successive calls passing back the last id
+// returned sweep the whole store. Without it the walk always stopped at the same lexicographically
+// smallest `limit` ids, and any orphan beyond them was never examined — on a store holding more
+// than one batch, the reclaimer silently never reached most of it.
+func (b *BlobStore) IDs(after string, limit int) ([]string, error) {
 	seen := make(map[string]struct{})
 	out := make([]string, 0, limit)
 	err := filepath.WalkDir(b.root, func(path string, d os.DirEntry, err error) error {
@@ -291,6 +296,9 @@ func (b *BlobStore) IDs(limit int) ([]string, error) {
 			return nil
 		}
 		if _, dup := seen[id]; dup {
+			return nil
+		}
+		if after != "" && id <= after {
 			return nil
 		}
 		seen[id] = struct{}{}

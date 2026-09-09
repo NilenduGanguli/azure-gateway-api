@@ -195,10 +195,18 @@ func (s *Server) poll(w http.ResponseWriter, r *http.Request, surface azerr.Surf
 	}
 
 	job, err := s.deps.Store.Get(r.Context(), id)
+	if err != nil && !errors.Is(err, store.ErrNoJob) {
+		// A database failure is not an answer about this operation. Reporting it as 404 would kill
+		// Java clients with an opaque NullPointerException and mark the operation terminally
+		// failed in .NET and JS — for a job that is very much alive and whose 202 the gateway has
+		// already promised to honour. 500 is retriable; 404 is not.
+		azerr.Internal(surface, "The gateway could not read the operation's state.").
+			WriteTo(w, surface)
+		return
+	}
 	if err != nil || job.Surface != surfaceName {
 		// An unknown id is a genuine 404, exactly as Azure answers an expired resultId. A live id
-		// is never 404'd: that would kill Java clients with an opaque NullPointerException and
-		// mark the operation terminally failed in .NET and JS.
+		// is never 404'd, for the reasons above.
 		azerr.NotFound(surface).WriteTo(w, surface)
 		return
 	}

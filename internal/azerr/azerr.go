@@ -236,6 +236,12 @@ type APIError struct {
 	// unknown-result-id response sets it, because that is the one place the container diverges
 	// from its own contract.
 	flat bool
+
+	// synthesised marks an error the gateway manufactured from a status code, rather than one
+	// parsed from an upstream body. Callers that reason about what the container *said* must be
+	// able to tell the two apart; inferring it from the code alone silently breaks when the
+	// status-to-code mapping changes.
+	synthesised bool
 	// bare suppresses the body entirely, matching the container's response to an unrouted path.
 	bare bool
 }
@@ -476,6 +482,7 @@ func Unavailable(s Surface, message string, retryAfter int) *APIError {
 // Preserving the status is the point. Synthesising a 500 for every unparseable upstream response
 // turns a container's 404 into a server error, which is both wrong and actively misleading: on a
 // probed build /info and /documentModels answer a bodyless 404, and a client must see that 404.
+// The result is marked synthesised: it reflects a status code, not anything the container said.
 func ForStatus(s Surface, status int, detail string) *APIError {
 	if detail == "" {
 		detail = fmt.Sprintf("The upstream container returned HTTP %d.", status)
@@ -509,10 +516,14 @@ func ForStatus(s Surface, status int, detail string) *APIError {
 		case status >= 400 && status < 500:
 			readCode = ReadBadArgument
 		}
-		return &APIError{Status: status, Code: readCode, Message: detail}
+		return &APIError{Status: status, Code: readCode, Message: detail, synthesised: true}
 	}
-	return &APIError{Status: status, Code: code, Message: detail}
+	return &APIError{Status: status, Code: code, Message: detail, synthesised: true}
 }
+
+// Synthesised reports whether the gateway manufactured this error from a status code rather than
+// parsing it out of an upstream response body.
+func (e *APIError) Synthesised() bool { return e != nil && e.synthesised }
 
 // Internal reports an unexpected gateway-side failure.
 func Internal(s Surface, message string) *APIError {

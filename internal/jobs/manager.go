@@ -90,6 +90,14 @@ type Manager struct {
 	claimMu sync.Mutex
 	claims  map[string]struct{}
 
+	// blobCursor is where the next orphan-blob sweep resumes, so successive sweeps rotate through
+	// the whole blob tree instead of re-examining the same lexicographically smallest batch.
+	//
+	// Guarded: sweepOnce runs on the background sweeper and is also called directly by tests, so
+	// two goroutines genuinely reach it.
+	cursorMu   sync.Mutex
+	blobCursor string
+
 	// now is indirected so tests can control time.
 	now func() time.Time
 }
@@ -557,7 +565,7 @@ func (m *Manager) fetchArtifacts(liveCtx, storeCtx context.Context, r *surfaceRu
 
 	if outputs["pdf"] {
 		if !abort("pdf") {
-			path, _, ct, err := di.FetchArtifact(actx, job.Prefix, job.ModelID, res.UpstreamOpID, "/pdf", query)
+			path, _, ct, err := di.FetchArtifact(actx, res, job.Prefix, job.ModelID, "/pdf", query)
 			switch {
 			case err != nil:
 				log.Warn("could not fetch searchable pdf", "error", err)
@@ -583,7 +591,7 @@ func (m *Manager) fetchArtifacts(liveCtx, storeCtx context.Context, r *surfaceRu
 			if abort("figure " + figID) {
 				break
 			}
-			path, _, _, err := di.FetchArtifact(actx, job.Prefix, job.ModelID, res.UpstreamOpID,
+			path, _, _, err := di.FetchArtifact(actx, res, job.Prefix, job.ModelID,
 				"/figures/"+url.PathEscape(figID), query)
 			if err != nil {
 				log.Warn("could not fetch figure", "figure", figID, "error", err)

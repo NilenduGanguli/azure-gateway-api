@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -118,7 +119,27 @@ func (c *DIClient) Analyze(ctx context.Context, doc Document, req Request) (*Res
 	if err != nil {
 		return nil, err
 	}
-	defer ac.close()
+	// Released here unless the result carries an upstream operation, in which case it is handed to
+	// the caller on the Result and released by Result.Cleanup — the artifact fetches that follow
+	// have to reach the same replica.
+	keepAffinity := false
+	defer func() {
+		if !keepAffinity {
+			ac.close()
+		}
+	}()
+
+	res, err := c.analyzeWith(ctx, ac, doc, req, deadline)
+	if err != nil || res == nil || res.UpstreamOpID == "" {
+		return res, err
+	}
+	res.affinity = ac
+	keepAffinity = true
+	return res, nil
+}
+
+func (c *DIClient) analyzeWith(ctx context.Context, ac *affinityClient, doc Document,
+	req Request, deadline time.Time) (*Result, error) {
 
 	if !req.RequireOperation && syncCapability(c.capability.Load()) != syncUnavailable {
 		res, err := c.trySync(ctx, ac, doc, req, deadline)
@@ -153,21 +174,47 @@ func (c *DIClient) trySync(ctx context.Context, ac *affinityClient, doc Document
 	// container declares it in its swagger and still never answers, holding the connection past
 	// five minutes on a blank image. Without this, auto mode would spend the entire upstream
 	// timeout here on every job before falling back to a route that works.
-	probeCtx, cancelProbe := context.WithTimeout(ctx, c.probeTimeout)
-	defer cancelProbe()
+	//
+	// The bound applies to the ANSWER, not to the download that follows it. Deriving the request
+	// from a context.WithTimeout also bounded the streaming of the analyzeResult, so a result that
+	// took longer than DI_SYNC_PROBE_TIMEOUT to transfer failed on a route that was working
+	// perfectly — and failed with a context.DeadlineExceeded, which the worker classifies as a
+	// shutdown and therefore leaves the job neither completed nor failed. The timer is disarmed
+	// the instant the headers arrive.
+	reqCtx, cancelReq := context.WithCancel(ctx)
+	defer cancelReq()
+
+	var probeMu sync.Mutex
+	answered, probeExpired := false, false
+	probeTimer := time.AfterFunc(c.probeTimeout, func() {
+		probeMu.Lock()
+		defer probeMu.Unlock()
+		if !answered {
+			probeExpired = true
+			cancelReq()
+		}
+	})
 
 	started := time.Now()
-	hreq, err := c.newRequest(probeCtx, http.MethodPost, target, &doc)
+	hreq, err := c.newRequest(reqCtx, http.MethodPost, target, &doc)
 	if err != nil {
+		probeTimer.Stop()
 		return nil, err
 	}
 	resp, err := ac.http.Do(hreq)
+
+	probeMu.Lock()
+	answered = true
+	expired := probeExpired
+	probeMu.Unlock()
+	probeTimer.Stop()
+
 	if err != nil {
 		// A caller going away is not a verdict on the route; a probe deadline is.
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		if probeCtx.Err() != nil {
+		if expired {
 			return nil, ErrSyncUnavailable
 		}
 		return nil, c.unreachable(ctx, err)
@@ -323,8 +370,12 @@ func (c *DIClient) pollURLIn(fam, modelID, resultID string, q url.Values) string
 // pathPrefix is the job's own path family. The operation was created under it, and the container
 // scopes an operation id to the family it was issued in — fetching from the other one answers 404,
 // so a legacy /formrecognizer job silently lost its searchable PDF and every figure.
-func (c *DIClient) FetchArtifact(ctx context.Context, pathPrefix, modelID, resultID, suffix string,
+// res carries the job's affinity client, which these requests must use: the operation id is
+// meaningful only to the replica that minted it, and the shared pool lands anywhere.
+func (c *DIClient) FetchArtifact(ctx context.Context, res *Result, pathPrefix, modelID, suffix string,
 	q url.Values) (path string, size int64, contentType string, err error) {
+
+	resultID := res.UpstreamOpID
 
 	pq := url.Values{}
 	if v := q.Get("api-version"); v != "" {
@@ -338,7 +389,7 @@ func (c *DIClient) FetchArtifact(ctx context.Context, pathPrefix, modelID, resul
 	if err != nil {
 		return "", 0, "", err
 	}
-	resp, err := c.client.Do(req)
+	resp, err := res.client(c.client).Do(req)
 	if err != nil {
 		return "", 0, "", err
 	}
@@ -372,8 +423,14 @@ func resourceScoped404(e *azerr.APIError) bool {
 	case azerr.InnerModelNotFound, azerr.InnerOperationNotFound:
 		return true
 	}
-	// A well-formed NotFound with a message is the service talking about a resource; a bodyless or
-	// unparseable 404 never reaches here, because readErrorBody yields a synthesised code instead.
+	// A well-formed NotFound with a message is the service talking about a resource. A bodyless or
+	// unparseable 404 is the gateway's own manufactured error and says nothing about whether the
+	// route exists, so it must not count — checked explicitly rather than inferred from the code,
+	// which is what quietly broke the latch when genericError started preserving the upstream
+	// status.
+	if e.Synthesised() {
+		return false
+	}
 	return e.Code == azerr.CodeNotFound && e.Message != ""
 }
 
