@@ -59,8 +59,8 @@ with `-coverpkg=./internal/...`, so it is not in the denominator. Figures from `
 Re-verified on 2026-10-04 against `0f9c794`; the code is unchanged on branch `wega/handoff`.
 `go build ./...`, the linux/amd64 cross-compile, `make lint` (gofmt, `go vet`, staticcheck) and
 `go test -race ./...` all pass: 109 tests pass and 1 is skipped (`TestLiveMocks`, the harness
-gated on `MOCKAZURE_LIVE=1`). Coverage measured 67.8%. Two checks were not re-run that day:
-`make image`, because Docker was unavailable on that machine, and the fresh-clone build.
+gated on `MOCKAZURE_LIVE=1`). Coverage measured 67.8%. A fresh clone of the branch builds and
+vets clean. `make image` was not re-run that day, because Docker was unavailable on that machine.
 
 ---
 
