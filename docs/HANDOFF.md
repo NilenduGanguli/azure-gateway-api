@@ -348,19 +348,51 @@ a row (the default blind-poll budget) fail the job.
 ### Build and publish
 
 Run `make check` first, then `make image`. There is no push target: publishing is the deploy
-agent's job. For Wega, tag with semver plus the git SHA:
+agent's job.
+
+`<registry>` means what it means in the orchestrator's `docs/deploy/SYSTEM-HANDOFF.md` §5 and
+`docs/deploy/system.yaml`: the system parameter `P-REGISTRY`, which is the registry host **plus**
+the namespace. Its default is `image-registry.openshift-image-registry.svc:5000/wega-<env>`, so
+the image is always `<registry>/azure-gateway-api`. Never write `wega-<env>` after `<registry>`:
+that doubles the namespace (`…:5000/wega-dev/wega-dev/azure-gateway-api`), which is not where
+the overlays pull from. For Wega, tag with semver plus the git SHA:
 
 ```sh
-make image IMAGE=<registry>/wega-<env>/azure-gateway-api VERSION=<semver>
-docker tag <registry>/wega-<env>/azure-gateway-api:<semver> \
-  <registry>/wega-<env>/azure-gateway-api:$(git rev-parse --short HEAD)
+make image IMAGE=<registry>/azure-gateway-api VERSION=<semver>
+docker tag <registry>/azure-gateway-api:<semver> \
+  <registry>/azure-gateway-api:$(git rev-parse --short HEAD)
 ```
 
+With the default registry in dev, that is
+`image-registry.openshift-image-registry.svc:5000/wega-dev/azure-gateway-api:<semver>`, plus
+`:<git-sha>` and `:latest`. The default is the in-cluster pull address. A push from outside the
+cluster goes through the registry's exposed route: the route host replaces
+`image-registry.openshift-image-registry.svc:5000`, and `/wega-<env>/azure-gateway-api` stays.
+
 `VERSION` also stamps the binary, so `/_gw/version` reports it. `COMMIT` defaults to the short
-SHA, and `make image` always adds `:latest` as well. The default registry is
-`image-registry.openshift-image-registry.svc:5000/wega-<env>`; it is the system parameter
-`P-REGISTRY`. Wega manifests reference the image by digest. The deploy agent captures the digest
-at push and injects it in a release overlay, so no committed manifest carries it.
+SHA, and `make image` always adds `:latest` as well. Wega deploys by digest only, so no committed
+manifest carries a real one. The deploy agent captures the digest at push. `skopeo` must use the
+address the push used, so from outside the cluster it names the route host. With the default,
+integrated registry, `oc` asks the OpenShift API for the same value:
+
+```sh
+skopeo inspect --format '{{.Digest}}' docker://<registry>/azure-gateway-api:<git-sha>
+oc -n wega-<env> get istag azure-gateway-api:<git-sha> -o jsonpath='{.image.metadata.name}'
+```
+
+It injects the digest in the orchestrator's untracked release overlay for dev or perf, never in a
+committed overlay. The committed overlay has already renamed `azure-gateway-api` to its full
+in-cluster name with the all-zero placeholder digest, so the release overlay's key must be that
+full name. A bare `azure-gateway-api=` key matches nothing, and the render keeps `@sha256:0000…`:
+
+```sh
+FULL=image-registry.openshift-image-registry.svc:5000/wega-<env>/azure-gateway-api
+kustomize edit set image "$FULL=<registry>/azure-gateway-api@sha256:<digest>"
+```
+
+The orchestrator's `docs/deploy/release-example/` writes the same entry as an `images:` item
+(`name:` the full name, `digest:`), and its `make manifests-release RELEASE=<release dir>` must
+then pass with no warning.
 
 ### Verify after deploy
 
@@ -441,7 +473,8 @@ column that a newer build adds is not applied to an existing volume.
 | 2026-10-04 | `ec4da83` | The `OPERATIONS.md` sample labels its pods and selectors `app.kubernetes.io/name: azure-gateway-api`, the label Wega's NetworkPolicies select. |
 | 2026-10-04 | `656fa6b` | This section: how Wega deploys the gateway, the configuration rules, the health semantics, the build facts and the update rule. |
 | 2026-10-04 | `7743bc3` | This section checked against orchestrator `c8ce603`: the upstream port is filled in as 5000. The ConfigMap and Secret wiring, the PVC, probes, resources, security context, network policies, the mocks' `/status` and `syncAnalyze`, and the staging and prod cells now match `ocr-cell` and `infra-mocks`. The fleet mismatch with vision is recorded. |
-| 2026-10-04 | The first commit after `7743bc3` | This section re-checked against the `main` branches of the orchestrator (`44016ec`), vision (`5f93223`) and DES (`bf57bbb`). The fleet gap is closed: vision's four fleet files are byte-identical to the orchestrator's from vision `4e9d40e`, so vision's perf ceiling is 7 against `di` 4/2, and its staging and prod egress reaches `gateway-<env>`. The DES mocks that serve `/status` and `syncAnalyze` are on DES `main`, so `527c6c0` and branch `wega/azure-mocks` are no longer cited. A staging or prod cell also needs ingress from `wega-<env>` and DNS egress. The staging and prod `queue_depth` mismatch is recorded. The code, the image and the values `ocr-cell` sets are unchanged. |
+| 2026-10-04 | `e688dbb` | This section re-checked against the `main` branches of the orchestrator (`44016ec`), vision (`5f93223`) and DES (`bf57bbb`). The fleet gap is closed: vision's four fleet files are byte-identical to the orchestrator's from vision `4e9d40e`, so vision's perf ceiling is 7 against `di` 4/2, and its staging and prod egress reaches `gateway-<env>`. The DES mocks that serve `/status` and `syncAnalyze` are on DES `main`, so `527c6c0` and branch `wega/azure-mocks` are no longer cited. A staging or prod cell also needs ingress from `wega-<env>` and DNS egress. The staging and prod `queue_depth` mismatch is recorded. The code, the image and the values `ocr-cell` sets are unchanged. |
+| 2026-10-04 | The first commit after `e688dbb` | [Build and publish](#build-and-publish): `<registry>` now means the registry host plus the namespace (`P-REGISTRY`), as in the orchestrator's `SYSTEM-HANDOFF.md` §5 at `6cdaec6`, so the image is `<registry>/azure-gateway-api`. The old recipe wrote `wega-<env>` after `<registry>`, which doubled the namespace with the default registry this file named. The digest capture and the full-name release-overlay key are added; `kustomize build` over orchestrator `6cdaec6`'s dev overlay renders the given digest with the full-name key and the zero digest with a bare key. Between `44016ec` and `6cdaec6`, `ocr-cell`, the overlays and their fleet files are unchanged, and `infra-mocks` changed only `oracle-init.sh`; the DES mocks are unchanged between `bf57bbb` and `fec8bd7`. The code, the image and the values `ocr-cell` sets are unchanged. |
 
 ### Read next
 
