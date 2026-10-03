@@ -298,8 +298,8 @@ observation in each case; the short version:
 
 ## Status
 
-Build green: `go vet`, `gofmt`, `go test -race` across all ten packages, and a `linux/amd64` image
-whose build runs the suite inside it.
+Build green: `go vet`, `gofmt`, `go test -race` across all eleven packages that have tests, and a
+`linux/amd64` image whose build runs the suite inside it.
 
 **Not yet done**, stated plainly:
 

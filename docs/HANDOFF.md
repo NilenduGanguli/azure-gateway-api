@@ -37,9 +37,9 @@ Verified, not remembered — re-run the commands if you doubt any of it.
 | Cross-compile | `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./cmd/gateway` | pass |
 | Format | `gofmt -l .` | clean |
 | Vet | `go vet ./...` | clean |
-| Tests | `go test -race ./...` | 10/10 packages pass |
+| Tests | `go test -race ./...` | 11/11 packages with tests pass |
 | Image | `make image` | exit 0, ~5.7 MB, suite runs *inside* the build |
-| Git | `git status` | clean, pushed to `origin/main` |
+| Git | `git status` | clean. `origin/main` stops at `0f9c794`; the Wega handoff commits after it were not pushed as of 2026-10-04 |
 | Publishable | `git clone <url> /tmp/x && cd /tmp/x && go build ./...` | pass |
 
 > **Do not substitute `git status` for that last row.** A `.gitignore` entry of `gateway` — meant
@@ -56,11 +56,13 @@ both of which drive real I/O. `cmd/gateway` contributes nothing either way: the 
 with `-coverpkg=./internal/...`, so it is not in the denominator. Figures from `make cover`;
 `docs/TESTING.md` carries the full table and is the one to update.
 
-Re-verified on 2026-10-04 against `0f9c794`; the code is unchanged on branch `wega/handoff`.
-`go build ./...`, the linux/amd64 cross-compile, `make lint` (gofmt, `go vet`, staticcheck) and
-`go test -race ./...` all pass: 109 tests pass and 1 is skipped (`TestLiveMocks`, the harness
-gated on `MOCKAZURE_LIVE=1`). Coverage measured 67.8%. A fresh clone of the branch builds and
-vets clean. `make image` was not re-run that day, because Docker was unavailable on that machine.
+Re-verified on 2026-10-04 on `main` after merging `wega/handoff`; the code is unchanged since
+`0f9c794`, and only documentation moved. `go build ./...`, the linux/amd64 cross-compile,
+`make lint` (gofmt, `go vet`, staticcheck), `go test ./...` and `go test -race ./...` all pass.
+The race run passes 109 tests in 11 packages and skips 1 (`TestLiveMocks`, the harness gated on
+`MOCKAZURE_LIVE=1`). Coverage measured 68.0%; it moves by a few tenths between runs. A fresh
+clone of `main` builds and vets clean. `make image` was not re-run that day, because Docker was
+unavailable on that machine.
 
 ---
 
@@ -137,15 +139,18 @@ repository; see [Wega: build and deploy facts](#wega-build-and-deploy-facts).
 
 ## Wega: build and deploy facts
 
-Last verified on 2026-10-04 against the code at `0f9c794`. The system-level handoff for every
-Wega repository is `docs/deploy/SYSTEM-HANDOFF.md` in `document-embedding-orchestrator`, with the
-machine-readable `docs/deploy/system.yaml` beside it. This section covers only what is true of
-the gateway.
+Last verified on 2026-10-04: the code at `0f9c794`, and the manifests that deploy it at
+`document-embedding-orchestrator` `c8ce603` (`deploy/openshift/components/ocr-cell/`,
+`deploy/openshift/components/infra-mocks/` and the dev and perf overlays). The system-level
+handoff for every Wega repository is `docs/deploy/SYSTEM-HANDOFF.md` in
+`document-embedding-orchestrator`, with the machine-readable `docs/deploy/system.yaml` beside it.
+This section covers only what is true of the gateway.
 
 **Update rule: update this file in the same change as anything that alters build or deploy
 facts.** Some facts here are also relied on by the orchestrator's `ocr-cell` component or by the
 shared gateway fleet file: a port, a label, an endpoint, a variable name, or a health rule. When
-one of those changes, change the consumers in the same release.
+one of those changes, change the consumers in the same release. The reverse holds too: when
+`ocr-cell` or `infra-mocks` changes, re-check the tables below against it.
 
 ### How Wega deploys it
 
@@ -155,47 +160,60 @@ two upstreams are mocks.
 
 | Aspect | Fact |
 |---|---|
-| Manifests | Not in this repository. They are the orchestrator's kustomize component `deploy/openshift/components/ocr-cell/`, included by the dev and perf overlays. The system handoff says how staging and prod get their gateways. |
+| Manifests | Not in this repository. They are the orchestrator's kustomize component `deploy/openshift/components/ocr-cell/`: `gateway.yaml` (the PVC, Service, Deployment and PodMonitor), `gateway.env` (the ConfigMap), `networkpolicies.yaml` and `serviceaccount.yaml`. The dev and perf overlays include it. Staging and prod do not; see the staging and prod row. |
 | Namespace | `wega-<env>`, shared with every other Wega workload of that environment. |
-| Workload | Deployment `azure-gateway-api` with `replicas: 1` and `strategy.type: Recreate`. Never scale it out, and never use `RollingUpdate`; see [One replica, `Recreate`](OPERATIONS.md#one-replica-recreate). |
-| Storage | One `ReadWriteOnce` PVC mounted at `/data` (`DATA_DIR`), from a **block** storage class: ext4 or xfs on RBD or similar. The class is a per-environment overlay parameter. The gateway refuses to start on CephFS, NFS or FUSE. |
-| Service | `azure-gateway-api`, ClusterIP, port `8080` named `http`. Wega needs no Route: every Wega client is in-cluster. Do not add one either, because no `/_gw` endpoint is authenticated. |
-| Labels | The pods carry `app.kubernetes.io/name: azure-gateway-api`, and the Service selects on it. Wega's NetworkPolicies select this label. |
-| Fleet entry | `gw-01`, with `base_url` `http://azure-gateway-api.wega-<env>.svc.cluster.local:8080`. It is in the single gateway fleet file, which is identical in the orchestrator and vision overlays. |
-| Upstreams in dev and perf | The DES Azure mocks, reached through their Services: `azure-di-mock` for Layout and `azure-read-mock` for Read. Their images build from `document-enrichment-services` (`mock_azure_di/`, `mock_azure_ocr/`). Their manifests are the orchestrator component `infra-mocks`. |
+| Workload | Deployment `azure-gateway-api` with `replicas: 1` and `strategy.type: Recreate`. It runs one container, `gateway`, with `args: [serve]`, under ServiceAccount `azure-gateway-api` with `automountServiceAccountToken: false`. Never scale it out, and never use `RollingUpdate`; see [One replica, `Recreate`](OPERATIONS.md#one-replica-recreate). |
+| Storage | PVC `azure-gateway-api-data`: `ReadWriteOnce`, 50 Gi, mounted at `/data` (`DATA_DIR`). The class must be **block**: ext4 or xfs on RBD or similar. `ocr-cell` commits `ocs-storagecluster-ceph-rbd`. The class is the system parameter `P-STORAGE-BLOCK`, which a release overlay patches per cluster. The gateway refuses to start on CephFS, NFS or FUSE. |
+| Service | `azure-gateway-api`, ClusterIP, port `8080` named `http`, with `targetPort: http`. Wega needs no Route: every Wega client is in-cluster. Do not add one either, because no `/_gw` endpoint is authenticated. |
+| Labels | The Deployment, its pods, the Service, the PVC and the ServiceAccount carry `app.kubernetes.io/name: azure-gateway-api` and `app.kubernetes.io/part-of: wega`. The Service, the PodMonitor and both gateway NetworkPolicies select the name label. So do the mocks' ingress policy, the orchestrator's `wega-control-egress` and vision's egress policy. The pods carry no `wega.io/deployment` label, so the namespace's `wega-scrape` policy does not cover them; the gateway's own ingress policy admits the scrape instead. |
+| Fleet entry | `gw-01`, with `base_url` `http://azure-gateway-api.wega-<env>.svc.cluster.local:8080`, and `max_inflight: 4` and `queue_depth: 2` on both `di` and `read`. The file is the orchestrator's `deploy/openshift/overlays/<env>/gateway-fleet.json`, published as ConfigMap `wega-gateway-fleet`. Vision's overlays must carry the same file byte for byte, and in perf they do not yet; see [Known gaps](#known-gaps-for-wega-as-of-2026-10-04). |
+| Upstreams in dev and perf | The DES Azure mocks, from the orchestrator component `infra-mocks` (`azure-mocks.yaml`). Layout is Deployment and ClusterIP Service `azure-di-mock`; Read is `azure-read-mock`. Each Service listens on port `5000`, named `http`, which is also the container port. The images are `wega-azure-di-mock` and `wega-azure-read-mock`, built from `document-enrichment-services` (`mock_azure_di/`, `mock_azure_ocr/`). Each mock runs `replicas: 1` with `Recreate`. Its startup and readiness probes are `GET /status`, and its liveness probe is `GET /health`. The pods are labelled `app.kubernetes.io/name: azure-di-mock` or `azure-read-mock`, plus `wega.io/mock: "true"`. Their ingress policy, `wega-azure-mocks-ingress`, admits only pods labelled `app.kubernetes.io/name: azure-gateway-api`, on TCP 5000. |
 | Real upstreams | The Azure Document Intelligence Layout and Read containers. Probe them before the first deploy (`make probe`; see [OPERATIONS §1](OPERATIONS.md#1-before-you-deploy-probe-the-containers)), and set `DI_SYNC_ANALYZE` from the verdict. |
-| Callers | `wega-vision` submits and polls on both surfaces, and reads `/_gw/health`, `/_gw/jobs/{id}` and `/_gw/version`. The orchestrator observer, in `wega-orch-control`, reads `/_gw/health` and `/_gw/config`. |
+| Staging and prod | No `ocr-cell`. The orchestrator's committed staging and prod fleets list several cells, `gw-NN` at `http://azure-gateway-api-NN.gateway-<env>.svc.cluster.local:8080`. These are real gateways against real Azure, deployed outside the Wega overlays: open input `I-GATEWAY-CELLS` in the system handoff. `ocr-cell` is the template for one cell, with two changes. The Secret below must exist. The egress policy admits only the two mocks, so it must name the real upstreams instead. |
+| Callers | `wega-vision`, whose pods are labelled `wega.io/deployment: vision`, submits and polls on both surfaces, and reads `/_gw/health`, `/_gw/jobs/{id}` and `/_gw/version`. The orchestrator observer runs in `wega-orch-control`, labelled `wega.io/deployment: orch-control`, and reads `/_gw/health` and `/_gw/config`. User-workload monitoring scrapes `/_gw/metrics` through PodMonitor `azure-gateway-api` every 30 s. The ingress policy admits nobody else. |
 
 ### Configuration Wega sets
 
-The `ocr-cell` ConfigMap holds the actual values. This table gives the rule each value must
-satisfy. Anything not listed keeps its image default; the full catalogue is in
-[OPERATIONS §4](OPERATIONS.md#4-configuration-recipes).
+The values live in ConfigMap `azure-gateway-api`. `ocr-cell` generates it from `gateway.env`, and
+the container reads it with `envFrom`. Each overlay's `patch-gateway.yaml` adds
+`PUBLIC_BASE_URL`. This table gives the value Wega sets in dev and perf, and the rule each value
+must satisfy. The full catalogue is in [OPERATIONS §4](OPERATIONS.md#4-configuration-recipes).
 
-| Variable | dev and perf | Against real containers | Why |
+| Variable | dev and perf (`ocr-cell`) | Against real containers | Why |
 |---|---|---|---|
-| `DI_UPSTREAM_URL` | `http://azure-di-mock:<port>` | The Layout container's Service URL | Required; startup fails without it. `<port>` is the port the `infra-mocks` Service exposes. The mock container itself listens on 5000. |
-| `READ_UPSTREAM_URL` | `http://azure-read-mock:<port>` | The Read container's Service URL | Required. The hostname must not contain `vision` ([why](OPERATIONS.md#the-vision-substring-bug-in-the-read-container)). |
-| `DI_SYNC_ANALYZE` | `off` | From the probe verdict | The DES Layout mock serves no `:syncAnalyze`. With `off`, the gateway skips that attempt on every job, and `/_gw/health` reports `syncAnalyze: unavailable` for Layout from boot. DI jobs then run as `:analyze` plus polling, and show `upstreamMode: async-fallback`. |
-| `DI_MAX_INFLIGHT` | `gw-01` `di.max_inflight` from the fleet file | Same rule | Every 300 s the orchestrator observer reads `/_gw/config`. When `diMaxInflight` differs from the fleet value, it raises `WegaGatewayFleetDrift`. |
-| `QUEUE_DEPTH` | `gw-01` `di.queue_depth` from the fleet file | Same rule | Also drift-checked, as `queueDepth`. The gateway has one `QUEUE_DEPTH` for both surfaces, so the fleet's `read.queue_depth` must equal its `di.queue_depth`. |
-| `READ_MAX_INFLIGHT` | `gw-01` `read.max_inflight` from the fleet file | Same rule | Not drift-checked. Keep it equal anyway, so that the fleet file stays a true description of the gateway. |
-| `PUBLIC_BASE_URL` | `http://azure-gateway-api.wega-<env>.svc.cluster.local:8080`, the fleet `base_url` | Same rule | Recommended, not required. Vision takes only the operation id from `Operation-Location` and rebuilds every poll URL from the fleet `base_url`. Setting this silences the `PUBLIC_BASE_URL is unset` warning and fixes the advertised authority. Give scheme and authority only. |
-| `DATA_DIR` | `/data`, the image default | Same | Must be the PVC mount. |
-| `SHUTDOWN_GRACE` | Less than `terminationGracePeriodSeconds` | Same | The default is `30s`. The OPERATIONS sample uses a 60 s grace period. |
+| `DI_UPSTREAM_URL` | `http://azure-di-mock:5000` | The Layout container's Service URL | Required; startup fails without it. 5000 is the `infra-mocks` Service port, and the mock's container port too. The gateway's egress policy admits TCP 5000 to the two mocks and nothing else. |
+| `READ_UPSTREAM_URL` | `http://azure-read-mock:5000` | The Read container's Service URL | Required. The hostname must not contain `vision` ([why](OPERATIONS.md#the-vision-substring-bug-in-the-read-container)). |
+| `DI_SYNC_ANALYZE` | `off` | From the probe verdict | With `off`, the gateway never tries `:syncAnalyze`. `/_gw/health` reports `syncAnalyze: unavailable` for Layout from boot, and DI jobs run as `:analyze` plus polling and show `upstreamMode: async-fallback`. `gateway.env` gives the reason as the DES Layout mock serving no `:syncAnalyze`. That is true of DES `527c6c0`. The mock at `d1b8ec4` (branch `wega/azure-mocks`) does serve it, so `auto` would work against it too. `off` costs only the fast path. Changing it is an `ocr-cell` change, and this row changes with it. |
+| `DI_MAX_INFLIGHT` | `4`, which is `gw-01` `di.max_inflight` | Same rule | Every 300 s the orchestrator observer reads `/_gw/config`. When `diMaxInflight` differs from the fleet value, it raises `WegaGatewayFleetDrift`. |
+| `QUEUE_DEPTH` | `2`, which is `gw-01` `di.queue_depth` | Same rule | Also drift-checked, as `queueDepth`. The gateway has one `QUEUE_DEPTH` for both surfaces, so the fleet's `read.queue_depth` must equal its `di.queue_depth`. |
+| `READ_MAX_INFLIGHT` | `4`, which is `gw-01` `read.max_inflight` | Same rule | The observer does not drift-check it. Keep it equal anyway, so that the fleet file stays a true description of the gateway. |
+| `PUBLIC_BASE_URL` | `http://azure-gateway-api.wega-<env>.svc.cluster.local:8080`, the fleet `base_url`, from `overlays/<env>/patch-gateway.yaml` | Same rule | Give scheme and authority only; the gateway rejects a path. Vision takes only the operation id from `Operation-Location` and rebuilds every poll URL from the fleet `base_url`, so this is not load-bearing for Wega. Setting it silences the `PUBLIC_BASE_URL is unset` warning and fixes the advertised authority. |
+| `DATA_DIR` | `/data`, set explicitly, and also the image default | Same | Must be the PVC mount. |
+| `SHUTDOWN_GRACE` | `30s`, under `terminationGracePeriodSeconds: 60` | Less than `terminationGracePeriodSeconds` | The default is `30s`. |
 
-At the time of writing, the orchestrator's dev fleet file gives `gw-01` `max_inflight: 4` and
-`queue_depth: 2` on both `di` and `read`. That means `DI_MAX_INFLIGHT=4`, `READ_MAX_INFLIGHT=4`
-and `QUEUE_DEPTH=2`. The fleet file is the source: derive the values from it, not from this
-paragraph.
+The orchestrator's `tests/parity/test_deploy_components.py` fails when `DI_MAX_INFLIGHT`,
+`READ_MAX_INFLIGHT`, `QUEUE_DEPTH` or `PUBLIC_BASE_URL` disagrees with the `gw-01` entry of that
+overlay's fleet file. The fleet file is the source: derive the values from it, not from this
+table.
+
+`gateway.env` also sets `GATEWAY_ADDR=:8080`, `DI_UPSTREAM_TIMEOUT=15m`,
+`READ_SYNC_TIMEOUT=10m`, `RESULT_TTL=24h`, `GC_INTERVAL=5m`, `DISK_HIGH_WATERMARK=0.90`,
+`ERROR_COMPAT=observed`, `LOG_LEVEL=info` and `LOG_FORMAT=json`. Each equals the gateway's own
+default in `internal/config/config.go`. Changing one of those defaults therefore does not change
+Wega, because the ConfigMap still sets the old value. Every variable not named in this section
+keeps its default.
 
 **Secret (name only).** The Secret is `azure-gateway-api`, with keys `DI_UPSTREAM_API_KEY` and
-`READ_UPSTREAM_API_KEY`, consumed through `envFrom`. Everywhere else, Wega mounts secrets as
-files. The gateway reads nothing from disk, so it is the documented exception. The DES mocks
-check no key, so in dev and perf both values may be empty. `/_gw/health` then lists two
-`…_API_KEY is empty; upstream calls will be unauthenticated` lines under `warnings`; in those
-environments they are expected, not faults. Against real containers, the keys are the Azure
-resource's billing keys.
+`READ_UPSTREAM_API_KEY`. The container reads each key into the variable of the same name through
+`env[].valueFrom.secretKeyRef` with `optional: true`, not through `envFrom`. The orchestrator's
+`policy/secrets.rego` admits exactly these two keys of this Secret, and only in this container.
+Everywhere else, Wega mounts secrets as files. The gateway reads nothing from disk, so it is the
+documented exception. In dev and perf the Secret need not exist, because the DES mocks check no
+key: they would only check one with `MOCK_API_KEY` set, and `infra-mocks` does not set it. Both
+variables are then unset, and `/_gw/health` lists two
+`…_API_KEY is empty; upstream calls will be unauthenticated` lines under `warnings`. In those
+environments they are expected, not faults. Against real containers the Secret is required, and
+the keys are the Azure resource's billing keys.
 
 ### Health: the endpoints, and which one Wega reads
 
@@ -205,6 +223,7 @@ resource's billing keys.
 | `GET /_gw/ready` | `200` when both SQLite pools answer a ping within 3 s, else `503`. Upstreams are deliberately excluded | The readiness probe, and nothing else. Wega never treats it as health, because it answers `ready` with both upstreams down. |
 | `GET /_gw/health` | The full diagnostic. `503` only when the store is unreachable. Otherwise `200`, with `status` set to `ok`, or to `degraded` when any upstream is not ok | Wega's only health signal, for vision's per-surface breakers and the observer's OCR window. Never a probe. |
 | `GET /_gw/config` | The effective configuration, with keys redacted | The observer's fleet-drift check, through `diMaxInflight`, `readMaxInflight` and `queueDepth` |
+| `GET /_gw/metrics` | Prometheus text format | PodMonitor `azure-gateway-api`, every 30 s |
 | `GET /status`, at the root | Container-shaped `apiStatus`, `Valid` or `Invalid`, always at HTTP `200` | Nothing in Wega. It cannot fail, so it is useless as a probe. |
 
 **How `upstreams[].ok` is decided.** `/_gw/health` lists two upstreams: `document-intelligence`
@@ -219,8 +238,10 @@ affects `ok`, so `apiStatus: Invalid` at HTTP `200` still counts as ok. The logi
 out, or cannot be reached. After two consecutive `ok: false` reads, vision opens that surface's
 breaker and stops sending it work, and the observer drops the surface from the OCR window. **So
 every upstream this gateway points at, mocks included, must answer `GET /status` with HTTP 200
-within 5 s.** The recommended body is `{"apiStatus":"Valid"}`. At DES `527c6c0`, the mocks serve
-only `/health`, so the Wega design requires DES to add `/status` before the first dev deploy.
+within 5 s.** The recommended body is `{"apiStatus":"Valid"}`. The DES mocks serve exactly that
+from `d1b8ec4`, on branch `wega/azure-mocks`; at `527c6c0` they served only `/health`.
+`infra-mocks` makes `/status` the startup and readiness probe of both mocks, so a mock image
+without it never becomes Ready.
 
 The same response carries `capacity.di` and `capacity.read`, each with `inFlight`, `limit`,
 `queued` and `upstreamInUse`. `limit` is `MAX_INFLIGHT + QUEUE_DEPTH`; the observer uses it as
@@ -242,34 +263,50 @@ perf.
 
 The Read fallback has no latch. Against a mock without `syncAnalyze`, every Read job uploads its
 document twice, once to the `404` and once to `analyze`, and shows `upstreamMode: async-fallback`.
-That costs time, not correctness. Keep each mock at one replica, because their job stores are per
-process. A poll that reaches the other replica gets a 404, and 60 of those in a row (the default
-blind-poll budget) fail the job.
+That costs time, not correctness. The DES Read mock serves `syncAnalyze` from `d1b8ec4`, so Read
+jobs against it run `sync`. Keep each mock at one replica, as `infra-mocks` does, because their
+job stores are per process. A poll that reaches the other replica gets a 404, and 60 of those in
+a row (the default blind-poll budget) fail the job.
 
-### Probes, network and security context for the `ocr-cell` manifests
+### Probes, network and security context in `ocr-cell`
 
-- Liveness on `/_gw/live`, readiness on `/_gw/ready`, startup on `/_gw/live`, all on port `http`
-  (8080). The periods and thresholds in the
-  [OPERATIONS sample](OPERATIONS.md#a-complete-manifest) are a sound start. Never put liveness or
-  readiness on `/_gw/health`, and never use `/status` as a probe.
-- `terminationGracePeriodSeconds` must exceed `SHUTDOWN_GRACE`.
-- `readOnlyRootFilesystem: true` works, because every write lands under `DATA_DIR`. Mount an
-  `emptyDir` at `/tmp` anyway.
-- Ingress: TCP 8080 from the vision pods and from the orchestrator control pods. Egress: the two
-  upstream Services, and DNS.
-- Vision's egress policy, at `document-vision-service` `0b87792`, selects the gateway with a
-  `namespaceSelector` on `wega.io/service: azure-gateway-api` **and** a `podSelector` on
-  `app.kubernetes.io/name: azure-gateway-api`. With the gateway in `wega-<env>`, that peer
-  matches only if the namespace carries that label, or if the peer is reduced to the pod
-  selector. The gateway guarantees only the pod label. The namespace decision belongs to the
-  vision and orchestrator overlays.
-- The image runs as `nonroot`, uid 65532, and the OPERATIONS sample pins `runAsUser: 65532` and
-  `fsGroup: 65532`. OpenShift's `restricted-v2` SCC assigns both from the namespace's range. It
-  rejects a pinned uid outside that range unless the ServiceAccount is granted an SCC that allows
-  it, such as `nonroot-v2`. Leaving both unset should work under `restricted-v2`: the binary is
-  world-readable, and every write lands on the volume that the SCC's `fsGroup` makes writable.
+- Probes, all on port `http` (8080):
+  - startup on `/_gw/live`, every 2 s, failure threshold 30, so the gateway has 60 s to start;
+  - readiness on `/_gw/ready`, every 10 s, timeout 5 s, failure threshold 3;
+  - liveness on `/_gw/live`, every 10 s, timeout 3 s, failure threshold 3.
+
+  Never put liveness or readiness on `/_gw/health`, because it calls both upstreams, and never
+  use `/status` as a probe.
+- `terminationGracePeriodSeconds: 60`, which must exceed `SHUTDOWN_GRACE` (`30s`).
+- Resources: requests of 250m CPU and 256Mi, limits of 2 CPU and 1Gi.
+- The container sets `readOnlyRootFilesystem: true`, `allowPrivilegeEscalation: false`, and drops
+  all capabilities. The pod sets `runAsNonRoot: true`, the `RuntimeDefault` seccomp profile and
+  `enableServiceLinks: false`. The read-only root works because every write lands under
+  `DATA_DIR`; a 64Mi `emptyDir` is mounted at `/tmp` anyway.
+- Ingress, policy `azure-gateway-api-ingress`: TCP 8080 from pods in the namespace labelled
+  `wega.io/deployment` `vision` or `orch-control`, and from the namespace
+  `openshift-user-workload-monitoring` for metrics. No other pod can connect, including the
+  orchestrator's API and workers.
+- Egress, policy `azure-gateway-api-egress`: TCP 5000 to pods labelled `app.kubernetes.io/name`
+  `azure-di-mock` or `azure-read-mock`. DNS comes from the namespace-wide `wega-allow-dns`
+  policy of the orchestrator's `network-policies` component. Under the namespace default-deny,
+  that is everything the gateway can reach.
+- Vision's egress policy, at `document-vision-service` `68f8a7c`, selects the gateway with a bare
+  `podSelector` on `app.kubernetes.io/name: azure-gateway-api`, on 8080. That matches the
+  gateway in vision's own namespace only. The orchestrator's `wega-control-egress` selects the
+  same label with an empty `namespaceSelector`, which matches it in any namespace. The gateway
+  guarantees only the pod label.
+- The image's `USER` is `nonroot:nonroot`, uid and gid 65532, given by name. `ocr-cell` sets
+  neither `runAsUser` nor `fsGroup`: OpenShift's `restricted-v2` SCC assigns both from the
+  namespace's range, and its `fsGroup` makes `/data` writable. The binary is world-readable.
   **This is not verified on a cluster.** A permission error on `/data` at startup points here
-  first.
+  first. The uid matters in two other places:
+  - The OPERATIONS sample pins `runAsUser: 65532` and `fsGroup: 65532`. `restricted-v2` rejects
+    a pinned uid outside the namespace range unless the ServiceAccount is granted an SCC that
+    allows it, such as `nonroot-v2`.
+  - Outside OpenShift, nothing assigns a uid. The kubelet then refuses `runAsNonRoot: true`,
+    because the image's user is a name, not a number. Such a cluster needs `runAsUser: 65532`
+    and `fsGroup: 65532`.
 
 ### Build facts
 
@@ -282,22 +319,23 @@ blind-poll budget) fail the job.
 | Build stage | `golang:1.26-bookworm`, `CGO_ENABLED=0`, `-trimpath` | `Dockerfile:5,21-27` |
 | In-build test | `go test ./...` runs inside the build stage, without `-race`. A failing test fails the image build | `Dockerfile:29` |
 | Runtime base | `gcr.io/distroless/static-debian12:nonroot`, with no shell and no curl | `Dockerfile:36` |
-| User | `nonroot:nonroot`, uid and gid 65532 | `Dockerfile:48` |
+| User | `nonroot:nonroot`, uid and gid 65532, given by name | `Dockerfile:48` |
 | Port | `8080`/TCP. One listener serves both Azure surfaces, `/_gw/*`, `/status` and `/ready` | `Dockerfile:44,47` |
 | Entrypoint | `/usr/local/bin/gateway`, with default command `serve`; the other commands are `probe` and `version` | `Dockerfile:50-51` |
 | Volume | `VOLUME /data` | `Dockerfile:42` |
 | Image env | `DATA_DIR=/data`, `GATEWAY_ADDR=:8080`, `LOG_FORMAT=json` | `Dockerfile:43-45` |
 | Required env | `DI_UPSTREAM_URL` and `READ_UPSTREAM_URL`, each `http` or `https` with a host. With an invalid configuration, startup exits and lists every problem | `internal/config/config.go:198-199,267-288` |
 | Other env | Everything else, all optional with defaults; see the [README](../README.md#configuration) | `internal/config/config.go:133-196` |
-| Secret | `azure-gateway-api`, with keys `DI_UPSTREAM_API_KEY` and `READ_UPSTREAM_API_KEY` | `internal/config/config.go:155,160` |
+| Secret | `azure-gateway-api`, with keys `DI_UPSTREAM_API_KEY` and `READ_UPSTREAM_API_KEY`, read from the environment only | `internal/config/config.go:155,160` |
 | Probes | Liveness `/_gw/live`, readiness `/_gw/ready`, startup `/_gw/live` | `internal/admin/admin.go:48-61` |
 | Metrics | `GET /_gw/metrics`, in Prometheus text format, unauthenticated | `internal/admin/admin.go:56` |
 | Make targets | `help`, `build`, `test`, `test-short`, `cover`, `lint`, `check`, `image`, `probe`, `probe-go`, `run`, `sdk-test`, `clean`. There is no push target and no manifest target | `Makefile` |
 | Pre-build gate | `make check`: gofmt, `go vet`, staticcheck when installed, and `go test -race ./...` | `Makefile:31-42` |
 | Toolchain | Go 1.26 (`go 1.26.0`), with one direct dependency: `modernc.org/sqlite` v1.58.0, which is pure Go | `go.mod` |
 | Image size | About 5.7 MB | `make image`, 2026-09-09 |
-| Manifests | None here. For Wega, the orchestrator's `deploy/openshift/components/ocr-cell/` | — |
-| Verified at | `0f9c794`, on 2026-10-04 | — |
+| Manifests | None here. For Wega, the orchestrator's `deploy/openshift/components/ocr-cell/` | orchestrator `c8ce603` |
+| Image in Wega | `gateway.yaml` names the bare image `azure-gateway-api`. Each overlay's `images:` maps it to `image-registry.openshift-image-registry.svc:5000/wega-<env>/azure-gateway-api` by digest, with a zero digest committed as the placeholder | orchestrator `deploy/openshift/overlays/{dev,perf}/kustomization.yaml` |
+| Verified at | Code `0f9c794` and orchestrator manifests `c8ce603`, on 2026-10-04 | — |
 
 ### Build and publish
 
@@ -312,9 +350,9 @@ docker tag <registry>/wega-<env>/azure-gateway-api:<semver> \
 
 `VERSION` also stamps the binary, so `/_gw/version` reports it. `COMMIT` defaults to the short
 SHA, and `make image` always adds `:latest` as well. The default registry is
-`image-registry.openshift-image-registry.svc:5000/wega-<env>`, which is a deploy parameter. Wega
-manifests reference the image by digest. The deploy agent captures the digest at push and injects
-it in a release overlay, so no committed manifest carries it.
+`image-registry.openshift-image-registry.svc:5000/wega-<env>`; it is the system parameter
+`P-REGISTRY`. Wega manifests reference the image by digest. The deploy agent captures the digest
+at push and injects it in a release overlay, so no committed manifest carries it.
 
 ### Verify after deploy
 
@@ -328,8 +366,16 @@ oc -n wega-<env> exec deploy/wega-orch-control -- python -c \
   http://azure-gateway-api:8080/_gw/health
 ```
 
-1. Run `oc -n wega-<env> rollout status deploy/azure-gateway-api`. With `Recreate`, the old pod
-   stops before the new one starts, so a short gap is expected.
+1. In dev and perf, wait for the mocks before the gateway, one rollout at a time:
+
+   ```sh
+   oc -n wega-<env> rollout status deploy/azure-di-mock --timeout=10m
+   oc -n wega-<env> rollout status deploy/azure-read-mock --timeout=10m
+   oc -n wega-<env> rollout status deploy/azure-gateway-api --timeout=10m
+   ```
+
+   With `Recreate`, the old gateway pod stops before the new one starts, so a short gap is
+   expected.
 2. `/_gw/ready` answers `{"status":"ready"}`.
 3. `/_gw/health` shows `status: ok`, and `ok: true` on both upstreams. In dev and perf:
    - `document-intelligence` shows `syncAnalyze: unavailable`.
@@ -337,10 +383,12 @@ oc -n wega-<env> exec deploy/wega-orch-control -- python -c \
      and never probed.
    - `warnings` holds at most the two empty-key lines.
 4. `/_gw/config` shows `diMaxInflight`, `readMaxInflight` and `queueDepth` equal to the `gw-01`
-   fleet entry. In dev and perf it also shows `diSyncAnalyze: off`.
+   fleet entry. In dev and perf it also shows `diSyncAnalyze: off`, `diUpstreamUrl`
+   `http://azure-di-mock:5000` and `readUpstreamUrl` `http://azure-read-mock:5000`.
 5. Send one document through Wega end to end, as the system handoff describes. Then
-   `/_gw/jobs?limit=5` shows `status: succeeded`. Against the DES mocks, both surfaces show
-   `upstreamMode: async-fallback`; Read shows `sync` once the Read mock serves `syncAnalyze`.
+   `/_gw/jobs?limit=5` shows `status: succeeded`. Against the DES mocks, DI jobs show
+   `upstreamMode: async-fallback`, because of `DI_SYNC_ANALYZE=off`. Read jobs show `sync`,
+   because the Read mock serves `syncAnalyze`.
 
 ### Rollback
 
@@ -353,20 +401,40 @@ column that a newer build adds is not applied to an existing volume.
 
 ### Known gaps for Wega, as of 2026-10-04
 
-1. **It has never run against the DES mocks.** Their routes match what the gateway calls, but the
-   pairing is unproven until the first dev deploy. At DES `527c6c0` the mocks also lack
-   `GET /status`, which would make both upstreams read `ok: false`; see above.
-2. **The `clientRequestId` lookup (GW-CR-1) is not implemented.** `/_gw/jobs` ignores a
+1. **It has never run against the DES mocks in a cluster.** DES `8c01dc9` adds an opt-in test
+   that drives both mocks through a gateway binary built from `0f9c794`, outside a cluster. The
+   mocks that serve `GET /status` are on DES branch `wega/azure-mocks` (head `d1b8ec4`). When
+   this was written, DES `main` was still at `527c6c0`, whose mocks lack `/status` and would
+   never pass the `infra-mocks` readiness probes.
+2. **The fleet files differ between the orchestrator and vision.** Compare orchestrator
+   `c8ce603` with `document-vision-service` `68f8a7c`:
+   - dev is identical.
+   - In perf, vision's `gw-01` gives `di` `max_inflight: 8` and `queue_depth: 4`. The
+     orchestrator's fleet and this gateway's ConfigMap give 4 and 2, and the orchestrator's
+     parity test ties those two together, so vision's copy is the stale one. Vision's figures
+     also cannot describe this gateway, because its perf `read.queue_depth` is 2 and the gateway
+     has one `QUEUE_DEPTH`. The observer reads the orchestrator's copy, so
+     `WegaGatewayFleetDrift` does not fire. Vision derives its perf KEDA ceiling from its own
+     copy: 12 admission slots and `maxReplicaCount: 13`, against a gateway that admits 6. The
+     gateway answers the surplus with `429`.
+   - Staging and prod differ in shape. Vision lists one `gw-01` in `wega-<env>`. The
+     orchestrator lists `gw-NN` cells in `gateway-<env>`, which vision's egress cannot reach,
+     because it is limited to vision's own namespace. Which shape is right is open input
+     `I-GATEWAY-CELLS`.
+
+   Neither fix is in this repository.
+
+3. **The `clientRequestId` lookup (GW-CR-1) is not implemented.** `/_gw/jobs` ignores a
    `clientRequestId` parameter, and `/_gw/version` advertises no `clientRequestIdLookup`. Vision
    therefore treats the lookup as unsupported, which costs at most one extra resubmit after an
    ambiguous submit.
-3. **The OpenShift SCC behaviour on `/data` is unverified**; see the security-context item above.
-4. **The base images are pinned by tag, not by digest**: `golang:1.26-bookworm` and
+4. **The OpenShift SCC behaviour on `/data` is unverified**; see the security-context item above.
+5. **The base images are pinned by tag, not by digest**: `golang:1.26-bookworm` and
    `gcr.io/distroless/static-debian12:nonroot`. Wega pins the built gateway image by digest
    regardless.
-5. **`make image` last ran on 2026-09-09.** Docker was unavailable for the 2026-10-04
+6. **`make image` last ran on 2026-09-09.** Docker was unavailable for the 2026-10-04
    verification.
-6. Items 1 and 2 of [What is NOT done](#what-is-not-done) still stand: there has been no
+7. Items 1 and 2 of [What is NOT done](#what-is-not-done) still stand: there has been no
    end-to-end run against real containers, and `make sdk-test` has never been executed.
 
 ### Build and deploy change log
@@ -374,7 +442,8 @@ column that a newer build adds is not applied to an existing volume.
 | Date | Commit | Change |
 |---|---|---|
 | 2026-10-04 | `ec4da83` | The `OPERATIONS.md` sample labels its pods and selectors `app.kubernetes.io/name: azure-gateway-api`, the label Wega's NetworkPolicies select. |
-| 2026-10-04 | The commit that added this section | This section: how Wega deploys the gateway, the configuration rules, the health semantics, the build facts and the update rule. |
+| 2026-10-04 | `656fa6b` | This section: how Wega deploys the gateway, the configuration rules, the health semantics, the build facts and the update rule. |
+| 2026-10-04 | The first commit after merge `887ecbf` | This section checked against orchestrator `c8ce603`: the upstream port is filled in as 5000. The ConfigMap and Secret wiring, the PVC, probes, resources, security context, network policies, the mocks' `/status` and `syncAnalyze`, and the staging and prod cells now match `ocr-cell` and `infra-mocks`. The fleet mismatch with vision is recorded. |
 
 ### Read next
 
@@ -383,6 +452,8 @@ column that a newer build adds is not applied to an existing volume.
 - The [README configuration tables](../README.md#configuration): every variable and its default.
 - [`TESTING.md`](TESTING.md) and [`CONTAINER-BEHAVIOUR.md`](CONTAINER-BEHAVIOUR.md).
 - `document-embedding-orchestrator/docs/deploy/SYSTEM-HANDOFF.md`: the whole system.
+- `document-embedding-orchestrator/deploy/openshift/components/ocr-cell/` and
+  `components/infra-mocks/`: the manifests this section describes.
 
 ---
 
