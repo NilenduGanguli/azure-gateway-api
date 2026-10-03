@@ -148,7 +148,14 @@ the length of the rollout.
 The repository deliberately ships no `k8s/` directory — Kubernetes and Helm manifests are an
 explicit non-goal in the [design spec](superpowers/specs/2026-09-08-azure-gateway-api-design.md),
 because a manifest that is not applied by CI rots. What follows is documentation: a working
-starting point to copy into whatever actually manages your cluster state.
+starting point to copy into whatever actually manages your cluster state. The Wega pipeline
+deploys from its own manifests instead, kept in the orchestrator repository; see
+[`HANDOFF.md` § Wega](HANDOFF.md#wega-build-and-deploy-facts).
+
+The pods are labelled `app.kubernetes.io/name: azure-gateway-api`, which is the label Wega's
+NetworkPolicies select. Earlier revisions of this sample used `app: azure-gateway-api`. A
+Deployment's `spec.selector` is immutable, so a Deployment created from the old sample has to
+be deleted and re-created to change it, not patched.
 
 ```yaml
 apiVersion: v1
@@ -217,7 +224,7 @@ metadata:
 spec:
   type: ClusterIP
   selector:
-    app: azure-gateway-api
+    app.kubernetes.io/name: azure-gateway-api
   ports:
     - name: http
       port: 8080
@@ -233,11 +240,12 @@ spec:
     type: Recreate         # never RollingUpdate: two pods must not share this volume
   selector:
     matchLabels:
-      app: azure-gateway-api
+      app.kubernetes.io/name: azure-gateway-api
   template:
     metadata:
       labels:
-        app: azure-gateway-api
+        # Wega's NetworkPolicies select exactly this label; keep it if Wega calls this gateway.
+        app.kubernetes.io/name: azure-gateway-api
     spec:
       # Must exceed SHUTDOWN_GRACE, which bounds connection draining *and* job draining.
       terminationGracePeriodSeconds: 60
