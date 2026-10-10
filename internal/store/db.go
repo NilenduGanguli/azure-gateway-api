@@ -81,40 +81,6 @@ type Job struct {
 	Figures string // comma-separated figure ids
 }
 
-const schema = `
-CREATE TABLE IF NOT EXISTS jobs (
-  id                TEXT PRIMARY KEY,
-  surface           TEXT NOT NULL,
-  model_id          TEXT NOT NULL DEFAULT '',
-  api_version       TEXT NOT NULL DEFAULT '',
-  status            TEXT NOT NULL,
-  created_at        INTEGER NOT NULL,
-  updated_at        INTEGER NOT NULL,
-  expires_at        INTEGER NOT NULL,
-  request_query     TEXT NOT NULL DEFAULT '',
-  content_type      TEXT NOT NULL DEFAULT '',
-  input_path        TEXT NOT NULL DEFAULT '',
-  input_bytes       INTEGER NOT NULL DEFAULT 0,
-  result_path       TEXT NOT NULL DEFAULT '',
-  result_bytes      INTEGER NOT NULL DEFAULT 0,
-  error_json        TEXT NOT NULL DEFAULT '',
-  attempts          INTEGER NOT NULL DEFAULT 0,
-  lease_owner       TEXT NOT NULL DEFAULT '',
-  lease_until       INTEGER NOT NULL DEFAULT 0,
-  upstream_mode     TEXT NOT NULL DEFAULT '',
-  upstream_op_url   TEXT NOT NULL DEFAULT '',
-  upstream_status   INTEGER NOT NULL DEFAULT 0,
-  upstream_ms       INTEGER NOT NULL DEFAULT 0,
-  client_request_id TEXT NOT NULL DEFAULT '',
-  has_pdf           INTEGER NOT NULL DEFAULT 0,
-  figures           TEXT NOT NULL DEFAULT '',
-  prefix            TEXT NOT NULL DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS jobs_status  ON jobs(status, created_at);
-CREATE INDEX IF NOT EXISTS jobs_expiry  ON jobs(expires_at);
-CREATE INDEX IF NOT EXISTS jobs_surface ON jobs(surface, status);
-`
-
 // Store owns the job database and the blob store.
 //
 // Writes go through a single connection. SQLite permits one writer at a time regardless, so
@@ -125,7 +91,12 @@ type Store struct {
 	r    *sql.DB
 	Blob *BlobStore
 	dir  string
+	// Migration records what Open did to the schema, for the startup log line.
+	Migration MigrationReport
 }
+
+// dbName is the job database's file name in DATA_DIR. Pre-migration backups are named after it.
+const dbName = "gateway.db"
 
 // Options configures Open.
 type Options struct {
@@ -135,11 +106,13 @@ type Options struct {
 	ReadPoolSize int
 }
 
-// Open prepares the data directory, opens the database, applies the schema, and returns a Store.
+// Open prepares the data directory, opens the database, migrates its schema to SchemaVersion, and
+// returns a Store. Store.Migration records what the migration did.
 //
 // It refuses to start on a network filesystem unless explicitly allowed: WAL depends on shared
 // memory and POSIX advisory locks that NFS, CIFS and friends do not provide reliably, and silent
-// corruption is a far worse outcome than a clear startup failure.
+// corruption is a far worse outcome than a clear startup failure. For the same reason it refuses a
+// database whose schema is newer than this binary's, which an image rollback leaves behind.
 func Open(opts Options) (*Store, error) {
 	if opts.ReadPoolSize <= 0 {
 		opts.ReadPoolSize = 8
@@ -159,7 +132,7 @@ func Open(opts Options) (*Store, error) {
 		return nil, err
 	}
 
-	dbPath := filepath.Join(opts.DataDir, "gateway.db")
+	dbPath := filepath.Join(opts.DataDir, dbName)
 
 	// synchronous=FULL on the writer: the 202 is a durability promise. Transactions survive an
 	// application crash under either setting, but only FULL survives node power loss.
@@ -174,9 +147,12 @@ func Open(opts Options) (*Store, error) {
 	w.SetMaxIdleConns(1)
 	w.SetConnMaxLifetime(0)
 
-	if _, err := w.Exec(schema); err != nil {
+	report, err := migrate(w, opts.DataDir)
+	if err != nil {
+		// Closing the writer also rolls back anything the failed migration left open, so the
+		// database stays exactly as it was found.
 		_ = w.Close()
-		return nil, fmt.Errorf("store: apply schema: %w", err)
+		return nil, err
 	}
 
 	r, err := sql.Open("sqlite", readDSN)
@@ -187,7 +163,7 @@ func Open(opts Options) (*Store, error) {
 	r.SetMaxOpenConns(opts.ReadPoolSize)
 	r.SetMaxIdleConns(opts.ReadPoolSize)
 
-	return &Store{w: w, r: r, Blob: blob, dir: opts.DataDir}, nil
+	return &Store{w: w, r: r, Blob: blob, dir: opts.DataDir, Migration: report}, nil
 }
 
 func dsn(path, sync string) string {
