@@ -161,13 +161,13 @@ same four.
 | `POST {fam}/documentModels/{modelId}:analyze` | 202 + `Operation-Location` | **owned**: 202 after the input is durable; the result comes from the sync upstream call |
 | `GET`/`HEAD {fam}/documentModels/{modelId}/analyzeResults/{resultId}` | operation status | **owned**: served from the PVC; `HEAD` behaves as recorded (below) |
 | `DELETE` same | 204 | **owned**: 204 |
-| `POST {fam}/documentModels/{modelId}:syncAnalyze` | 200 + result | **passthrough**, one attempt |
+| `POST {fam}/documentModels/{modelId}:syncAnalyze` | 200 + result | **owned**: the body is saved, then run through the splitting spec's engine (retries, splitting), and the answer is the 200 the container's sync route would give |
 | `GET …/analyzeResults/{resultId}/pdf`, `…/figures/{figureId}` | the file | **owned**: always 404 in the DI error shape the container uses for a missing result file, because no job ever has these files |
 | `GET {fam}/info`, `/documentModels`, `/documentModels/{modelId}` | metadata | **passthrough**, as today |
 | `GET {fam}/operations`, `/operations/{operationId}` | model-lifecycle operations, empty for layout | **passthrough** (new) |
 | `POST /vision/v3.2/read/analyze` | 202 + `Operation-Location` | **owned** |
 | `GET /vision/v3.2/read/analyzeResults/{operationId}` | operation status | **owned** |
-| `POST /vision/v3.2/read/syncAnalyze` | 200 + result | **passthrough**, one attempt |
+| `POST /vision/v3.2/read/syncAnalyze` | 200 + result | **owned**, as for DI `:syncAnalyze` |
 | `GET /ready`, `/status` | container health | **owned**: container-shaped bodies, aggregated over the configured upstreams, as today |
 | `GET /`, `/swagger`, `/swagger/{rest...}`, `/records/usage-logs`, `/records/usage-logs/{month}/{year}` | home page, swagger, usage records | **passthrough** (new) to the configured container, DI when both are configured. Usage records come from whichever pod HAProxy picks. |
 | `POST {fam}/documentModels/{modelId}:analyzeBatch`, `analyzeBatchResults…`, model build/compose/copy, `documentClassifiers…`, `:syncAnalyze/upstreamResult` | Azure-Blob-bound, n/a to layout, or container-internal | **not served**: documented exception |
@@ -279,7 +279,10 @@ refused at startup; the override is removed.
 - drops the dead columns `upstream_op_url`, `has_pdf`, `figures` and `upstream_mode`, using SQLite
   `ALTER TABLE … DROP COLUMN`; none of them is indexed;
 - adds `upstream_attempts INTEGER NOT NULL DEFAULT 0`, written at completion and shown on
-  `/_gw/jobs`.
+  `/_gw/jobs`;
+- adds `upstream_parts INTEGER NOT NULL DEFAULT 0`, the number of parts the job was analysed in
+  (1 = whole), defined by the
+  [splitting design](2026-10-10-large-document-splitting-design.md) and shown on `/_gw/jobs`.
 
 **Rule for future changes.** Every schema change is a new migration file. A test fails if the
 schema produced by running every migration from scratch differs from the schema produced by
@@ -487,4 +490,6 @@ scale-in does not cut work short. Work that is cut short is retried.
    - vision's KEDA ceilings are re-derived;
    - vision's third attempt stops asking for `markdown` / `ocrHighResolution` until those are
      proven;
+   - vision's own split-and-merge is **kept as is**, at the user's instruction. The gateway's
+     splitting composes with it;
    - the orchestrator's system handoff is updated.
