@@ -61,6 +61,10 @@ type Options struct {
 	// in an operation envelope. Which shape the real DI container returns is unverified, so both
 	// are testable.
 	SyncBodyBare bool
+	// SyncBody, when set, is the body a successful synchronous call answers, verbatim: a response
+	// recorded from a real container (a golden file), so the gateway can be compared with the
+	// container it stands in for on the container's own bytes rather than on the fake's.
+	SyncBody []byte
 	// PollsBeforeSuccess is how many polls report "running" before the operation completes.
 	PollsBeforeSuccess int
 	// WrongReplicaEvery makes every Nth poll answer 404, simulating a round-robin route landing
@@ -587,6 +591,10 @@ func (c *Container) serveSync(w http.ResponseWriter, r *http.Request, di bool) {
 	}
 	if c.opts.FailAnalysis {
 		c.writeSyncBody(w, failedEnvelope(di))
+		return
+	}
+	if c.opts.SyncBody != nil {
+		c.writeSyncBody(w, c.opts.SyncBody)
 		return
 	}
 	if c.opts.SyncBodyBare {

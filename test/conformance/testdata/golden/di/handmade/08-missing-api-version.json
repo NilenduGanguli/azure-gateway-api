@@ -1,0 +1,27 @@
+{
+  "request": {
+    "method": "POST",
+    "path": "/documentintelligence/documentModels/prebuilt-layout:analyze",
+    "query": "",
+    "contentType": "application/pdf"
+  },
+  "response": {
+    "status": 400,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Length": "512",
+      "Content-Type": "application/json; charset=utf-8",
+      "Server": "Kestrel"
+    },
+    "body": {
+      "error": {
+        "code": "InvalidArgument",
+        "message": "Invalid argument.",
+        "innererror": {
+          "code": "ParameterMissing",
+          "message": "The parameter api-version is required."
+        }
+      }
+    }
+  }
+}

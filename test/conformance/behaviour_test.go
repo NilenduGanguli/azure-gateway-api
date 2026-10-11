@@ -200,35 +200,6 @@ func TestDeleteResultPurgesEarly(t *testing.T) {
 	}
 }
 
-// TestSyncPassthroughStreamsBothWays checks that a synchronous client call goes straight to the
-// container and back, with nothing persisted.
-func TestSyncPassthroughStreamsBothWays(t *testing.T) {
-	h := newHarness(t, harnessOpts{
-		di:   mockazure.Options{Sync: mockazure.Sync200},
-		read: mockazure.Options{Sync: mockazure.Sync200},
-	})
-
-	for _, tc := range []struct{ name, path string }{
-		{"document intelligence", diSync},
-		{"computer vision read", readSync},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			resp := h.post(tc.path, "%PDF-1.7 fake")
-			defer func() { _ = resp.Body.Close() }()
-			if resp.StatusCode != http.StatusOK {
-				t.Fatalf("sync passthrough returned %d, want 200", resp.StatusCode)
-			}
-			body := decode(t, resp)
-			if body["analyzeResult"] == nil && body["modelId"] == nil {
-				t.Errorf("passthrough body carries no result: %v", body)
-			}
-			if resp.Header.Get("Operation-Location") != "" {
-				t.Error("synchronous response carries Operation-Location; there is no operation to poll")
-			}
-		})
-	}
-}
-
 // TestUpstreamAPIKeyIsInjected checks that the gateway authenticates upstream with its own key
 // while requiring nothing from the client.
 func TestUpstreamAPIKeyIsInjected(t *testing.T) {

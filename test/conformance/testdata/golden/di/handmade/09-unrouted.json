@@ -1,0 +1,17 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/documentintelligence/nope",
+    "query": "",
+    "contentType": ""
+  },
+  "response": {
+    "status": 404,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Length": "0",
+      "Server": "Kestrel"
+    },
+    "body": null
+  }
+}

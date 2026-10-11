@@ -1,0 +1,16 @@
+{
+  "request": {
+    "method": "DELETE",
+    "path": "/documentintelligence/documentModels/prebuilt-layout/analyzeResults/<guid>",
+    "query": "api-version=2024-11-30",
+    "contentType": ""
+  },
+  "response": {
+    "status": 204,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Server": "Kestrel"
+    },
+    "body": null
+  }
+}
