@@ -181,10 +181,11 @@ type tally struct {
 }
 
 // attempt counts one call to Azure and remembers the status a failed one was answered with: the
-// status that explains a failed job is its failing call's, not a sibling part's 200.
+// status that explains a failed job is its failing call's, not a sibling part's 200, nor that of
+// a sibling the failure cancelled after its headers had arrived.
 func (t *tally) attempt(a upstream.Attempt) {
 	t.attempts.Add(1)
-	if a.Outcome != upstream.Success && a.Status != 0 {
+	if a.Outcome != upstream.Success && a.Outcome != upstream.Cancelled && a.Status != 0 {
 		t.status.Store(int64(a.Status))
 	}
 }
