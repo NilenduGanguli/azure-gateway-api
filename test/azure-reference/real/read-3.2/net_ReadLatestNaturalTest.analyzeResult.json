@@ -1,0 +1,120 @@
+{
+  "version": "3.2.0",
+  "modelVersion": "2021-04-12",
+  "readResults": [
+    {
+      "page": 1,
+      "angle": 2.2026,
+      "width": 250,
+      "height": 258,
+      "unit": "pixel",
+      "lines": [
+        {
+          "boundingBox": [
+            63,
+            41,
+            104,
+            41,
+            104,
+            59,
+            63,
+            60
+          ],
+          "text": "520",
+          "appearance": {
+            "style": {
+              "name": "other",
+              "confidence": 0.878
+            }
+          },
+          "words": [
+            {
+              "boundingBox": [
+                66,
+                41,
+                100,
+                41,
+                100,
+                60,
+                66,
+                60
+              ],
+              "text": "520",
+              "confidence": 0.997
+            }
+          ]
+        },
+        {
+          "boundingBox": [
+            121,
+            32,
+            201,
+            36,
+            200,
+            57,
+            120,
+            53
+          ],
+          "text": "WEST",
+          "appearance": {
+            "style": {
+              "name": "other",
+              "confidence": 0.878
+            }
+          },
+          "words": [
+            {
+              "boundingBox": [
+                122,
+                32,
+                199,
+                36,
+                197,
+                58,
+                120,
+                53
+              ],
+              "text": "WEST",
+              "confidence": 0.994
+            }
+          ]
+        },
+        {
+          "boundingBox": [
+            58,
+            103,
+            201,
+            108,
+            200,
+            139,
+            57,
+            133
+          ],
+          "text": "Seattle",
+          "appearance": {
+            "style": {
+              "name": "other",
+              "confidence": 0.878
+            }
+          },
+          "words": [
+            {
+              "boundingBox": [
+                61,
+                103,
+                199,
+                109,
+                199,
+                140,
+                59,
+                134
+              ],
+              "text": "Seattle",
+              "confidence": 0.936
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,172 @@
+{
+  "source": "test_layout_multipage_table_span_pdf.recording.json",
+  "exchanges": [
+    {
+      "index": 0,
+      "method": "POST",
+      "uri": "https://Sanitized.cognitiveservices.azure.com/documentintelligence/documentModels/prebuilt-layout:analyze?api-version=2024-11-30",
+      "requestHeaders": {
+        "Accept": "application/json",
+        "Content-Length": "650176",
+        "Content-Type": "application/octet-stream"
+      },
+      "status": 202,
+      "responseHeaders": {
+        "apim-request-id": "f9a49330-f1a0-496e-ab74-7bb001731579",
+        "Content-Length": "0",
+        "Date": "Tue, 17 Dec 2024 20:49:22 GMT",
+        "Operation-Location": "https://fakeendpoint.cognitiveservices.azure.com/documentintelligence/documentModels/prebuilt-layout/analyzeResults/f9a49330-f1a0-496e-ab74-7bb001731579?api-version=2024-11-30",
+        "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
+        "X-Content-Type-Options": "nosniff",
+        "x-envoy-upstream-service-time": "88",
+        "x-ms-region": "East US"
+      },
+      "responseBody": null
+    },
+    {
+      "index": 1,
+      "method": "GET",
+      "uri": "https://Sanitized.cognitiveservices.azure.com/documentintelligence/documentModels/prebuilt-layout/analyzeResults/f9a49330-f1a0-496e-ab74-7bb001731579?api-version=2024-11-30",
+      "requestHeaders": {
+        "Accept": "*/*"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "apim-request-id": "ac4ab437-cc78-4907-9701-8c6686f6f980",
+        "Content-Length": "106",
+        "Content-Type": "application/json; charset=utf-8",
+        "Date": "Tue, 17 Dec 2024 20:49:22 GMT",
+        "Retry-After": "1",
+        "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
+        "X-Content-Type-Options": "nosniff",
+        "x-envoy-upstream-service-time": "22",
+        "x-ms-region": "East US"
+      },
+      "responseBody": {
+        "status": "running",
+        "createdDateTime": "2024-12-17T20:49:22Z",
+        "lastUpdatedDateTime": "2024-12-17T20:49:22Z"
+      }
+    },
+    {
+      "index": 2,
+      "method": "GET",
+      "uri": "https://Sanitized.cognitiveservices.azure.com/documentintelligence/documentModels/prebuilt-layout/analyzeResults/f9a49330-f1a0-496e-ab74-7bb001731579?api-version=2024-11-30",
+      "requestHeaders": {
+        "Accept": "*/*"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "apim-request-id": "20d04268-2881-4da6-b2ed-4a298e2b0ee5",
+        "Content-Length": "106",
+        "Content-Type": "application/json; charset=utf-8",
+        "Date": "Tue, 17 Dec 2024 20:49:23 GMT",
+        "Retry-After": "1",
+        "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
+        "X-Content-Type-Options": "nosniff",
+        "x-envoy-upstream-service-time": "28",
+        "x-ms-region": "East US"
+      },
+      "responseBody": {
+        "status": "running",
+        "createdDateTime": "2024-12-17T20:49:22Z",
+        "lastUpdatedDateTime": "2024-12-17T20:49:22Z"
+      }
+    },
+    {
+      "index": 3,
+      "method": "GET",
+      "uri": "https://Sanitized.cognitiveservices.azure.com/documentintelligence/documentModels/prebuilt-layout/analyzeResults/f9a49330-f1a0-496e-ab74-7bb001731579?api-version=2024-11-30",
+      "requestHeaders": {
+        "Accept": "*/*"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "apim-request-id": "b14b76f2-800c-428a-83a1-227c6e9a42fc",
+        "Content-Length": "106",
+        "Content-Type": "application/json; charset=utf-8",
+        "Date": "Tue, 17 Dec 2024 20:49:24 GMT",
+        "Retry-After": "1",
+        "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
+        "X-Content-Type-Options": "nosniff",
+        "x-envoy-upstream-service-time": "32",
+        "x-ms-region": "East US"
+      },
+      "responseBody": {
+        "status": "running",
+        "createdDateTime": "2024-12-17T20:49:22Z",
+        "lastUpdatedDateTime": "2024-12-17T20:49:22Z"
+      }
+    },
+    {
+      "index": 4,
+      "method": "GET",
+      "uri": "https://Sanitized.cognitiveservices.azure.com/documentintelligence/documentModels/prebuilt-layout/analyzeResults/f9a49330-f1a0-496e-ab74-7bb001731579?api-version=2024-11-30",
+      "requestHeaders": {
+        "Accept": "*/*"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "apim-request-id": "c875eac6-c484-42aa-bc6c-a7462ff51799",
+        "Content-Length": "106",
+        "Content-Type": "application/json; charset=utf-8",
+        "Date": "Tue, 17 Dec 2024 20:49:25 GMT",
+        "Retry-After": "1",
+        "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
+        "X-Content-Type-Options": "nosniff",
+        "x-envoy-upstream-service-time": "25",
+        "x-ms-region": "East US"
+      },
+      "responseBody": {
+        "status": "running",
+        "createdDateTime": "2024-12-17T20:49:22Z",
+        "lastUpdatedDateTime": "2024-12-17T20:49:24Z"
+      }
+    },
+    {
+      "index": 5,
+      "method": "GET",
+      "uri": "https://Sanitized.cognitiveservices.azure.com/documentintelligence/documentModels/prebuilt-layout/analyzeResults/f9a49330-f1a0-496e-ab74-7bb001731579?api-version=2024-11-30",
+      "requestHeaders": {
+        "Accept": "*/*"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "apim-request-id": "05693657-1f9e-474e-b188-a1f2e797e6ba",
+        "Content-Length": "106",
+        "Content-Type": "application/json; charset=utf-8",
+        "Date": "Tue, 17 Dec 2024 20:49:26 GMT",
+        "Retry-After": "1",
+        "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
+        "X-Content-Type-Options": "nosniff",
+        "x-envoy-upstream-service-time": "32",
+        "x-ms-region": "East US"
+      },
+      "responseBody": {
+        "status": "running",
+        "createdDateTime": "2024-12-17T20:49:22Z",
+        "lastUpdatedDateTime": "2024-12-17T20:49:24Z"
+      }
+    },
+    {
+      "index": 6,
+      "method": "GET",
+      "uri": "https://Sanitized.cognitiveservices.azure.com/documentintelligence/documentModels/prebuilt-layout/analyzeResults/f9a49330-f1a0-496e-ab74-7bb001731579?api-version=2024-11-30",
+      "requestHeaders": {
+        "Accept": "*/*"
+      },
+      "status": 200,
+      "responseHeaders": {
+        "apim-request-id": "d5822079-3c33-4b6e-9c67-233a36836fa1",
+        "Content-Length": "155696",
+        "Content-Type": "application/json; charset=utf-8",
+        "Date": "Tue, 17 Dec 2024 20:49:27 GMT",
+        "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
+        "X-Content-Type-Options": "nosniff",
+        "x-envoy-upstream-service-time": "47",
+        "x-ms-region": "East US"
+      },
+      "responseBody": "<see py_layout_multipage_table_span_pdf.envelope.json>"
+    }
+  ]
+}

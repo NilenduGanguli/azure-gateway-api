@@ -1,0 +1,156 @@
+{
+  "source": "ReadPdfFileInStreamTest.json",
+  "exchanges": [
+    {
+      "index": 0,
+      "method": "POST",
+      "uri": "/vision/v3.2/read/analyze?model-version=latest&readingOrder=basic",
+      "requestHeaders": {
+        "Content-Type": [
+          "application/octet-stream"
+        ],
+        "Content-Length": [
+          "54714"
+        ]
+      },
+      "status": 202,
+      "responseHeaders": {
+        "Operation-Location": [
+          "https://westus.api.cognitive.microsoft.com/vision/v3.2/read/analyzeResults/a5d84602-3f8d-4031-a7c4-86fb8c2268df"
+        ],
+        "x-envoy-upstream-service-time": [
+          "30"
+        ],
+        "CSP-Billing-Usage": [
+          "CognitiveServices.ComputerVision.Transaction=1"
+        ],
+        "apim-request-id": [
+          "a5d84602-3f8d-4031-a7c4-86fb8c2268df"
+        ],
+        "Strict-Transport-Security": [
+          "max-age=31536000; includeSubDomains; preload"
+        ],
+        "x-content-type-options": [
+          "nosniff"
+        ],
+        "Date": [
+          "Thu, 04 Nov 2021 05:53:55 GMT"
+        ],
+        "Content-Length": [
+          "0"
+        ]
+      },
+      "responseBody": ""
+    },
+    {
+      "index": 1,
+      "method": "GET",
+      "uri": "/vision/v3.2/read/analyzeResults/a5d84602-3f8d-4031-a7c4-86fb8c2268df",
+      "requestHeaders": {},
+      "status": 200,
+      "responseHeaders": {
+        "x-envoy-upstream-service-time": [
+          "23"
+        ],
+        "CSP-Billing-Usage": [
+          "CognitiveServices.ComputerVision.Transaction=1"
+        ],
+        "apim-request-id": [
+          "db5a9c93-620f-4981-b97d-5f9d67e63dc3"
+        ],
+        "Strict-Transport-Security": [
+          "max-age=31536000; includeSubDomains; preload"
+        ],
+        "x-content-type-options": [
+          "nosniff"
+        ],
+        "Date": [
+          "Thu, 04 Nov 2021 05:53:55 GMT"
+        ],
+        "Content-Length": [
+          "106"
+        ],
+        "Content-Type": [
+          "application/json; charset=utf-8"
+        ]
+      },
+      "responseBody": {
+        "status": "running",
+        "createdDateTime": "2021-11-04T05:53:55Z",
+        "lastUpdatedDateTime": "2021-11-04T05:53:55Z"
+      }
+    },
+    {
+      "index": 2,
+      "method": "GET",
+      "uri": "/vision/v3.2/read/analyzeResults/a5d84602-3f8d-4031-a7c4-86fb8c2268df",
+      "requestHeaders": {},
+      "status": 200,
+      "responseHeaders": {
+        "x-envoy-upstream-service-time": [
+          "12"
+        ],
+        "CSP-Billing-Usage": [
+          "CognitiveServices.ComputerVision.Transaction=1"
+        ],
+        "apim-request-id": [
+          "30a58424-73f2-4e5e-a950-89efdf329d9e"
+        ],
+        "Strict-Transport-Security": [
+          "max-age=31536000; includeSubDomains; preload"
+        ],
+        "x-content-type-options": [
+          "nosniff"
+        ],
+        "Date": [
+          "Thu, 04 Nov 2021 05:53:56 GMT"
+        ],
+        "Content-Length": [
+          "106"
+        ],
+        "Content-Type": [
+          "application/json; charset=utf-8"
+        ]
+      },
+      "responseBody": {
+        "status": "running",
+        "createdDateTime": "2021-11-04T05:53:55Z",
+        "lastUpdatedDateTime": "2021-11-04T05:53:55Z"
+      }
+    },
+    {
+      "index": 3,
+      "method": "GET",
+      "uri": "/vision/v3.2/read/analyzeResults/a5d84602-3f8d-4031-a7c4-86fb8c2268df",
+      "requestHeaders": {},
+      "status": 200,
+      "responseHeaders": {
+        "x-envoy-upstream-service-time": [
+          "18"
+        ],
+        "CSP-Billing-Usage": [
+          "CognitiveServices.ComputerVision.Transaction=1"
+        ],
+        "apim-request-id": [
+          "608833dc-4ba7-42d2-8d8e-4c715885f29c"
+        ],
+        "Strict-Transport-Security": [
+          "max-age=31536000; includeSubDomains; preload"
+        ],
+        "x-content-type-options": [
+          "nosniff"
+        ],
+        "Date": [
+          "Thu, 04 Nov 2021 05:53:57 GMT"
+        ],
+        "Content-Length": [
+          "20550"
+        ],
+        "Content-Type": [
+          "application/json; charset=utf-8"
+        ]
+      },
+      "responseBody": "<see net_ReadPdfFileInStreamTest.envelope.json>"
+    }
+  ]
+}
