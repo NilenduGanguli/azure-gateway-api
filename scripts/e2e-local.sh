@@ -9,7 +9,7 @@
 #   2. the official Azure SDKs (test/sdk/run.sh), including 23-page PDFs that are split and merged;
 #   3. split jobs by curl: multi-page PDFs through both surfaces, merged page-exact, with the parts
 #      visible in /_gw/jobs and /_gw/metrics;
-#   4. gateway probe --compare-split on generated PDFs, when this build's probe has that mode.
+#   4. gateway probe --compare-split on generated PDFs: no page-level difference, split or whole.
 #
 # Then it stops the gateway with SIGTERM, checks it shut down cleanly, and prints a summary.
 #
@@ -584,26 +584,21 @@ end
 
 section "4. gateway probe --compare-split"
 
-# The mode lands with the probe work (plan T13). Its flag name is in the binary once it exists,
-# which is a cheaper and safer test than running an older probe that would ignore the argument
-# and probe the fakes instead.
-if grep -aq -- 'compare-split' "$BIN/gateway"; then
-  begin "gateway probe --compare-split on 7, 12 and 23-page PDFs -> no page-level difference"
-  mkdir -p "$WORK/probe-data"
-  env -i PATH="$PATH" HOME="${HOME:-/tmp}" TMPDIR="${TMPDIR:-/tmp}" \
-    DATA_DIR="$WORK/probe-data" DI_UPSTREAM_URL="$DI_UP" READ_UPSTREAM_URL="$READ_UP" \
-    SPLIT_PAGES=5 PROBE_TIMEOUT=2m \
-    "$BIN/gateway" probe --compare-split "$PDFS" >"$WORK/compare.log" 2>&1
-  rc=$?
-  sed 's/^/        /' "$WORK/compare.log" | tail -n 25
-  [ "$rc" = 0 ] || fail "exit status $rc"
-  [ -s "$PDFS/compare-report.json" ] || fail "no compare-report.json written"
-  AZURE=0
-  : >"$H"
-  end
-else
-  skip "gateway probe --compare-split: this build's probe has no such mode yet"
-fi
+# The splitting go-live measurement (splitting spec §6): every PDF analysed whole and split, the
+# results diffed, and any page-level difference fails the probe.
+begin "gateway probe --compare-split on 7, 12 and 23-page PDFs -> no page-level difference"
+mkdir -p "$WORK/probe-data"
+env -i PATH="$PATH" HOME="${HOME:-/tmp}" TMPDIR="${TMPDIR:-/tmp}" \
+  DATA_DIR="$WORK/probe-data" DI_UPSTREAM_URL="$DI_UP" READ_UPSTREAM_URL="$READ_UP" \
+  SPLIT_PAGES=5 PROBE_TIMEOUT=2m \
+  "$BIN/gateway" probe --compare-split "$PDFS" >"$WORK/compare.log" 2>&1
+rc=$?
+sed 's/^/        /' "$WORK/compare.log" | tail -n 25
+[ "$rc" = 0 ] || fail "exit status $rc"
+[ -s "$PDFS/compare-report.json" ] || fail "no compare-report.json written"
+AZURE=0
+: >"$H"
+end
 
 # ------------------------------------------------------------------------------- shutdown
 
