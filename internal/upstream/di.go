@@ -434,24 +434,6 @@ func resourceScoped404(e *azerr.APIError) bool {
 	return e.Code == azerr.CodeNotFound && e.Message != ""
 }
 
-// looksLikeMissingEndpoint reports whether a 500 is really "this route does not exist".
-func looksLikeMissingEndpoint(e *azerr.APIError) bool {
-	if e == nil {
-		return false
-	}
-	hay := strings.ToLower(e.Code + " " + e.Message + " " + e.InnerCode + " " + e.InnerMsg)
-	for _, needle := range []string{
-		"unhandledendpointexception",
-		"no candidates found for the request path",
-		"request did not match any endpoints",
-	} {
-		if strings.Contains(hay, needle) {
-			return true
-		}
-	}
-	return false
-}
-
 func isSyncUnavailable(err error) bool {
 	return err == ErrSyncUnavailable
 }
