@@ -1,0 +1,24 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/swagger/v1/swagger.json",
+    "query": "",
+    "contentType": ""
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Length": "94",
+      "Content-Type": "application/json; charset=utf-8",
+      "Server": "Kestrel"
+    },
+    "body": {
+      "openapi": "3.0.1",
+      "info": {
+        "title": "Document Intelligence",
+        "version": "2024-11-30"
+      },
+      "paths": {}
+    }
+  }
+}

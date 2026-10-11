@@ -1,0 +1,19 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/ready",
+    "query": "",
+    "contentType": ""
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Length": "17",
+      "Content-Type": "application/json; charset=utf-8",
+      "Server": "Kestrel"
+    },
+    "body": {
+      "ready": "ready"
+    }
+  }
+}

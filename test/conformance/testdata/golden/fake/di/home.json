@@ -1,0 +1,17 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/",
+    "query": "",
+    "contentType": ""
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Length": "156",
+      "Content-Type": "text/html; charset=utf-8",
+      "Server": "Kestrel"
+    },
+    "body": "<!DOCTYPE html><html><head><title>Document Intelligence container</title></head><body><h1>The Document Intelligence container is running.</h1></body></html>"
+  }
+}

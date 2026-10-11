@@ -1,0 +1,22 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/vision/v3.2/read/analyzeResults/not-a-guid",
+    "query": "",
+    "contentType": ""
+  },
+  "response": {
+    "status": 404,
+    "headers": {
+      "Content-Length": "137",
+      "Content-Type": "application/json; charset=utf-8",
+      "Server": "Kestrel"
+    },
+    "body": {
+      "error": {
+        "code": "BadArgument",
+        "message": "Operation ID is invalid, expired or the results matching this operationId have been deleted."
+      }
+    }
+  }
+}

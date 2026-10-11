@@ -1,0 +1,16 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/vision/v3.2/read/operations/<guid>",
+    "query": "",
+    "contentType": ""
+  },
+  "response": {
+    "status": 404,
+    "headers": {
+      "Content-Length": "0",
+      "Server": "Kestrel"
+    },
+    "body": ""
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "request": {
+    "method": "DELETE",
+    "path": "/documentintelligence/documentModels/prebuilt-layout/analyzeResults/<guid>",
+    "query": "",
+    "contentType": ""
+  },
+  "response": {
+    "status": 204,
+    "headers": {
+      "Server": "Kestrel"
+    },
+    "body": ""
+  }
+}

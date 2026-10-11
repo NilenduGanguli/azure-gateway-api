@@ -1,0 +1,17 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/swagger",
+    "query": "",
+    "contentType": ""
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Length": "106",
+      "Content-Type": "text/html; charset=utf-8",
+      "Server": "Kestrel"
+    },
+    "body": "<!DOCTYPE html><html><head><title>Swagger UI</title></head><body><div id=\"swagger-ui\"></div></body></html>"
+  }
+}

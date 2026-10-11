@@ -1,0 +1,17 @@
+{
+  "request": {
+    "method": "HEAD",
+    "path": "/documentintelligence/documentModels/prebuilt-layout/analyzeResults/<guid>",
+    "query": "",
+    "contentType": ""
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Length": "2771",
+      "Content-Type": "application/json; charset=utf-8",
+      "Server": "Kestrel"
+    },
+    "body": ""
+  }
+}

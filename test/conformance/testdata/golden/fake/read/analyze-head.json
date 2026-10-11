@@ -1,0 +1,17 @@
+{
+  "request": {
+    "method": "HEAD",
+    "path": "/vision/v3.2/read/analyzeResults/<guid>",
+    "query": "",
+    "contentType": ""
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Length": "563",
+      "Content-Type": "application/json; charset=utf-8",
+      "Server": "Kestrel"
+    },
+    "body": ""
+  }
+}

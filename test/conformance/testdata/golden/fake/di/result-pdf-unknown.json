@@ -1,0 +1,17 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/documentintelligence/documentModels/prebuilt-layout/analyzeResults/<guid>/pdf",
+    "query": "api-version=2024-11-30",
+    "contentType": ""
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Length": "31",
+      "Content-Type": "application/pdf",
+      "Server": "Kestrel"
+    },
+    "body": "%PDF-1.7\n% fake searchable pdf\n"
+  }
+}

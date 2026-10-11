@@ -1,0 +1,20 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/status",
+    "query": "",
+    "contentType": ""
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Length": "60",
+      "Content-Type": "application/json; charset=utf-8",
+      "Server": "Kestrel"
+    },
+    "body": {
+      "apiStatus": "Valid",
+      "apiStatusMessage": "Api key is valid."
+    }
+  }
+}

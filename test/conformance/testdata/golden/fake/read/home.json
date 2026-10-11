@@ -1,0 +1,17 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/",
+    "query": "",
+    "contentType": ""
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Length": "154",
+      "Content-Type": "text/html; charset=utf-8",
+      "Server": "Kestrel"
+    },
+    "body": "<!DOCTYPE html><html><head><title>Computer Vision Read container</title></head><body><h1>The Computer Vision Read container is running.</h1></body></html>"
+  }
+}
