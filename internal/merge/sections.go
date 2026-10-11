@@ -9,27 +9,36 @@ import (
 	"io"
 	"os"
 	"strconv"
-	"strings"
 
 	"github.com/NilenduGanguli/azure-gateway-api/internal/jsonx"
 )
 
-// Sections are the one array the merge cannot simply concatenate. Every part's sections[0] is a
-// root covering the whole of that part, and a document has one root. So the merged root is built
-// from the parts' roots — their elements in order, and one span from part 0's root start to the
-// last root's end — and the parts' other sections follow it in part order, renumbered so that
-// part k's section i ≥ 1 becomes secBase[k] + i − 1.
+// Sections are the one array the merge cannot simply concatenate. Every part's sections[0] is the
+// root of that part's section tree, and a document has one root. So the merged root is built from
+// the parts' roots — their elements in order, and their spans shifted into the merged content —
+// and the parts' other sections follow it in part order, renumbered so that part k's section
+// i ≥ 1 becomes secBase[k] + i − 1.
 //
-// A part without sections contributes none, which is only right when it has no content either.
-// If part 0 has none while a later part does, the whole document's root could not be told from
-// the parts; if a later part has content but no sections while part 0 has them, its paragraphs
-// would be in no section and the root's span would not cover them. Both are check failures.
+// A root's spans cover the text its sections hold, not the whole part: the service leaves page
+// headers, footers and page numbers out of every section, and a blank page's empty text too, so a
+// real root often stops short of its part's end or comes in several spans
+// (py_layout_multipage_transform's root is [{0,301},{303,319}] around its blank second page).
+// The merged root therefore keeps every root's own spans, shifted, and joins two of them only
+// where nothing but the page separator lies between: the earlier root runs to the end of its
+// part, the next part's root starts at its beginning, and the two parts are adjacent. That is
+// what the service does within a document — where only a separator lies between, its spans run
+// on (py_layout_multipage_table_span_pdf's root is one span over both pages) — and it never
+// covers furniture the service left out.
 //
-// The merged root's span is written by the merge, not copied, so every root's spans are decoded
-// strictly (readSpans) and must fit its part's content. A root that is one span over the whole
-// part is also the service's own measure of that part's content, and it must equal the gateway's
-// (checkRootSpans): there the merge sees how the service counts the unit, before it shifts every
-// offset by its own count.
+// A part whose leading content has no heading continues the section the parts before it left
+// open, and is folded into that section rather than given one of its own (continue.go).
+//
+// A part without sections contributes none, which is only right when it has no content either: a
+// run of blank pages. If any part has sections, a part with content but none would leave its
+// paragraphs in no section, and that is a check failure.
+//
+// The merged root's spans are written by the merge, not copied, so every root's spans are decoded
+// strictly (readSpans) and must lie within its part's content (checkRootSpans).
 
 // root is a part's root section: its members in order, with their raw values.
 type root struct {
@@ -236,25 +245,27 @@ func nextByte(k int, f io.ReaderAt, off, end int64) (byte, int64, error) {
 	return 0, 0, checkf("part %d: sections ends after the root section", k)
 }
 
-// checkSections refuses parts whose sections cannot make the document's: part 0 without sections
-// while a later part has them, or a later part with content but no sections while part 0 has
-// them. A part with no content has nothing a section could hold, and may have none.
+// checkSections refuses parts whose sections cannot make the document's: a part with content but
+// no sections while another part has them. A part with no content has nothing a section could
+// hold, and may have none.
 //
 // It then reads every part's root section, which the merged root is built from, and checks its
 // spans (checkRootSpans). Roots are small, and reading them all before anything is written lets
 // a bad one fail the merge while the output is still empty.
 func (m *merger) checkSections() error {
-	if m.parts[0].counts["sections"] == 0 {
-		for _, p := range m.parts[1:] {
-			if p.counts["sections"] > 0 {
-				return checkf("part 0 has no sections but part %d does", p.k)
-			}
+	var with *part
+	for _, p := range m.parts {
+		if p.counts["sections"] > 0 {
+			with = p
+			break
 		}
+	}
+	if with == nil {
 		return nil
 	}
-	for _, p := range m.parts[1:] {
+	for _, p := range m.parts {
 		if p.counts["sections"] == 0 && p.length > 0 {
-			return checkf("part %d has content but no sections, while part 0 has them", p.k)
+			return checkf("part %d has content but no sections, while part %d has them", p.k, with.k)
 		}
 	}
 	for _, p := range m.parts {
@@ -277,26 +288,14 @@ func (m *merger) checkSections() error {
 		m.with = append(m.with, p)
 		m.roots = append(m.roots, r)
 	}
-	// m.with[0] is part 0: the first check let no part have sections unless part 0 has them.
-	if len(m.roots[0].spans) == 0 {
-		for j, r := range m.roots[1:] {
-			if len(r.spans) > 0 {
-				return checkf("part 0's root section has no span to start the merged root's, "+
-					"but part %d's has", m.with[j+1].k)
-			}
-		}
-	}
 	return nil
 }
 
-// checkRootSpans decodes a part's root spans and checks them against the part's content.
-//
-// Every span must lie within the content. A part with content must have a span, since its root is
-// what the merged root's span is built from. And a single span from offset 0 is the service's
-// length of the content in the unit, which must be the gateway's: the service and the gateway
-// segment text with different Unicode versions (uniseg implements 15.0; a .NET runtime may
-// implement 15.1, whose rule GB9c joins Devanagari conjuncts into one grapheme cluster), and
-// where they disagree every offset the merge shifts past that part would be wrong.
+// checkRootSpans decodes a part's root spans and checks them against the part's content: every
+// span must lie within it, and a part with content must have one, since its root's spans are what
+// the merged root's are built from. Reaching past the content is the one way a root can show that
+// the service counts the unit differently from the gateway; the pages' spans are the check for
+// that (measureContent), since a root rarely covers the whole part.
 func (m *merger) checkRootSpans(p *part, r *root) error {
 	if v, ok := r.get("spans"); ok {
 		var err error
@@ -309,11 +308,6 @@ func (m *merger) checkRootSpans(p *part, r *root) error {
 			return checkf("part %d has content but its root section has no span", p.k)
 		}
 		return nil
-	}
-	if s := r.spans[0]; len(r.spans) == 1 && s.offset == 0 && s.length != p.length {
-		return checkf("part %d: the root section spans %d %v, but the content is %d long: "+
-			"the service counts %v differently from the gateway",
-			p.k, s.length, m.unit, p.length, m.unit)
 	}
 	if _, end := r.extent(); end > p.length {
 		return checkf("part %d: the root section's spans reach %d %v, past the content's %d: "+
@@ -344,34 +338,21 @@ func (m *merger) writeSections(bw *bufio.Writer) error {
 		return err
 	}
 	total := 1
-	prefix := []jsonx.PathElem{{Key: "sections"}}
-	for i, p := range m.with {
-		want := p.counts["sections"] - 1
-		if want == 0 {
+	for _, p := range m.with {
+		if p.counts["sections"] == 1 {
 			continue
 		}
-		if m.roots[i].rest < 0 {
-			return checkf("part %d: %d sections counted, but none after the root", p.k, want+1)
-		}
-		mb, _, _ := p.member("sections")
-		bw.WriteByte(',')
-		var n int
-		err := withFile(p, func(f *os.File) error {
-			// The sections after the root, read as an array of their own: an opening bracket,
-			// then the original bytes from section 1 to the closing bracket.
-			rest := io.MultiReader(strings.NewReader("["),
-				io.NewSectionReader(f, m.roots[i].rest, mb.End-m.roots[i].rest))
-			var err error
-			n, err = m.items(bw, p, rest, prefix, p.secBase)
-			return err
-		})
+		secs, err := readSections(p)
 		if err != nil {
 			return err
 		}
-		if n != want {
-			return checkf("part %d: %d sections after the root, %d counted", p.k, n, want)
+		for i := 1 + p.secDrop; i < len(secs); i++ {
+			bw.WriteByte(',')
+			if err := m.writeSection(bw, p, i, secs[i], total); err != nil {
+				return err
+			}
+			total++
 		}
-		total += n
 	}
 	bw.WriteByte(']')
 	m.stats.Counts["sections"] = total
@@ -379,8 +360,8 @@ func (m *merger) writeSections(bw *bufio.Writer) error {
 }
 
 // writeRoot writes the merged root: members in an order that keeps every root's own, as the
-// result's members are ordered (mergeOrder); elements from every root in order; one span over all
-// of them; anything else from the first root that has it.
+// result's members are ordered (mergeOrder); elements from every root in order; every root's
+// spans, shifted (writeRootSpans); anything else from the first root that has it.
 func (m *merger) writeRoot(bw *bufio.Writer) error {
 	lists := make([][]string, len(m.roots))
 	for j, r := range m.roots {
@@ -425,56 +406,54 @@ func (m *merger) writeRoot(bw *bufio.Writer) error {
 	return nil
 }
 
+// writeRootElements writes the merged root's elements: every root's in part order, less what
+// continues an earlier part's section.
 func (m *merger) writeRootElements(bw *bufio.Writer) error {
-	prefix := []jsonx.PathElem{{Key: "sections"}, {IsIndex: true}, {Key: "elements"}}
-	bw.WriteByte('[')
-	total := 0
+	var lists []continuation
 	for j, r := range m.roots {
-		v, ok := r.get("elements")
-		if !ok {
-			continue
-		}
 		p := m.with[j]
-		n, err := jsonx.CountItems(bytes.NewReader(v), 0, int64(len(v)))
-		if err != nil {
-			return jsonErr(p.k, "root section elements", err)
-		}
-		if n == 0 {
+		v, ok := r.get("elements")
+		if !ok || p.rootMoved {
 			continue
 		}
-		if total > 0 {
-			bw.WriteByte(',')
+		if p.secDrop > 0 {
+			var err error
+			if v, err = withoutFirst(p.k, v); err != nil {
+				return err
+			}
 		}
-		if _, err := m.items(bw, p, bytes.NewReader(v), prefix, total); err != nil {
-			return err
-		}
-		total += n
+		lists = append(lists, continuation{p: p, elements: v})
 	}
-	bw.WriteByte(']')
-	return nil
+	return m.writeElements(bw, lists,
+		[]jsonx.PathElem{{Key: "sections"}, {IsIndex: true}, {Key: "elements"}})
 }
 
-// writeRootSpans writes the merged root's single span: from where part 0's root starts to where
-// the last root with a span ends, in merged offsets. checkSections made sure that part 0's root
-// has a span if any root does, and that every span lies within its part's content, so the end is
-// never before the start.
+// writeRootSpans writes the merged root's spans: every root's in part order, shifted into merged
+// offsets, a part's first span joined to the span before it where only the page separator lies
+// between them (appendSpans). A root whose content continues an earlier part's section gives its
+// spans to that section instead.
 func (m *merger) writeRootSpans(bw *bufio.Writer) {
-	last := -1
+	var out []span
 	for j, r := range m.roots {
-		if len(r.spans) > 0 {
-			last = j
+		if p := m.with[j]; !p.rootMoved {
+			out = m.appendSpans(out, p, r.spans)
 		}
 	}
-	if last < 0 {
-		bw.WriteString("[]")
-		return
+	writeSpans(bw, out)
+}
+
+// writeSpans writes spans compactly, as the service does.
+func writeSpans(bw *bufio.Writer, spans []span) {
+	bw.WriteByte('[')
+	for i, s := range spans {
+		if i > 0 {
+			bw.WriteByte(',')
+		}
+		bw.WriteString(`{"offset":`)
+		bw.WriteString(strconv.Itoa(s.offset))
+		bw.WriteString(`,"length":`)
+		bw.WriteString(strconv.Itoa(s.length))
+		bw.WriteByte('}')
 	}
-	start, _ := m.roots[0].extent() // part 0's offsets are the merged ones
-	_, end := m.roots[last].extent()
-	end += m.with[last].char
-	bw.WriteString(`[{"offset":`)
-	bw.WriteString(strconv.Itoa(start))
-	bw.WriteString(`,"length":`)
-	bw.WriteString(strconv.Itoa(end - start))
-	bw.WriteString(`}]`)
+	bw.WriteByte(']')
 }

@@ -61,10 +61,14 @@ func validPages(k int, pages []int) error {
 // measurePart reads a part's shape in one walk: its members, the item count of each array and
 // the page numbers of its page array. Its content is then read again to be measured as text.
 func (m *merger) measurePart(p *part, f, f0 io.ReaderAt) error {
-	pages := &pageCollector{k: p.k, array: m.prof.pageArray, key: m.prof.pageKey}
+	pages := &pageCollector{k: p.k, array: m.prof.pageArray, key: m.prof.pageKey, spanEnd: -1}
+	heads := &headingCollector{}
 	members, err := jsonx.VisitMembers(f, p.Start, p.End, func(name string) jsonx.Visitor {
-		if name == m.prof.pageArray {
+		switch {
+		case name == m.prof.pageArray:
 			return pages.visit
+		case m.prof.di && name == "paragraphs":
+			return heads.visit
 		}
 		return nil
 	})
@@ -104,6 +108,8 @@ func (m *merger) measurePart(p *part, f, f0 io.ReaderAt) error {
 			p.k, m.prof.pageArray, len(pages.pages), m.prof.pageKey)
 	}
 	p.pages = pages.pages
+	p.pageEnd = pages.spanEnd
+	p.heads = heads.heads
 
 	if m.prof.di {
 		if err := m.measureContent(p, f); err != nil {
@@ -118,14 +124,29 @@ func (m *merger) measurePart(p *part, f, f0 io.ReaderAt) error {
 
 // pageCollector reads the page number of every item of a part's page array, in order, as the
 // array is walked. Every item must carry exactly one.
+//
+// It also finds where the pages' text ends as the service measures it: the furthest end,
+// offset + length, of any span of any page. Document Intelligence lays content out page by page
+// and gives every page a span over its text, a blank page an empty one, so that end is the
+// content's length in the unit — in every real result, whatever the page holds outside its
+// sections (headers, footers, page numbers) and whatever the format.
 type pageCollector struct {
 	k          int
 	array, key string
 	pages      []int
 	bad        error // the first check failure
+
+	spanEnd int    // the furthest end of a page span, or -1 before one is read whole
+	at      [2]int // the page and span index of the span being read
+	off, n  int    // its offset and length, as far as they have been read
+	have    int    // bit 0: its offset was read, bit 1: its length
 }
 
 func (c *pageCollector) visit(path []jsonx.PathElem, kind jsonx.Kind, raw []byte) ([]byte, bool) {
+	if len(path) == 5 && path[1].IsIndex && isKey(path[2], "spans") && path[3].IsIndex {
+		c.span(path, kind, raw)
+		return nil, false
+	}
 	if c.bad != nil || len(path) != 3 || !path[1].IsIndex || !isKey(path[2], c.key) {
 		return nil, false
 	}
@@ -142,6 +163,28 @@ func (c *pageCollector) visit(path []jsonx.PathElem, kind jsonx.Kind, raw []byte
 		c.pages = append(c.pages, v)
 	}
 	return nil, false
+}
+
+// span reads one scalar of a page span. An offset or length that is not a canonical integer is
+// not counted here; the visitor refuses such an offset when it shifts it.
+func (c *pageCollector) span(path []jsonx.PathElem, kind jsonx.Kind, raw []byte) {
+	if at := [2]int{path[1].Index, path[3].Index}; at != c.at {
+		c.at, c.have = at, 0
+	}
+	v, ok := parseIndex(raw)
+	if kind != jsonx.Number || !ok {
+		return
+	}
+	switch {
+	case isKey(path[4], "offset"):
+		c.off, c.have = v, c.have|1
+	case isKey(path[4], "length"):
+		c.n, c.have = v, c.have|2
+	}
+	if c.have == 3 {
+		c.spanEnd = max(c.spanEnd, c.off+c.n)
+		c.have = 0
+	}
 }
 
 // measureContent decodes a part's content to measure it in the unit. Parts are a few pages, so
@@ -166,6 +209,26 @@ func (m *merger) measureContent(p *part, f io.ReaderAt) error {
 	p.length = textunit.Len(s, m.unit)
 	p.endsCR = strings.HasSuffix(s, "\r")
 	p.lt = ltEvidence(raw)
+	return nil
+}
+
+// checkPageSpans is the unit self-check. The service and the gateway segment text with different
+// Unicode versions (uniseg implements 15.0; a .NET runtime may implement 15.1, whose rule GB9c
+// joins Devanagari conjuncts into one grapheme cluster), and where they disagree every offset the
+// merge shifts past a part would be wrong. The end of a part's page spans is the service's own
+// measure of its content (pageCollector), so it must be the gateway's before anything is shifted.
+func (m *merger) checkPageSpans() error {
+	for _, p := range m.parts {
+		switch {
+		case p.pageEnd < 0 && p.length > 0:
+			return checkf("part %d has content but none of its pages has a span: "+
+				"the merge cannot tell how the service counts %v", p.k, m.unit)
+		case p.pageEnd >= 0 && p.pageEnd != p.length:
+			return checkf("part %d: its pages' spans end at %d %v, but the content is %d long: "+
+				"the service counts %v differently from the gateway",
+				p.k, p.pageEnd, m.unit, p.length, m.unit)
+		}
+	}
 	return nil
 }
 
@@ -303,7 +366,9 @@ func (m *merger) shift(sepLen int) {
 		}
 		p.secBase = sec
 		if n := p.counts["sections"]; n > 0 {
-			sec += n - 1 // every part has its own root; only the merged root survives
+			// Every part has its own root, and only the merged root survives; a section 1 that
+			// continues an earlier part's section is folded into it.
+			sec += n - 1 - p.secDrop
 		}
 	}
 }

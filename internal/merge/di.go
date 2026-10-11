@@ -35,6 +35,9 @@ func DI(w io.Writer, parts []Part, unit textunit.Unit) (Stats, error) {
 	if err := m.checkSections(); err != nil {
 		return Stats{}, err
 	}
+	if err := m.planContinuations(); err != nil {
+		return Stats{}, err
+	}
 	sep, sepLen, err := m.separator()
 	if err != nil {
 		return Stats{}, err
@@ -47,6 +50,9 @@ func DI(w io.Writer, parts []Part, unit textunit.Unit) (Stats, error) {
 				return Stats{}, checkf("part %d: content ends with CR, which joins the page separator", p.k)
 			}
 		}
+	}
+	if err := m.checkPageSpans(); err != nil {
+		return Stats{}, err
 	}
 	m.sep = sep
 	m.shift(sepLen)
@@ -229,9 +235,14 @@ func (v *diVisitor) pointer(kind jsonx.Kind, raw []byte) ([]byte, bool) {
 		return v.fail("element pointer %s is past the part's %d %s", raw, own, name)
 	}
 	j := i + v.p.ptrBase[which]
-	if which == ptrSections && i > 0 {
-		j = v.p.secBase + i - 1
-	} else if which == ptrSections {
+	switch {
+	case which == ptrSections && i > 0 && i <= v.p.secDrop:
+		// Only the root points at a section 1 that was folded away, and the merged root leaves
+		// that pointer out.
+		return v.fail("element pointer %s names a section folded into an earlier part's", raw)
+	case which == ptrSections && i > 0:
+		j = v.p.secBase + i - 1 - v.p.secDrop
+	case which == ptrSections:
 		j = 0
 	}
 	if j == i {

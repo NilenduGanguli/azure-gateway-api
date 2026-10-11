@@ -17,6 +17,7 @@ import (
 
 	"github.com/NilenduGanguli/azure-gateway-api/internal/docgen"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/merge"
+	"github.com/NilenduGanguli/azure-gateway-api/internal/realcut"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/textunit"
 )
 
@@ -266,7 +267,7 @@ func TestDIChecks(t *testing.T) {
 				}
 				return b
 			})
-		}, 0, "part 0 has no sections but part 1 does"},
+		}, 0, "part 0 has content but no sections, while part 1 has them"},
 		// Strings longer than jsonx.MaxVisitString are not shown to the merge's visitor; where it
 		// must see a value, one is refused rather than copied unrenumbered.
 		{"element pointer too long to visit", func(t *testing.T) []merge.Part {
@@ -367,41 +368,49 @@ func TestDIChecks(t *testing.T) {
 			})
 		}, 0, "part 1 has content but its root section has no span"},
 
-		// The unit self-check: a root span over the whole part is the service's own measure of
-		// the part's content, which must be the gateway's.
+		// A root that reaches past its part's content cannot be the service's: it counts the unit
+		// differently from the gateway.
 		rootSpansCase("root span longer than the content", `[{"offset":0,"length":159}]`,
-			"part 1: the root section spans 159 textElements, but the content is 158 long: "+
+			"part 1: the root section's spans reach 159 textElements, past the content's 158: "+
 				"the service counts textElements differently from the gateway"),
-		{"root span shorter than the content, in code points", func(t *testing.T) []merge.Part {
+		rootSpansCase("root span reaching past the content", `[{"offset":1,"length":158}]`,
+			"part 1: the root section's spans reach 159 textElements, past the content's 158: "+
+				"the service counts textElements differently from the gateway"),
+
+		// The unit self-check: the end of a part's page spans is the service's own measure of its
+		// content, which must be the gateway's.
+		{"pages end before the content, in code points", func(t *testing.T) []merge.Part {
 			opts := docgen.Options{Unit: textunit.UnicodeCodePoint}
 			var parts []merge.Part
 			for i, pages := range two {
 				b := docgen.DI(pages, docgen.Local, opts)
 				if i == 1 {
-					b = withRootSpans(t, b, func(n int) string {
-						return fmt.Sprintf(`[{"offset":0,"length":%d}]`, n-1)
-					})
+					b = withLastPageSpan(t, b, -1)
 				}
 				parts = append(parts, writePart(t, b, pages, false))
 			}
 			return parts
-		}, textunit.UnicodeCodePoint, "the service counts unicodeCodePoint differently from the gateway"},
-		rootSpansCase("root span reaching past the content", `[{"offset":1,"length":158}]`,
-			"part 1: the root section's spans reach 159 textElements, past the content's 158: "+
-				"the service counts textElements differently from the gateway"),
+		}, textunit.UnicodeCodePoint, "part 1: its pages' spans end at 169 unicodeCodePoint, but the " +
+			"content is 170 long: the service counts unicodeCodePoint differently from the gateway"},
+		{"pages end past the content", func(t *testing.T) []merge.Part {
+			return diParts(t, two, func(i int, b []byte) []byte {
+				if i == 0 {
+					return withLastPageSpan(t, b, 2)
+				}
+				return b
+			})
+		}, 0, "part 0: its pages' spans end at 151 textElements, but the content is 149 long"},
+		{"pages without spans", func(t *testing.T) []merge.Part {
+			return diParts(t, two, func(i int, b []byte) []byte {
+				if i == 1 {
+					return withoutPageSpans(t, b)
+				}
+				return b
+			})
+		}, 0, "part 1 has content but none of its pages has a span"},
 
 		// Member names are written as the merge read them, so one written with an escape would
 		// come out spelt differently. The service never escapes a name.
-		{"empty first part's root has no span, a later one's has", func(t *testing.T) []merge.Part {
-			blank := []byte(`{"apiVersion":"2024-11-30","modelId":"prebuilt-layout","stringIndexType":"textElements",` +
-				`"content":"","pages":[{"pageNumber":1,"spans":[{"offset":0,"length":0}]}],` +
-				`"sections":[{"elements":[]}],"contentFormat":"text"}`)
-			return []merge.Part{
-				writePart(t, blank, []int{1}, false),
-				writePart(t, docgen.DI([]int{2, 3}, docgen.Local, docgen.Options{}), []int{2, 3}, false),
-			}
-		}, 0, "part 0's root section has no span to start the merged root's, but part 1's has"},
-
 		{"escaped member name in a later part", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
 				if i == 1 {
@@ -468,6 +477,34 @@ func withRootSpans(t *testing.T, b []byte, spans func(n int) string) []byte {
 		t.Fatal(err)
 	}
 	return rootSpan.ReplaceAllLiteral(b, []byte(`"sections":[{"spans":`+spans(n)+`,`))
+}
+
+// withLastPageSpan changes the length of the last page's last span by delta.
+func withLastPageSpan(t *testing.T, b []byte, delta int) []byte {
+	t.Helper()
+	r, err := realcut.Parse(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pages := realcut.Items(r.Get("pages"))
+	spans := realcut.Items(pages[len(pages)-1].Get("spans"))
+	last := spans[len(spans)-1]
+	n, _ := last.Get("length").Int()
+	last.Set("length", realcut.NumNode(n+delta))
+	return realcut.Encode(r)
+}
+
+// withoutPageSpans drops every page's spans member.
+func withoutPageSpans(t *testing.T, b []byte) []byte {
+	t.Helper()
+	r, err := realcut.Parse(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range realcut.Items(r.Get("pages")) {
+		p.Del("spans")
+	}
+	return realcut.Encode(r)
 }
 
 // withoutRootSpans drops the root section's spans member from a docgen result.
@@ -583,13 +620,26 @@ func TestReadChecks(t *testing.T) {
 	}
 }
 
-// markdownPart builds a minimal markdown DI part by hand: one page span per page, and a paragraph
-// per page whose span the merge has to shift past the page-break separators.
+// markdownPart builds a minimal markdown DI part by hand: one page span per page, the last ending
+// where the content does, and a paragraph per page whose span the merge has to shift past the
+// page-break separators. The content is ASCII, so its length is its decoded byte count.
 func markdownPart(content string, pages int) []byte {
+	var decoded string
+	if err := json.Unmarshal([]byte(`"`+content+`"`), &decoded); err != nil {
+		panic(err)
+	}
 	var ps, paras []string
 	for i := 0; i < pages; i++ {
-		ps = append(ps, fmt.Sprintf(`{"pageNumber":%d,"spans":[{"offset":%d,"length":4}]}`, i+1, i*24))
-		paras = append(paras, fmt.Sprintf(`{"content":"# P","spans":[{"offset":%d,"length":3}]}`, i*24))
+		off, n := i*24, 4
+		if i == pages-1 {
+			off = max(0, len(decoded)-4)
+			if pages == 1 {
+				off = 0
+			}
+			n = len(decoded) - off
+		}
+		ps = append(ps, fmt.Sprintf(`{"pageNumber":%d,"spans":[{"offset":%d,"length":%d}]}`, i+1, off, n))
+		paras = append(paras, fmt.Sprintf(`{"content":"# P","spans":[{"offset":%d,"length":3}]}`, off))
 	}
 	return []byte(`{"apiVersion":"2024-11-30","modelId":"prebuilt-layout","stringIndexType":"textElements",` +
 		`"content":"` + content + `","pages":[` + strings.Join(ps, ",") + `],"paragraphs":[` +
@@ -811,9 +861,12 @@ func TestPartWithoutSectionsContributesNothing(t *testing.T) {
 	if got := strings.Join(r.Sections[0].Elements, " "); got != "/sections/1 /sections/2 /sections/3 /sections/4" {
 		t.Errorf("root elements %s", got)
 	}
-	if sp := r.Sections[0].Spans; len(sp) != 1 || sp[0].Offset != 0 ||
-		sp[0].Length != textunit.Len(r.Content, textunit.TextElements) {
-		t.Errorf("root spans %+v", sp)
+	// The root leaves the blank page out, as the service's own root does around a blank page:
+	// one span up to the end of page 2, the next from page 4 to the end.
+	end := textunit.Len(r.Content, textunit.TextElements)
+	if sp := r.Sections[0].Spans; len(sp) != 2 || sp[0].Offset != 0 || sp[0].Length != want-1 ||
+		sp[1].Offset != want+1 || sp[1].Offset+sp[1].Length != end {
+		t.Errorf("root spans %+v, want [{0 %d} {%d %d}]", sp, want-1, want+1, end-want-1)
 	}
 	// Section 3 is page 4's: its first element must be page 4's heading.
 	var idx int
@@ -847,13 +900,16 @@ func TestRootMembersKeepEveryPartsOrder(t *testing.T) {
 	}
 }
 
-// TestRootOfSeveralSpans: a root whose spans are not one span over the whole part says nothing
-// about how the service counts, so it is not self-checked; the merged root still runs from part
-// 0's root start to the last root's end.
+// TestRootOfSeveralSpans: the merged root keeps every part's root spans, shifted, and joins a
+// part's first span to the previous part's last only where nothing but the page separator lies
+// between them.
 func TestRootOfSeveralSpans(t *testing.T) {
 	runs := [][]int{{1, 2, 3}, {4, 5, 6}}
 	whole := docgen.DI(pageRange(1, 6), docgen.Original, docgen.Options{})
 	total := textunit.Len(decodedContent(t, whole), textunit.TextElements)
+	first := textunit.Len(decodedContent(t, docgen.DI(runs[0], docgen.Local, docgen.Options{})),
+		textunit.TextElements)
+	second := first + 1 // where part 1 starts, after the separator
 	for _, tc := range []struct {
 		name  string
 		part  int
@@ -862,10 +918,19 @@ func TestRootOfSeveralSpans(t *testing.T) {
 	}{
 		{"later root in two spans", 1, func(n int) string {
 			return fmt.Sprintf(`[ {"length":100, "offset":0}, {"offset":100,"length":%d} ]`, n-100)
-		}, fmt.Sprintf(`[{"offset":0,"length":%d}]`, total)},
+		}, fmt.Sprintf(`[{"offset":0,"length":%d},{"offset":%d,"length":%d}]`,
+			second+100, second+100, total-second-100)},
 		{"first root starting late", 0, func(n int) string {
 			return fmt.Sprintf(`[{"offset":2,"length":%d}]`, n-2)
 		}, fmt.Sprintf(`[{"offset":2,"length":%d}]`, total-2)},
+		{"first root stopping short, as before a page footer", 0, func(n int) string {
+			return fmt.Sprintf(`[{"offset":0,"length":%d}]`, n-5)
+		}, fmt.Sprintf(`[{"offset":0,"length":%d},{"offset":%d,"length":%d}]`,
+			first-5, second, total-second)},
+		{"later root starting late, as after a page header", 1, func(n int) string {
+			return fmt.Sprintf(`[{"offset":3,"length":%d}]`, n-3)
+		}, fmt.Sprintf(`[{"offset":0,"length":%d},{"offset":%d,"length":%d}]`,
+			first, second+3, total-second-3)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			parts := diParts(t, runs, func(i int, b []byte) []byte {
@@ -881,6 +946,39 @@ func TestRootOfSeveralSpans(t *testing.T) {
 			want := withRootSpans(t, whole, func(int) string { return tc.want })
 			sameBytes(t, out.Bytes(), want)
 		})
+	}
+}
+
+// TestBlankFirstPartWithoutSections: a part of blank pages has no content and no sections, and
+// that is as true of the first part as of any other. The merged root is built from the parts that
+// have one, and starts where the first of them does.
+func TestBlankFirstPartWithoutSections(t *testing.T) {
+	blank := []byte(`{"apiVersion":"2024-11-30","modelId":"prebuilt-layout","stringIndexType":"textElements",` +
+		`"content":"","pages":[{"pageNumber":1,"angle":0,"width":8.5,"height":11,"unit":"inch",` +
+		`"words":[],"lines":[],"spans":[{"offset":0,"length":0}]}],"contentFormat":"text"}`)
+	parts := []merge.Part{
+		writePart(t, blank, []int{1}, false),
+		writePart(t, docgen.DI([]int{2, 3}, docgen.Local, docgen.Options{}), []int{2, 3}, false),
+	}
+	var out bytes.Buffer
+	if _, err := merge.DI(&out, parts, 0); err != nil {
+		t.Fatal(err)
+	}
+	var r struct {
+		Content  string
+		Sections []struct {
+			Spans []struct{ Offset, Length int }
+		}
+	}
+	if err := json.Unmarshal(out.Bytes(), &r); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(r.Content, "\nHeading P2") {
+		t.Fatalf("content %q does not start with the blank page and a separator", r.Content)
+	}
+	end := textunit.Len(r.Content, textunit.TextElements)
+	if sp := r.Sections[0].Spans; len(sp) != 1 || sp[0].Offset != 1 || sp[0].Length != end-1 {
+		t.Errorf("root spans %+v, want one span from 1 to %d", sp, end)
 	}
 }
 

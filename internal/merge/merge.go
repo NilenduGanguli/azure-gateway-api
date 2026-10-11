@@ -22,8 +22,8 @@
 // not contradict each other; member names written without escapes, so that they can be written
 // back byte for byte; the pages returned covering the planned pages once each, in order;
 // sections in every part with content, or in none; root section spans that are exactly offsets
-// and lengths within their part's content and, where one spans a whole part, measure it in the
-// unit as the gateway does. References that can only be judged in place — a pointer past its
+// and lengths within their part's content; and pages whose spans end where the content does as
+// the gateway measures it in the unit, which is the service's own measure of the content. References that can only be judged in place — a pointer past its
 // part's items, a region on a page outside its part, an offset that is not an integer — are
 // checked as they are copied. A failure wraps ErrCheck, and the caller discards the output and
 // analyses the whole document instead, so a split never produces a result the service would not.
@@ -101,12 +101,19 @@ type part struct {
 	isArray []bool         // parallel to members
 	counts  map[string]int // items in each array member
 	pages   []int          // page numbers as the part's result gives them, in order
+	pageEnd int            // the furthest end of its pages' spans, -1 if they have none
 	local   bool           // numbered 1..len(Pages), as a physically split part is
 
 	// Document Intelligence only.
-	length int     // content length in the unit
-	endsCR bool    // content ends with CR, which would join the separator's LF
-	lt     ltStyle // how the content writes '<' and '>', if it shows
+	length int          // content length in the unit
+	endsCR bool         // content ends with CR, which would join the separator's LF
+	lt     ltStyle      // how the content writes '<' and '>', if it shows
+	heads  map[int]bool // the paragraphs whose role is title or sectionHeading
+
+	// How the part's leading content continues the section open before it (continue.go): its
+	// section 1 folded into that section (secDrop 1), or its root's content moved into it.
+	secDrop   int
+	rootMoved bool
 
 	// Shifts, set once every part is measured.
 	char    int              // content length of all earlier parts, separators included
@@ -152,9 +159,11 @@ type merger struct {
 	sep   []byte          // the raw page separator between parts' content
 	stats Stats
 
-	// Document Intelligence only: the parts with sections, and their root sections, in order.
+	// Document Intelligence only: the parts with sections, and their root sections, in order; and
+	// the continuations folded into each section they continue (continue.go).
 	with  []*part
 	roots []*root
+	folds map[sectionAt][]continuation
 
 	// Reused across parts so that measuring hundreds of them allocates nothing per part.
 	cmpA, cmpB []byte
@@ -163,7 +172,7 @@ type merger struct {
 
 func newMerger(prof profile, unit textunit.Unit) *merger {
 	return &merger{
-		prof: prof, unit: unit, array: map[string]bool{},
+		prof: prof, unit: unit, array: map[string]bool{}, folds: map[sectionAt][]continuation{},
 		cmpA: make([]byte, 4<<10), cmpB: make([]byte, 4<<10),
 		stats: Stats{Counts: map[string]int{}},
 	}
