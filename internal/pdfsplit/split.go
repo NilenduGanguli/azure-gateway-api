@@ -161,7 +161,8 @@ func (s *Splitter) parse(ctx context.Context, path string, deadline time.Time) (
 }
 
 // readPDF parses rs under c, which is ctx bounded by the document's deadline. A failure of rs
-// itself is returned as such: an I/O error is not the document's fault.
+// itself is returned as such, whatever pdfcpu made of it: an I/O error is not the document's
+// fault.
 func readPDF(ctx, c context.Context, rs io.ReadSeeker) (*model.Context, error) {
 	src := &errReader{rs: rs}
 	var pdf *model.Context
@@ -179,7 +180,13 @@ func readPDF(ctx, c context.Context, rs io.ReadSeeker) (*model.Context, error) {
 		delete(pdf.Names, "Dests")
 		return nil
 	})
-	if err != nil && src.err != nil && ctx.Err() == nil {
+	if src.err != nil {
+		// Never accept a parse that lost a read, even one pdfcpu calls a success: in relaxed
+		// validation it logs and skips an object it fails to load, so a page can lose its content
+		// and the part reach Azure blank.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr // cancellation is classified first, as everywhere
+		}
 		return nil, fmt.Errorf("pdfsplit: read: %w", src.err)
 	}
 	if err != nil {

@@ -637,3 +637,62 @@ func TestWritePartStaysFailedAfterAPanic(t *testing.T) {
 		t.Fatalf("%d slots held after closing the failed document", n)
 	}
 }
+
+// objectFailingReader fails every read that starts at one offset, where pdfcpu seeks to load an
+// object, and serves every other read normally. onFail, if set, runs as the read fails.
+type objectFailingReader struct {
+	*bytes.Reader
+	at     int64
+	err    error
+	onFail func()
+}
+
+func (r *objectFailingReader) Read(p []byte) (int, error) {
+	if pos, _ := r.Reader.Seek(0, io.SeekCurrent); pos == r.at {
+		if r.onFail != nil {
+			r.onFail()
+		}
+		return 0, r.err
+	}
+	return r.Reader.Read(p)
+}
+
+// TestReadPDFNeverAcceptsAParseThatLostARead is a regression test. In relaxed validation pdfcpu
+// logs and skips an object it fails to load, so an I/O error inside one object left it nil and
+// the parse succeeded: losing page 10's content stream gave a part with a blank page 10, which
+// Azure would have analysed as empty.
+func TestReadPDFNeverAcceptsAParseThatLostARead(t *testing.T) {
+	data := pdftest.Make(12)
+	ioErr := errors.New("input/output error")
+	for _, object := range []string{
+		"23 0 obj", // page 10's content stream
+		"6 0 obj",  // page 2's page object
+	} {
+		at := bytes.Index(data, []byte("\n"+object+"\n"))
+		if at < 0 {
+			t.Fatalf("fixture has no %q", object)
+		}
+		src := &objectFailingReader{Reader: bytes.NewReader(data), at: int64(at + 1), err: ioErr}
+		ctx := context.Background()
+		pdf, err := readPDF(ctx, ctx, src)
+		if !errors.Is(err, ioErr) {
+			pages := -1
+			if pdf != nil {
+				pages = pdf.PageCount
+			}
+			t.Errorf("a read failing at %q: readPDF = %v (pages %d), want the reader's error", object, err, pages)
+		}
+		if errors.Is(err, ErrUnparseable) {
+			t.Errorf("a read failing at %q was blamed on the document: %v", object, err)
+		}
+	}
+
+	// A caller that gives up as the read fails still hears about its own cancellation first.
+	at := bytes.Index(data, []byte("\n23 0 obj\n")) + 1
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	src := &objectFailingReader{Reader: bytes.NewReader(data), at: int64(at), err: ioErr, onFail: cancel}
+	if _, err := readPDF(ctx, ctx, src); err != context.Canceled {
+		t.Errorf("a read failing as the caller cancels: readPDF = %v, want context.Canceled", err)
+	}
+}
