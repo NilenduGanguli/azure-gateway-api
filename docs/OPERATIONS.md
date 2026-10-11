@@ -333,8 +333,10 @@ spec:
 - **`pod-concurrent-connections`** is enforced by each router replica on its own. With pods that
   take 2 analyses at a time and 2 router replicas, set `1`: each replica sends a pod at most one
   call, so the pod sees at most two. Calls over the cap wait in HAProxy's queue and then get a
-  503, which the gateway retries with backoff (`status_503`) **while keeping its slot**, so an
-  overloaded deployment slows the gateway down instead of being hammered.
+  503, which the gateway retries with backoff (`status_503`), honouring any `Retry-After`, so
+  each job backs away from an overloaded deployment. The backing-off job gives its scheduler slot
+  back meanwhile, so the gateway keeps up to `MAX_INFLIGHT` calls open; size that against what the
+  pods can take, not higher.
 - **`balance: leastconn`** sends each call to the pod with the fewest open calls. Analyses vary from
   2 seconds to many minutes, so round-robin would stack calls behind one slow document.
 - **The Azure pods** need `terminationGracePeriodSeconds` at least as long as the slowest
@@ -790,7 +792,7 @@ of a `:syncAnalyze` sees its connection close, exactly as it would with a real p
 |---|---|---|
 | Admission | `MAX_INFLIGHT + QUEUE_DEPTH` per surface | From accepting a submit (or a client `:syncAnalyze`) until it is terminal. Exhausting it produces a `429`. |
 | Workers | `MAX_INFLIGHT` per surface | Jobs actually running. |
-| Scheduler slots | `MAX_INFLIGHT` per surface | One call to the Azure pods — whole document, part, hedge or re-check — including the backoff before its retry. Shared fairly between jobs: waiting jobs take turns, round-robin. |
+| Scheduler slots | `MAX_INFLIGHT` per surface | One call to the Azure pods — whole document, part, hedge or re-check — for that call alone: the backoff before a retry holds none. Shared fairly between jobs: waiting jobs take turns, round-robin. |
 | Split slots | 2, both surfaces together | Parsing and cutting one PDF. |
 | Metadata lane | 4 per surface | One GET relay, 10 s at most. |
 

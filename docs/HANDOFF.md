@@ -588,7 +588,7 @@ Do not "fix" these without reading the reason.
 |---|---|
 | A container's `202` is drained and retried, never polled | With autoscaled pods behind HAProxy, the operation lives only on the pod that answered, and a poll would land anywhere. The stored input makes a retry cheap and correct |
 | Every attempt opens a new connection | So HAProxy balances each attempt on its own and a retry can reach a different pod. Keep-alive would pin retries to the pod that just failed |
-| A job keeps its scheduler slot while it backs off | That is what makes a deployment answering 503 slow the gateway down. Releasing it would let newcomers hit the same overloaded pods |
+| A job gives its scheduler slot back while it backs off | A slot bounds calls into the pods, and a job that is waiting out a backoff is not calling. Holding the slot would idle capacity that another job's parts could use; the backing-off job is still slowed by its own backoff and `Retry-After`. The sync-only spec §1 asked for the opposite; the splitting design's per-call scheduler replaced it |
 | Parts time out after 60 s while whole documents get 15 minutes | A 3–5 page part normally takes 2 s; a hung pod should cost a minute. A whole document is unknown work |
 | A terminal error on a part is re-checked against the original instead of failing the job | A splitting artefact must never fail a good document; Azure's answer about the original is the one that counts |
 | A merge check failure re-analyses the whole document instead of failing | The client asked for an analysis, not a merge. Whole is always correct |

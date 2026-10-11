@@ -427,9 +427,12 @@ Before attempt *n*+1 the engine waits a random duration between 50% and 100% of
 response replaces that wait, capped at 60s. Waiting stops early when the context ends. The jitter
 source is injected, so tests are deterministic.
 
-**A job keeps its scheduler slot while it backs off.** A deployment that answers 503 therefore
-lowers the gateway's request rate with no extra mechanism, and a job's retries cannot be overtaken
-by a newcomer that would hit the same overloaded pods.
+**A job gives its scheduler slot back while it backs off.** Each attempt is `Acquire`, one
+`Client.Do`, release; the wait before the next attempt holds no slot, so another job's call can use
+it. A deployment answering 503 slows each job down through that job's own backoff and
+`Retry-After`, while the gateway keeps up to `MAX_INFLIGHT` calls open. (The sync-only spec §1
+asked a job to keep its slot through backoff; the splitting design's per-call scheduler replaced
+that rule.)
 
 ### 4.3 The engine: whole or split
 
@@ -516,7 +519,7 @@ context. Each part attempt is one `:syncAnalyze` with the part PDF as the body
 | Retriable outcome (rows 5–8) | up to **3 attempts** per part at its current size (`PartAttempts`), with the backoff of §4.2 |
 | Still failing after 3 | **halve** the part: the first half is `ceil(n/2)` pages, re-cut from the part's own PDF, and each half gets 3 fresh attempts: 5 → 3+2 → 2+1 / 1+1 → single pages |
 | A single page exhausts its attempts | the job fails with that attempt's error, as the whole document would have |
-| Terminal outcome (rows 3, 9, 10) | **re-check against the original**: send the *original* file with `pages=<this part's original pages>` and the whole-document timeout. If that succeeds, its result is used — a splitting artefact can never fail a good document. If it fails terminally too, the job fails with **that** error, Azure's own answer about the original |
+| Terminal outcome (rows 3, 9, 10) | **re-check against the original**: send the *original* file with `pages=<this part's original pages>` under the whole-document rules (timeout, up to 5 attempts, at most 2 in the `RetryOnce` class), so a transient 503 during a re-check does not fail the job. If that succeeds, its result is used — a splitting artefact can never fail a good document. If it fails terminally too, the job fails with **that** error, Azure's own answer about the original |
 | Route not served (row 4) | the job fails at once: a deployment fault |
 | Cancelled (row 1) | every part attempt is cancelled; the job stays `running` for recovery |
 
@@ -812,7 +815,9 @@ ${DATA_DIR}/work/sync-<id>/        a client :syncAnalyze in flight
 ```
 
 `newWorkdir` empties a folder left by an earlier run of the same job first, since its parts may
-come from a different plan. Every file is written through `writeFile`, which removes it again on
+come from a different plan. It keeps the job's own input when that lives in the folder, as a
+`:syncAnalyze` body does, matched by file identity rather than name; an `:analyze` input lives in
+the blob store and is never inside it. Every file is written through `writeFile`, which removes it again on
 any error, because a cut or a merge that fails may have written part of its output. A job's folder
 is removed when `Run` returns, unless the output lives in it — then
 `Output.Cleanup` removes it once `finish` has copied the result into the blob store. Nothing in a
@@ -866,7 +871,7 @@ Per configured surface, unless stated otherwise:
 |---|---|---|---|---|
 | `admits` | `MAX_INFLIGHT + QUEUE_DEPTH` | at admission (`Admit`), non-blocking, by `:analyze` submits **and** client `:syncAnalyze` calls | by the worker in `run`'s defer, by the sync handler on return, or by `submit` on any failure before the 202 is written — `committed` is set only once `Enqueue` succeeds, so the deferred release also covers the post-commit `Enqueue` failure, where the row stays valid and recovery picks it up | bounds accepted-but-unfinished work. With the default `QUEUE_DEPTH=0` a submit is refused the moment every worker is busy |
 | `workers` | `MAX_INFLIGHT` goroutines | — | — | how many jobs actually run at once |
-| scheduler slots (`sched`) | `MAX_INFLIGHT` | `Acquire` (blocking, fair across jobs) for every call to Azure — whole, part, re-check; `TryAcquireIdle` for a hedge | when that call returns, on every path; held through backoff | bounds concurrent calls into the Azure pods, however many parts a job fans out into and however many sync clients arrive |
+| scheduler slots (`sched`) | `MAX_INFLIGHT` | `Acquire` (blocking, fair across jobs) for every call to Azure — whole, part, re-check; `TryAcquireIdle` for a hedge | when that call returns, on every path; never held through backoff | bounds concurrent calls into the Azure pods, however many parts a job fans out into and however many sync clients arrive |
 | splitter slots (`pdfsplit`) | **2**, shared by both surfaces | `Splitter.Open` | `Document.Close`, before the parts run | bounds the memory pdfcpu holds while parsing |
 | `metadata` | fixed **4** | `AdmitMetadata` in the GET relays | on completion | the read-only relay lane (`/info`, `/documentModels`, `/operations`, the container root). These must not starve analysis nor pile up without bound against a wedged container. Also bounded by a 10-second timeout |
 

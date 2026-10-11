@@ -23,6 +23,12 @@ the behaviour is the same:
 - The probe's per-parameter verdict and the golden case list are as in §2 and §3; the readiness
   verdict is as in §8.
 
+One behaviour does differ: §1's **Slots** rule. The splitting design's scheduler (its §3) replaced
+it: every call to Azure takes a scheduler slot for that call alone and gives it back when the call
+returns, so a job that backs off holds no slot and another job's call may use it. Overload still
+slows each job down through its own backoff and `Retry-After`, but no longer lowers the
+gateway's total request rate by idling slots.
+
 ## Problem
 
 The target deployment has changed:
