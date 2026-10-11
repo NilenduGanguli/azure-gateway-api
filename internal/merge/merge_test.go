@@ -1086,6 +1086,11 @@ func TestMergeMemoryIsBounded(t *testing.T) {
 	if testing.Short() {
 		t.Skip("generates and merges about 60 MB")
 	}
+	if raceEnabled {
+		// The race detector's instrumentation roughly triples the allocation count this bound is
+		// about, so it would measure the detector rather than the merge. The plain run asserts it.
+		t.Skip("allocation bounds are asserted without the race detector")
+	}
 	const pages, perPart = 20000, 100
 	opts := docgen.Options{Unit: textunit.UTF16CodeUnit}
 	whole := docgen.DI(pageRange(1, pages), docgen.Original, opts)
