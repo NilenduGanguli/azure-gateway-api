@@ -148,7 +148,7 @@ func (c *Client) attempt(ctx context.Context, call Call, started time.Time) Atte
 	}
 	tr := newAttemptTransport()
 	defer tr.CloseIdleConnections()
-	// No cookie jar: the OpenShift router's affinity cookie would pin every retry to one pod.
+	// No cookie jar: the OpenShift router's sticky-session cookie would pin every retry to one pod.
 	hc := &http.Client{Transport: tr, CheckRedirect: noRedirects}
 
 	resp, err := hc.Do(req)

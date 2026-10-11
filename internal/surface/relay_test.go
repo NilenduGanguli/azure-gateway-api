@@ -74,8 +74,9 @@ func TestRelayReplacesTheGatewayDefaults(t *testing.T) {
 			upstream := &http.Response{
 				StatusCode: tc.status,
 				Header: http.Header{
-					"Server":                 []string{"Kestrel"},
-					"X-Ms-Client-Request-Id": []string{cid},
+					"Server": []string{"Kestrel"},
+					// The container's own value: the gateway's call does not carry the client's.
+					"X-Ms-Client-Request-Id": []string{"99999999-0000-4000-8000-000000000000"},
 				},
 				Body: io.NopCloser(strings.NewReader(tc.body)),
 			}
@@ -92,10 +93,13 @@ func TestRelayReplacesTheGatewayDefaults(t *testing.T) {
 			if res.StatusCode != tc.status {
 				t.Fatalf("status %d, want the upstream's %d", res.StatusCode, tc.status)
 			}
-			for _, k := range []string{"Server", "X-Ms-Client-Request-Id"} {
-				if got := res.Header.Values(k); len(got) != 1 {
-					t.Errorf("%s is %q, want the container's single value", k, got)
-				}
+			if got := res.Header.Values("Server"); len(got) != 1 {
+				t.Errorf("Server is %q, want the container's single value", got)
+			}
+			// The correlation id is the client's, which the middleware echoed; the container
+			// never saw it.
+			if got := res.Header.Values("X-Ms-Client-Request-Id"); len(got) != 1 || got[0] != cid {
+				t.Errorf("x-ms-client-request-id is %q, want the client's single %q", got, cid)
 			}
 		})
 	}

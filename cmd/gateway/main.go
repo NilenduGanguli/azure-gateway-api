@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -27,7 +28,6 @@ import (
 	"github.com/NilenduGanguli/azure-gateway-api/internal/logging"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/probe"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/store"
-	"github.com/NilenduGanguli/azure-gateway-api/internal/upstream"
 )
 
 // Build metadata, set with -ldflags at build time.
@@ -74,27 +74,10 @@ Configuration is read from the environment; see README.md.
 `)
 }
 
-// requireBothUpstreams refuses to serve with only one upstream configured.
-//
-// The configuration accepts a gateway in front of one kind of container, but the job manager
-// still builds a runner and an upstream client for both surfaces. Serving a surface with no
-// container behind it would answer 202 for work that can never run, so refuse instead. Plan task
-// T10 deletes this guard: by then T9 builds runners, and T10 registers routes, for configured
-// surfaces only.
-func requireBothUpstreams(cfg *config.Config) error {
-	if !cfg.DI.Enabled() || !cfg.Read.Enabled() {
-		return errors.New("this build still needs both DI_UPSTREAM_URL and READ_UPSTREAM_URL")
-	}
-	return nil
-}
-
 func serve() error {
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("configuration is invalid:\n%w", err)
-	}
-	if err := requireBothUpstreams(cfg); err != nil {
-		return err
 	}
 	log := logging.New(cfg.LogLevel, cfg.LogFormat)
 	started := time.Now()
@@ -105,20 +88,19 @@ func serve() error {
 
 	st, err := store.Open(store.Options{
 		DataDir:      cfg.DataDir,
-		ReadPoolSize: cfg.DI.MaxInflight + cfg.Read.MaxInflight + 8,
+		ReadPoolSize: inflight(cfg.DI) + inflight(cfg.Read) + 8,
 	})
 	if err != nil {
 		return err
 	}
 	defer func() { _ = st.Close() }()
+	logMigration(log, st.Migration)
 
-	tempDir := st.Blob.Root()
-	diClient := upstream.NewDI(cfg.DI, cfg.DISyncMode, cfg.DIBlindPollBudget, tempDir,
-		cfg.MaxResultBytes, cfg.DISyncProbeTimeout)
-	readClient := upstream.NewRead(cfg.Read, cfg.ReadBlindPollBudget, tempDir, cfg.MaxResultBytes)
-
+	engines := app.NewEngines(cfg, st, log)
 	manager := jobs.New(jobs.Options{
-		Config: cfg, Store: st, Logger: log, DI: diClient, Read: readClient,
+		Config: cfg, Store: st, Logger: log,
+		DI: engines.DI, Read: engines.Read,
+		DIClient: engines.DIClient, ReadClient: engines.ReadClient,
 	})
 
 	// Two separate lifetimes. signalCtx only *triggers* the drain; runCtx is what requests and
@@ -173,8 +155,10 @@ func serve() error {
 			"diUpstream", config.SafeURL(cfg.DI.BaseURL),
 			"readUpstream", config.SafeURL(cfg.Read.BaseURL),
 			"dataDir", cfg.DataDir,
-			"diMaxInflight", cfg.DI.MaxInflight,
-			"readMaxInflight", cfg.Read.MaxInflight,
+			// A surface that is not configured has no capacity, so it reports 0 rather than an
+			// unused default, as /_gw/config does.
+			"diMaxInflight", inflight(cfg.DI),
+			"readMaxInflight", inflight(cfg.Read),
 			"splitPages", cfg.SplitPages,
 			"resultTtl", cfg.ResultTTL.String(),
 		)
@@ -213,6 +197,25 @@ func serve() error {
 
 	log.Info("shutdown complete")
 	return nil
+}
+
+// inflight is a surface's concurrency limit, or 0 when it is not configured.
+func inflight(u config.Upstream) int {
+	if !u.Enabled() {
+		return 0
+	}
+	return u.MaxInflight
+}
+
+// logMigration reports what opening the store did to its schema. A migration and its backup are
+// the first thing to check after an upgrade, and the backup's path is what a rollback needs.
+func logMigration(log *slog.Logger, m store.MigrationReport) {
+	if m.From == m.To && !m.Legacy {
+		log.Info("job store schema is current", "version", m.To)
+		return
+	}
+	log.Info("job store schema migrated", "from", m.From, "to", m.To, "backup", m.Backup,
+		"legacy", m.Legacy, "took", m.Took.String())
 }
 
 func runProbe() error {

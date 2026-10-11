@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/NilenduGanguli/azure-gateway-api/internal/config"
+	"github.com/NilenduGanguli/azure-gateway-api/internal/engine"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/httpx"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/jobs"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/store"
@@ -104,9 +105,9 @@ type storeHealth struct {
 
 // health is the full diagnostic view.
 //
-// The upstream section is where an operator learns whether the undocumented Document
-// Intelligence :syncAnalyze route works on their image build: syncAnalyze reads "unknown" until
-// the first job runs, then settles on "available" or "unavailable".
+// The upstream section lists the configured containers only, each checked through its GET
+// /status. There is no capability to report: every call is synchronous, so a container either
+// serves its sync route or each job says so in its own error.
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 6*time.Second)
 	defer cancel()
@@ -126,8 +127,8 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	for _, name := range []string{jobs.SurfaceDI, jobs.SurfaceRead} {
-		if a := s.jobs.Analyzer(name); a != nil {
-			rep.Upstreams = append(rep.Upstreams, a.Health(ctx))
+		if c := s.jobs.Client(name); c != nil {
+			rep.Upstreams = append(rep.Upstreams, c.Health(ctx))
 		}
 	}
 	if counts, err := s.store.Stats(ctx); err == nil {
@@ -162,27 +163,29 @@ type jobView struct {
 	Surface     string `json:"surface"`
 	ModelID     string `json:"modelId,omitempty"`
 	Status      string `json:"status"`
-	Mode        string `json:"upstreamMode,omitempty"`
 	CreatedAt   string `json:"createdAt"`
 	UpdatedAt   string `json:"updatedAt"`
 	ExpiresAt   string `json:"expiresAt"`
 	InputBytes  int64  `json:"inputBytes"`
 	ResultBytes int64  `json:"resultBytes"`
 	UpstreamMS  int64  `json:"upstreamMs"`
-	Attempts    int    `json:"attempts"`
-	Error       string `json:"error,omitempty"`
-	HasPDF      bool   `json:"hasPdf,omitempty"`
-	Figures     string `json:"figures,omitempty"`
+	// Attempts counts runs of the job: more than one means a crash or restart re-ran it.
+	Attempts int `json:"attempts"`
+	// UpstreamAttempts counts the last run's calls to the container, retries and hedges
+	// included; UpstreamParts is how many parts it was analysed in, 1 when sent whole.
+	UpstreamAttempts int    `json:"upstreamAttempts"`
+	UpstreamParts    int    `json:"upstreamParts"`
+	Error            string `json:"error,omitempty"`
 }
 
 func toView(j *store.Job) jobView {
 	return jobView{
-		ID: j.ID, Surface: j.Surface, ModelID: j.ModelID,
-		Status: string(j.Status), Mode: string(j.Mode),
+		ID: j.ID, Surface: j.Surface, ModelID: j.ModelID, Status: string(j.Status),
 		CreatedAt: j.CreatedAt.Format(time.RFC3339), UpdatedAt: j.UpdatedAt.Format(time.RFC3339),
 		ExpiresAt:  j.ExpiresAt.Format(time.RFC3339),
 		InputBytes: j.InputBytes, ResultBytes: j.ResultBytes, UpstreamMS: j.UpstreamMS,
-		Attempts: j.Attempts, Error: j.ErrorJSON, HasPDF: j.HasPDF, Figures: j.Figures,
+		Attempts: j.Attempts, UpstreamAttempts: j.UpstreamAttempts, UpstreamParts: j.UpstreamParts,
+		Error: j.ErrorJSON,
 	}
 }
 
@@ -269,11 +272,106 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 			map[string]float64{"": used})
 	}
 
+	s.writeEngineMetrics(&b, writeMetric)
+
 	body := b.String()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(body))
+}
+
+// Label values that are always exported, at zero until they happen, so a dashboard or an alert on
+// one of them has a series to read from the first scrape on.
+var (
+	partOutcomes    = []string{"succeeded", "retried", "halved", "hedged", "hedge_won", "rechecked"}
+	fallbackReasons = []string{"unparseable", "encrypted", "budget", "panic", "pages_param", "merge_check"}
+)
+
+// writeEngineMetrics appends each configured surface's engine counters and upstream slots.
+func (s *Server) writeEngineMetrics(b *strings.Builder,
+	writeMetric func(name, help, typ string, samples map[string]float64)) {
+
+	snaps := map[string]engine.MetricsSnapshot{}
+	slots := map[string]float64{}
+	for _, name := range []string{jobs.SurfaceDI, jobs.SurfaceRead} {
+		e := s.jobs.Engine(name)
+		if e == nil {
+			continue
+		}
+		snaps[name] = e.Metrics().Snapshot()
+		st := e.Sched().Stats()
+		slots[fmt.Sprintf("surface=%q,state=%q", name, "inUse")] = float64(st.InUse)
+		slots[fmt.Sprintf("surface=%q,state=%q", name, "waiting")] = float64(st.Waiting)
+		slots[fmt.Sprintf("surface=%q,state=%q", name, "limit")] = float64(st.Limit)
+	}
+
+	histogram := func(name, help string, pick func(engine.MetricsSnapshot) engine.Histogram) {
+		fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s histogram\n", name, help, name)
+		for _, surface := range sortedKeys(snaps) {
+			writeHistogram(b, name, surface, pick(snaps[surface]))
+		}
+	}
+	histogram("gateway_part_seconds", "Wall time of one successful part analysis, in seconds.",
+		func(m engine.MetricsSnapshot) engine.Histogram { return m.PartSeconds })
+	histogram("gateway_job_parts", "Parts each analysed document was sent in; 1 when whole.",
+		func(m engine.MetricsSnapshot) engine.Histogram { return m.JobParts })
+	histogram("gateway_merge_seconds", "Time to merge a split document's part results, in seconds.",
+		func(m engine.MetricsSnapshot) engine.Histogram { return m.MergeSeconds })
+
+	labelled := func(label string, known []string, pick func(engine.MetricsSnapshot) map[string]int64) map[string]float64 {
+		out := map[string]float64{}
+		for surface, m := range snaps {
+			for _, v := range known {
+				out[fmt.Sprintf("surface=%q,%s=%q", surface, label, v)] = 0
+			}
+			for v, n := range pick(m) {
+				out[fmt.Sprintf("surface=%q,%s=%q", surface, label, v)] = float64(n)
+			}
+		}
+		return out
+	}
+	writeMetric("gateway_parts_total", "Part attempts by outcome.", "counter",
+		labelled("outcome", partOutcomes, func(m engine.MetricsSnapshot) map[string]int64 { return m.Parts }))
+	writeMetric("gateway_split_fallback_total",
+		"Documents sent whole although splitting was on, by reason.", "counter",
+		labelled("reason", fallbackReasons, func(m engine.MetricsSnapshot) map[string]int64 { return m.SplitFallbacks }))
+	writeMetric("gateway_upstream_retries_total", "Upstream attempts retried, by reason.", "counter",
+		labelled("reason", nil, func(m engine.MetricsSnapshot) map[string]int64 { return m.Retries }))
+
+	exhausted := map[string]float64{}
+	for surface, m := range snaps {
+		exhausted[fmt.Sprintf("surface=%q", surface)] = float64(m.Exhausted)
+	}
+	writeMetric("gateway_upstream_exhausted_total",
+		"Analyses that failed after spending every attempt.", "counter", exhausted)
+	writeMetric("gateway_upstream_slots",
+		"Upstream call slots by state: in use, waited for, and in all.", "gauge", slots)
+}
+
+// writeHistogram renders one surface's histogram in Prometheus text form. Counts are already
+// cumulative, as le buckets are; +Inf is the total count.
+func writeHistogram(b *strings.Builder, name, surface string, h engine.Histogram) {
+	for i, bound := range h.Bounds {
+		var n int64
+		if i < len(h.Counts) {
+			n = h.Counts[i]
+		}
+		fmt.Fprintf(b, "%s_bucket{surface=%q,le=%q} %d\n", name, surface,
+			strconv.FormatFloat(bound, 'g', -1, 64), n)
+	}
+	fmt.Fprintf(b, "%s_bucket{surface=%q,le=\"+Inf\"} %d\n", name, surface, h.Count)
+	fmt.Fprintf(b, "%s_sum{surface=%q} %g\n", name, surface, h.Sum)
+	fmt.Fprintf(b, "%s_count{surface=%q} %d\n", name, surface, h.Count)
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // containerReady mirrors the containers' /ready body, including the exact "ready":"ready" pair
@@ -297,8 +395,8 @@ func (s *Server) containerStatus(w http.ResponseWriter, r *http.Request) {
 
 	var unhealthy []string
 	for _, name := range []string{jobs.SurfaceDI, jobs.SurfaceRead} {
-		if a := s.jobs.Analyzer(name); a != nil {
-			if h := a.Health(ctx); !h.OK {
+		if c := s.jobs.Client(name); c != nil {
+			if h := c.Health(ctx); !h.OK {
 				unhealthy = append(unhealthy, h.Name)
 			}
 		}

@@ -67,9 +67,10 @@ func Run(ctx context.Context, cfg *config.Config, out io.Writer) error {
 	}
 
 	rep.section("What to do with this")
-	rep.line("- If DI :syncAnalyze answered 200 or 400, the route exists: leave DI_SYNC_ANALYZE=auto.")
-	rep.line("- If it answered 404, or 500 UnhandledEndpointException, set DI_SYNC_ANALYZE=off to")
-	rep.line("  skip the probe on every job; the gateway falls back to :analyze with affinity polling.")
+	rep.line("- If DI :syncAnalyze answered 200 or 400, the route exists and the gateway can use it.")
+	rep.line("- If it answered 404, or 500 UnhandledEndpointException, this image does not serve the")
+	rep.line("  route, and every DI analysis through the gateway will fail: it only calls :syncAnalyze.")
+	rep.line("  Deploy an image build that serves it.")
 	rep.line("- Compare the unknown-result-id bodies against the gateway's own 404 bodies to confirm")
 	rep.line("  clients cannot tell them apart.")
 	rep.line("- Read each /swagger document: it is authoritative for your exact image build.")

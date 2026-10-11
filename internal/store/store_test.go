@@ -182,7 +182,7 @@ func TestJobLifecycle(t *testing.T) {
 		t.Errorf("attempts is %d, want 1", got.Attempts)
 	}
 
-	ok, err := s.Succeed(ctx, job.ID, "/data/blobs/x.res", 1234, ModeSync, 55, true, "1.1", now)
+	ok, err := s.Succeed(ctx, job.ID, "/data/blobs/x.res", 1234, 55, 7, 5, now)
 	if err != nil {
 		t.Fatalf("succeed: %v", err)
 	}
@@ -190,11 +190,12 @@ func TestJobLifecycle(t *testing.T) {
 		t.Fatal("Succeed reported no matching row for a job that exists")
 	}
 	got, _ = s.Get(ctx, job.ID)
-	if got.Status != StatusSucceeded || got.ResultBytes != 1234 || got.Mode != ModeSync {
+	if got.Status != StatusSucceeded || got.ResultBytes != 1234 || got.UpstreamMS != 55 {
 		t.Errorf("succeed did not persist: %+v", got)
 	}
-	if !got.HasPDF || got.Figures != "1.1" {
-		t.Errorf("artifact metadata lost: hasPdf=%v figures=%q", got.HasPDF, got.Figures)
+	if got.UpstreamAttempts != 7 || got.UpstreamParts != 5 {
+		t.Errorf("upstream counts lost: attempts=%d parts=%d, want 7 and 5",
+			got.UpstreamAttempts, got.UpstreamParts)
 	}
 	if got.InputPath != "" {
 		t.Error("input path should be cleared once the job succeeds")
@@ -312,7 +313,7 @@ func TestSucceedReportsAMissingRow(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
 
-	ok, err := s.Succeed(ctx, "00000000-0000-4000-8000-00000000dead", "/x", 1, ModeSync, 1, false, "", now)
+	ok, err := s.Succeed(ctx, "00000000-0000-4000-8000-00000000dead", "/x", 1, 1, 1, 1, now)
 	if err != nil {
 		t.Fatalf("succeed: %v", err)
 	}
@@ -320,7 +321,7 @@ func TestSucceedReportsAMissingRow(t *testing.T) {
 		t.Error("Succeed reported a row was updated for an id that does not exist")
 	}
 
-	ok, err = s.Fail(ctx, "00000000-0000-4000-8000-00000000dead", "{}", ModeSync, 500, 1, now)
+	ok, err = s.Fail(ctx, "00000000-0000-4000-8000-00000000dead", "{}", 500, 1, 1, 1, now)
 	if err != nil {
 		t.Fatalf("fail: %v", err)
 	}
@@ -526,5 +527,30 @@ func TestBlobIDsRotatesPastTheFirstBatch(t *testing.T) {
 	if len(missed) > 0 {
 		t.Errorf("%d of %d ids were never returned; the reclaimer can never collect them (e.g. %q)",
 			len(missed), total, missed[0])
+	}
+}
+
+// TestFailRecordsUpstreamCounts checks that a failed job keeps the attempt and part counts of the
+// run that failed it, which is what an operator reads first on the admin surface.
+func TestFailRecordsUpstreamCounts(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	id := "00000000-0000-4000-8000-0000000000fa"
+	if err := s.Create(ctx, &Job{ID: id, Surface: "di", Status: StatusRunning,
+		CreatedAt: now, UpdatedAt: now, ExpiresAt: now.Add(time.Hour)}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	ok, err := s.Fail(ctx, id, `{"code":"InternalServerError"}`, 503, 900, 5, 3, now)
+	if err != nil || !ok {
+		t.Fatalf("fail: ok=%v err=%v", ok, err)
+	}
+	got, err := s.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status != StatusFailed || got.UpStatus != 503 || got.UpstreamMS != 900 ||
+		got.UpstreamAttempts != 5 || got.UpstreamParts != 3 {
+		t.Errorf("fail did not persist: %+v", got)
 	}
 }

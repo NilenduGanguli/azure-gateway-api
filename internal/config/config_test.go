@@ -23,9 +23,8 @@ func setEnv(t *testing.T, kv map[string]string) {
 	reads := append([]string{
 		"GATEWAY_ADDR", "PUBLIC_BASE_URL", "DATA_DIR", "SPLIT_PAGES",
 		"DI_UPSTREAM_URL", "DI_UPSTREAM_API_KEY", "DI_MAX_INFLIGHT", "DI_UPSTREAM_TIMEOUT",
-		"DI_SYNC_ANALYZE", "DI_SYNC_PROBE_TIMEOUT", "DI_BLIND_POLL_BUDGET",
 		"READ_UPSTREAM_URL", "READ_UPSTREAM_API_KEY", "READ_MAX_INFLIGHT", "READ_SYNC_TIMEOUT",
-		"READ_BLIND_POLL_BUDGET", "QUEUE_DEPTH", "ARTIFACT_FETCH_TIMEOUT", "UPLOAD_TIMEOUT",
+		"QUEUE_DEPTH", "UPLOAD_TIMEOUT",
 		"RESULT_TTL", "GC_INTERVAL", "DISK_HIGH_WATERMARK", "MAX_REQUEST_BYTES", "MAX_RESULT_BYTES",
 		"SHUTDOWN_GRACE", "LOG_LEVEL", "LOG_FORMAT",
 	}, removedSettings...)
@@ -52,13 +51,6 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if c.SplitPages != 5 {
 		t.Errorf("SplitPages is %d, want 5", c.SplitPages)
-	}
-	if c.ArtifactFetchTimeout <= 0 {
-		t.Error("ArtifactFetchTimeout has no default; a wedged container would outlast the " +
-			"shutdown grace")
-	}
-	if c.DISyncMode != SyncAuto {
-		t.Errorf("DISyncMode is %q, want auto", c.DISyncMode)
 	}
 	if c.MaxRequestBytes != 500*1024*1024 {
 		t.Errorf("MaxRequestBytes is %d, want the 500 MB Document Intelligence S0 ceiling",
@@ -129,7 +121,6 @@ func TestLoadAcceptsOneSurface(t *testing.T) {
 			name: "document intelligence only",
 			env: map[string]string{
 				"READ_UPSTREAM_URL": "", "READ_MAX_INFLIGHT": "0", "READ_SYNC_TIMEOUT": "soon",
-				"READ_BLIND_POLL_BUDGET": "lots",
 			},
 			wantDI: true,
 		},
@@ -137,7 +128,6 @@ func TestLoadAcceptsOneSurface(t *testing.T) {
 			name: "read only",
 			env: map[string]string{
 				"DI_UPSTREAM_URL": "", "DI_MAX_INFLIGHT": "four", "DI_UPSTREAM_TIMEOUT": "-1s",
-				"DI_BLIND_POLL_BUDGET": "lots",
 			},
 			wantRdr: true,
 		},
@@ -181,19 +171,16 @@ func TestLoadFailsFastOnBadConfiguration(t *testing.T) {
 		{"zero inflight", map[string]string{"DI_MAX_INFLIGHT": "0"}, "must be at least 1"},
 		{"zero read inflight", map[string]string{"READ_MAX_INFLIGHT": "0"}, "READ_MAX_INFLIGHT must be at least 1"},
 		{"bad enabled timeout", map[string]string{"READ_SYNC_TIMEOUT": "soon"}, "READ_SYNC_TIMEOUT is not a valid duration"},
-		{"bad sync mode", map[string]string{"DI_SYNC_ANALYZE": "maybe"}, "must be auto, force or off"},
 		{"negative queue depth", map[string]string{"QUEUE_DEPTH": "-1"}, "must not be negative"},
 		{"negative split pages", map[string]string{"SPLIT_PAGES": "-1"}, "SPLIT_PAGES must not be negative"},
 		{"watermark above 1", map[string]string{"DISK_HIGH_WATERMARK": "1.5"}, "must be in (0,1]"},
 		{"zero request cap", map[string]string{"MAX_REQUEST_BYTES": "0"}, "must be positive"},
 		{"relative public base url", map[string]string{"PUBLIC_BASE_URL": "/gateway"}, "must be an absolute URL"},
 		{"public base url with a path", map[string]string{"PUBLIC_BASE_URL": "https://gw.example.com/api"}, "no path"},
-		{"zero artifact budget", map[string]string{"ARTIFACT_FETCH_TIMEOUT": "0s"}, "must be positive"},
 		{"unparseable duration", map[string]string{"RESULT_TTL": "24 hours"}, "not a valid duration"},
 		{"unparseable integer", map[string]string{"QUEUE_DEPTH": "lots"}, "QUEUE_DEPTH is not a valid integer"},
 		{"byte cap with a unit", map[string]string{"MAX_REQUEST_BYTES": "500Mi"}, "MAX_REQUEST_BYTES is not a valid integer"},
 		{"unparseable enabled inflight", map[string]string{"DI_MAX_INFLIGHT": "four"}, "DI_MAX_INFLIGHT is not a valid integer"},
-		{"unparseable enabled poll budget", map[string]string{"READ_BLIND_POLL_BUDGET": "lots"}, "READ_BLIND_POLL_BUDGET is not a valid integer"},
 		{"unparseable watermark", map[string]string{"DISK_HIGH_WATERMARK": "90%"}, "DISK_HIGH_WATERMARK is not a valid number"},
 	}
 	for _, tc := range cases {
@@ -241,6 +228,9 @@ func TestRemovedSettingsStillStartWithAWarning(t *testing.T) {
 	// The old values that used to fail validation must not fail it now.
 	env["ERROR_COMPAT"] = "documented"
 	env["POLL_RETRY_AFTER"] = "0"
+	env["DI_SYNC_ANALYZE"] = "maybe"
+	env["ARTIFACT_FETCH_TIMEOUT"] = "0s"
+	env["READ_BLIND_POLL_BUDGET"] = "lots"
 	setEnv(t, env)
 
 	c, err := Load()
@@ -249,7 +239,9 @@ func TestRemovedSettingsStillStartWithAWarning(t *testing.T) {
 	}
 	warnings := c.Warnings()
 	for _, name := range []string{"ERROR_COMPAT", "TRUST_FORWARDED_HEADERS",
-		"TRUSTED_FORWARDED_HOSTS", "ALLOW_NETWORK_FS", "POLL_RETRY_AFTER", "BUSY_RETRY_AFTER"} {
+		"TRUSTED_FORWARDED_HOSTS", "ALLOW_NETWORK_FS", "POLL_RETRY_AFTER", "BUSY_RETRY_AFTER",
+		"DI_SYNC_ANALYZE", "DI_SYNC_PROBE_TIMEOUT", "DI_BLIND_POLL_BUDGET",
+		"READ_BLIND_POLL_BUDGET", "ARTIFACT_FETCH_TIMEOUT"} {
 		want := name + " is no longer used"
 		found := false
 		for _, w := range warnings {
@@ -448,9 +440,7 @@ func TestRedactedCoversEveryField(t *testing.T) {
 	// A few keys are deliberately named for the environment variable an operator sets rather than
 	// for the Go field, which is more useful in the rendered view. Listing them here keeps that a
 	// conscious choice rather than an omission.
-	alias := map[string]string{
-		"DISyncMode": "diSyncAnalyze",
-	}
+	alias := map[string]string{}
 
 	v := reflect.TypeOf(*c)
 	var missing []string
@@ -483,6 +473,13 @@ func TestRedactedCoversEveryField(t *testing.T) {
 	} {
 		if _, ok := emitted[want]; !ok {
 			t.Errorf("Redacted() is missing the per-surface key %q", want)
+		}
+	}
+	// The async-path settings are gone, and /_gw/config must not show values that do nothing.
+	for _, gone := range []string{"disyncanalyze", "diblindpollbudget", "readblindpollbudget",
+		"disyncprobetimeout", "artifactfetchtimeout"} {
+		if _, ok := emitted[gone]; ok {
+			t.Errorf("Redacted() still shows the removed %q", gone)
 		}
 	}
 }

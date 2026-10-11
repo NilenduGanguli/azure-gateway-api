@@ -21,7 +21,6 @@ import (
 	"github.com/NilenduGanguli/azure-gateway-api/internal/jobs"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/mockazure"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/store"
-	"github.com/NilenduGanguli/azure-gateway-api/internal/upstream"
 )
 
 const (
@@ -61,8 +60,6 @@ func newHarness(t *testing.T, o harnessOpts) *harness {
 	cfg := &config.Config{
 		Addr:              "127.0.0.1:0",
 		DataDir:           dir,
-		DISyncMode:        config.SyncAuto,
-		DIBlindPollBudget: 10,
 		QueueDepth:        0,
 		ResultTTL:         time.Hour,
 		GCInterval:        time.Hour,
@@ -89,13 +86,13 @@ func newHarness(t *testing.T, o harnessOpts) *harness {
 	t.Cleanup(func() { _ = st.Close() })
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// The engines come from the same constructor the binary uses. Hand-built clients here once
+	// took different arguments from main's, so the suite tested a gateway production did not run.
+	engines := app.NewEngines(cfg, st, log)
 	manager := jobs.New(jobs.Options{
 		Config: cfg, Store: st, Logger: log,
-		// These argument lists must match cmd/gateway/main.go exactly. They did not: Read was
-		// built with the DI poll budget, and both clients with the request-size limit where the
-		// binary passes the result-size limit.
-		DI:   upstream.NewDI(cfg.DI, cfg.DISyncMode, cfg.DIBlindPollBudget, st.Blob.Root(), cfg.MaxResultBytes, cfg.DISyncProbeTimeout),
-		Read: upstream.NewRead(cfg.Read, cfg.ReadBlindPollBudget, st.Blob.Root(), cfg.MaxResultBytes),
+		DI: engines.DI, Read: engines.Read,
+		DIClient: engines.DIClient, ReadClient: engines.ReadClient,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	manager.Start(ctx)
@@ -113,6 +110,24 @@ func newHarness(t *testing.T, o harnessOpts) *harness {
 
 	return &harness{t: t, gateway: gw, handler: handler, di: diC, read: readC,
 		store: st, manager: manager, cfg: cfg}
+}
+
+// startManager builds and starts a job manager over st the way the binary does, for tests that
+// simulate a second process on the same volume. It is stopped when the test ends.
+func startManager(t *testing.T, cfg *config.Config, st *store.Store) *jobs.Manager {
+	t.Helper()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	engines := app.NewEngines(cfg, st, log)
+	manager := jobs.New(jobs.Options{
+		Config: cfg, Store: st, Logger: log,
+		DI: engines.DI, Read: engines.Read,
+		DIClient: engines.DIClient, ReadClient: engines.ReadClient,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	manager.Start(ctx)
+	t.Cleanup(func() { cancel(); manager.Stop() })
+	manager.Recover(ctx)
+	return manager
 }
 
 // post submits a document and returns the raw response.

@@ -2,22 +2,17 @@ package surface
 
 import (
 	"bytes"
-	"context"
-	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/NilenduGanguli/azure-gateway-api/internal/azerr"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/config"
+	"github.com/NilenduGanguli/azure-gateway-api/internal/httpx"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/ids"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/jobs"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/logging"
-	"github.com/NilenduGanguli/azure-gateway-api/internal/store"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/upstream"
 )
 
@@ -74,6 +69,10 @@ func (s *Server) registerDI(mux *http.ServeMux) {
 		mux.HandleFunc("GET "+fam+"/info", s.diInfo)
 		mux.HandleFunc("GET "+fam+"/documentModels", s.diListModels)
 		mux.HandleFunc("GET "+fam+"/documentModels/{modelId}", s.diGetModel)
+		// Model-lifecycle operations. A layout container has none, but it routes them, so a
+		// gateway that did not would answer a client differently from the pod.
+		mux.HandleFunc("GET "+fam+"/operations", s.diListOperations)
+		mux.HandleFunc("GET "+fam+"/operations/{operationId}", s.diGetOperation)
 	}
 }
 
@@ -108,6 +107,11 @@ func (s *Server) diAction(w http.ResponseWriter, r *http.Request) {
 func (s *Server) diAnalyze(w http.ResponseWriter, r *http.Request, modelID string) {
 	apiVersion, err := requireAPIVersion(r)
 	if err != nil {
+		err.WriteTo(w, azerr.SurfaceDI)
+		return
+	}
+	// Before admission, so a refused request stores nothing.
+	if err := checkDIParams(r.URL.Query()); err != nil {
 		err.WriteTo(w, azerr.SurfaceDI)
 		return
 	}
@@ -146,19 +150,17 @@ func diOperationLocation(base, prefix, modelID, resultID, apiVersion string) str
 		"/analyzeResults/" + url.PathEscape(resultID) + "?" + q.Encode()
 }
 
-// diSyncAnalyze passes a synchronous analysis straight through to the container.
-//
-// Nothing is persisted: the client is holding the connection and will have the whole result when
-// it returns, so there is no operation id to keep alive afterwards. A slot is still taken, so the
-// number of concurrent upstream calls stays bounded by one number across both call styles.
+// diSyncAnalyze serves a synchronous analysis through the engine; see syncAnalyze.
 func (s *Server) diSyncAnalyze(w http.ResponseWriter, r *http.Request, modelID string) {
 	if _, err := requireAPIVersion(r); err != nil {
 		err.WriteTo(w, azerr.SurfaceDI)
 		return
 	}
-	s.passthrough(w, r, azerr.SurfaceDI, jobs.SurfaceDI, upstream.Request{
-		ModelID: modelID, Query: upstreamQuery(r.URL.Query()), Prefix: prefixOf(r),
-	})
+	if err := checkDIParams(r.URL.Query()); err != nil {
+		err.WriteTo(w, azerr.SurfaceDI)
+		return
+	}
+	s.syncAnalyze(w, r, azerr.SurfaceDI, jobs.SurfaceDI, modelID, prefixOf(r))
 }
 
 func (s *Server) diPoll(w http.ResponseWriter, r *http.Request) {
@@ -169,22 +171,21 @@ func (s *Server) diDelete(w http.ResponseWriter, r *http.Request) {
 	s.deleteResult(w, r, azerr.SurfaceDI, jobs.SurfaceDI, r.PathValue("resultId"))
 }
 
-// diPDF serves the searchable PDF captured when the submission asked for output=pdf.
-func (s *Server) diPDF(w http.ResponseWriter, r *http.Request) {
-	s.diArtifact(w, r, store.KindPDF, "application/pdf")
-}
+// diPDF answers the searchable-PDF route of an operation.
+func (s *Server) diPDF(w http.ResponseWriter, r *http.Request) { s.diArtifact(w, r) }
 
-// diFigure serves one cropped figure captured when the submission asked for output=figures.
-func (s *Server) diFigure(w http.ResponseWriter, r *http.Request) {
-	s.diArtifact(w, r, store.KindFigure(r.PathValue("figureId")), "image/png")
-}
+// diFigure answers the cropped-figure route of an operation.
+func (s *Server) diFigure(w http.ResponseWriter, r *http.Request) { s.diArtifact(w, r) }
 
-// diArtifact serves a stored result file.
+// diArtifact answers a result-file route, which never has a file to serve.
 //
-// Artifacts are captured at job completion rather than proxied on demand: they are addressed by
-// the container's own operation id, which lives only as long as that container's configured TTL
-// and only on the replica that produced it.
-func (s *Server) diArtifact(w http.ResponseWriter, r *http.Request, kind store.Kind, contentType string) {
+// The container addresses these files by an operation id that only its asynchronous :analyze
+// mints, and the gateway only ever makes synchronous calls, so no job has them: output=pdf and
+// output=figures are refused at submit for that reason. The routes stay so a client that asks
+// anyway gets the 404 a container gives for a result file it did not produce, rather than the
+// bodyless 404 of a path the container does not route. An unknown or expired id is answered as
+// an unknown operation, as a poll is.
+func (s *Server) diArtifact(w http.ResponseWriter, r *http.Request) {
 	id, ok := ids.Normalize(r.PathValue("resultId"))
 	if !ok {
 		azerr.NotFound(azerr.SurfaceDI).WriteTo(w, azerr.SurfaceDI)
@@ -195,23 +196,10 @@ func (s *Server) diArtifact(w http.ResponseWriter, r *http.Request, kind store.K
 		azerr.NotFound(azerr.SurfaceDI).WriteTo(w, azerr.SurfaceDI)
 		return
 	}
-	f, size, err := s.deps.Store.Blob.Open(id, kind)
-	if err != nil {
-		azerr.New(http.StatusNotFound, azerr.CodeNotFound,
-			"The requested result file was not produced for this operation.").
-			WithInner(azerr.InnerOperationNotFound, "").
-			WriteTo(w, azerr.SurfaceDI)
-		return
-	}
-	defer func() { _ = f.Close() }()
-
-	h := w.Header()
-	h.Set("Content-Type", contentType)
-	h.Set("Content-Length", strconv.FormatInt(size, 10))
-	w.WriteHeader(http.StatusOK)
-	if r.Method != http.MethodHead {
-		_, _ = io.Copy(w, f)
-	}
+	azerr.New(http.StatusNotFound, azerr.CodeNotFound,
+		"The requested result file was not produced for this operation.").
+		WithInner(azerr.InnerOperationNotFound, "").
+		WriteTo(w, azerr.SurfaceDI)
 }
 
 // diInfo proxies GET {family}/info.
@@ -238,6 +226,18 @@ func (s *Server) diGetModel(w http.ResponseWriter, r *http.Request) {
 	}
 	s.proxyGET(w, r, azerr.SurfaceDI, jobs.SurfaceDI,
 		prefixOf(r)+"/documentModels/"+url.PathEscape(modelID))
+}
+
+// diListOperations proxies GET {family}/operations.
+func (s *Server) diListOperations(w http.ResponseWriter, r *http.Request) {
+	s.proxyGET(w, r, azerr.SurfaceDI, jobs.SurfaceDI, prefixOf(r)+"/operations")
+}
+
+// diGetOperation proxies GET {family}/operations/{operationId}, re-escaping the routed id for the
+// reason diGetModel gives.
+func (s *Server) diGetOperation(w http.ResponseWriter, r *http.Request) {
+	s.proxyGET(w, r, azerr.SurfaceDI, jobs.SurfaceDI,
+		prefixOf(r)+"/operations/"+url.PathEscape(r.PathValue("operationId")))
 }
 
 // validModelID applies the contract's own constraint: maxLength 64, pattern
@@ -285,122 +285,6 @@ func upstreamQuery(q url.Values) url.Values {
 		}
 	}
 	return out
-}
-
-// passthrough serves a client-facing synchronous analyze.
-//
-// It is not a blind relay. The container's synchronous route is not contractually synchronous —
-// it has been observed degrading to 202 under memory pressure — and relaying that 202 would hand
-// the caller an empty body with no way to reach a result the container has already been paid to
-// produce. The upstream client resolves that case by polling the operation out; this handler only
-// ever emits a terminal answer.
-func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, surface azerr.Surface,
-	surfaceName string, req upstream.Request) {
-
-	release, err := s.deps.Jobs.Admit(surfaceName)
-	if err != nil {
-		azerr.TooBusy(surface, config.RetryAfterBusy).WriteTo(w, surface)
-		return
-	}
-	defer release()
-
-	// Admission alone is sized MaxInflight+QueueDepth. The container's own concurrency limit is
-	// MaxInflight, so a synchronous call takes a container slot too.
-	releaseUpstream, err := s.deps.Jobs.AdmitUpstream(surfaceName)
-	if err != nil {
-		azerr.TooBusy(surface, config.RetryAfterBusy).WriteTo(w, surface)
-		return
-	}
-	defer releaseUpstream()
-
-	client, ok := s.deps.Jobs.Analyzer(surfaceName).(upstream.SyncAnalyzer)
-	if !ok {
-		azerr.Internal(surface, "This surface does not support synchronous analysis.").
-			WriteTo(w, surface)
-		return
-	}
-
-	s.setUploadDeadline(w, r)
-
-	body := http.MaxBytesReader(w, r.Body, s.deps.Config.MaxRequestBytes)
-	outcome, err := client.SyncAnalyze(r.Context(), req, r.Header.Get("Content-Type"),
-		body, r.ContentLength)
-	if err != nil {
-		s.writeUpstreamError(w, r, surface, err)
-		return
-	}
-	defer outcome.Close()
-
-	if outcome.Resolved != nil {
-		s.writeResolvedSync(w, r, surface, outcome)
-		return
-	}
-	s.relaySync(w, r, surface, outcome.Live)
-}
-
-// writeUpstreamError renders a failed synchronous call in the surface's own error shape.
-//
-// An oversized body is reported as the documented 400 rather than the transport-level error
-// http.MaxBytesReader produces, and a body that ran past the cap is never mistaken for the
-// container being unreachable.
-func (s *Server) writeUpstreamError(w http.ResponseWriter, r *http.Request, surface azerr.Surface,
-	err error) {
-
-	var maxErr *http.MaxBytesError
-	if errors.As(err, &maxErr) {
-		azerr.ContentTooLarge(surface).WriteTo(w, surface)
-		return
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		// The caller hung up or the deadline passed; nothing useful to send.
-		logging.From(r.Context()).Info("synchronous call abandoned", "error", err)
-		return
-	}
-	if apiErr, ok := azerr.AsAPIError(err); ok {
-		apiErr.WriteTo(w, surface)
-		return
-	}
-	logging.From(r.Context()).Warn("synchronous call failed", "error", err)
-	azerr.Internal(surface, "").WriteTo(w, surface)
-}
-
-// writeResolvedSync serves an analysis the gateway had to poll out of a degraded 202.
-//
-// The envelope is the shape both surfaces use for a completed operation, which is also what the
-// Read documentation says its synchronous route returns: "the same object graph as the
-// asynchronous version".
-func (s *Server) writeResolvedSync(w http.ResponseWriter, r *http.Request, surface azerr.Surface,
-	outcome *upstream.SyncOutcome) {
-
-	reader, size, err := outcome.OpenResolved()
-	if err != nil {
-		azerr.Internal(surface, "The analysis completed but its result could not be read.").
-			WriteTo(w, surface)
-		return
-	}
-	defer func() { _ = reader.Close() }()
-
-	now := s.deps.Now().Format(jobs.TimeFormat)
-	prefix := fmt.Sprintf(
-		`{"status":"succeeded","createdDateTime":"%s","lastUpdatedDateTime":"%s","analyzeResult":`,
-		now, now)
-	const suffix = "}"
-
-	h := w.Header()
-	h.Set("Content-Type", "application/json; charset=utf-8")
-	h.Set("Content-Length", strconv.FormatInt(int64(len(prefix))+size+int64(len(suffix)), 10))
-	w.WriteHeader(http.StatusOK)
-	if r.Method == http.MethodHead {
-		return
-	}
-	if _, err := io.WriteString(w, prefix); err != nil {
-		return
-	}
-	if _, err := io.Copy(w, reader); err != nil {
-		logging.From(r.Context()).Warn("synchronous result stream interrupted", "error", err)
-		return
-	}
-	_, _ = io.WriteString(w, suffix)
 }
 
 // relaySync forwards the container's own synchronous response.
@@ -468,48 +352,6 @@ func retriableStatus(status int) bool {
 	return false
 }
 
-// metadataTimeout bounds a read-only proxy call.
-//
-// These endpoints answer in milliseconds. Letting them inherit the analysis timeout meant a wedged
-// container could hold each one open for a quarter of an hour, and with no concurrency limit they
-// piled up without bound.
-const metadataTimeout = 10 * time.Second
-
-// proxyGET forwards a small read-only request.
-//
-// path is built by the caller from routed, validated components — never from r.URL.Path — because
-// the gateway signs this request with its own upstream credential.
-func (s *Server) proxyGET(w http.ResponseWriter, r *http.Request, surface azerr.Surface,
-	surfaceName, path string) {
-
-	release, err := s.deps.Jobs.AdmitMetadata(surfaceName)
-	if err != nil {
-		azerr.TooBusy(surface, config.RetryAfterBusy).WriteTo(w, surface)
-		return
-	}
-	defer release()
-
-	client, ok := s.deps.Jobs.Analyzer(surfaceName).(passthroughClient)
-	if !ok {
-		azerr.Internal(surface, "This surface does not support metadata proxying.").
-			WriteTo(w, surface)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), metadataTimeout)
-	defer cancel()
-
-	resp, err := client.PassthroughGET(ctx, path, upstreamQuery(r.URL.Query()))
-	if err != nil {
-		logging.From(r.Context()).Warn("metadata proxy failed", "path", path, "error", err)
-		azerr.Internal(surface, "The upstream container is unreachable.").WriteTo(w, surface)
-		return
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	s.relaySync(w, r, surface, resp)
-}
-
 // copyResponse relays an upstream response to the client.
 //
 // Hop-by-hop headers are dropped, and Operation-Location is dropped rather than relayed: the
@@ -535,7 +377,14 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) {
 // Middleware writes Server, Cache-Control and the x-ms-client-request-id echo before any handler
 // runs, and a real container sends Server and the echo too. Appending to them sent each header
 // twice, which no pod does, and the spec asks for these routes to be relayed verbatim.
+//
+// x-ms-client-request-id is the exception. It is the client's own correlation id, echoed by the
+// middleware, and the gateway's call to the container does not carry it, so whatever the container
+// sends under that name is not the client's id and is dropped.
 func relayHeader(dst http.Header, k string, vs []string) {
+	if http.CanonicalHeaderKey(k) == http.CanonicalHeaderKey(httpx.HeaderClientRequestID) {
+		return
+	}
 	dst.Del(k)
 	for _, v := range vs {
 		dst.Add(k, v)
@@ -550,11 +399,4 @@ func skipRelayHeader(k string) bool {
 		return true
 	}
 	return false
-}
-
-// passthroughClient is the subset of an upstream client the proxy paths need.
-type passthroughClient interface {
-	Passthrough(ctx context.Context, method, path string, q url.Values, contentType string,
-		body io.Reader, contentLength int64) (*http.Response, error)
-	PassthroughGET(ctx context.Context, path string, q url.Values) (*http.Response, error)
 }

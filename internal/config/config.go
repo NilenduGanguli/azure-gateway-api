@@ -31,8 +31,13 @@ const RetryAfterBusy = 5
 //
 // Refusing to start over a setting that no longer does anything would turn a gateway upgrade
 // into an outage for every deployment that has not yet edited its manifest.
+//
+// The last five belonged to the asynchronous upstream path — the sync-route probe, blind polling
+// pinned to one pod, and result-file fetches — which no longer exists: every call is synchronous.
 var removedSettings = []string{"ERROR_COMPAT", "TRUST_FORWARDED_HEADERS",
-	"TRUSTED_FORWARDED_HOSTS", "ALLOW_NETWORK_FS", "POLL_RETRY_AFTER", "BUSY_RETRY_AFTER"}
+	"TRUSTED_FORWARDED_HOSTS", "ALLOW_NETWORK_FS", "POLL_RETRY_AFTER", "BUSY_RETRY_AFTER",
+	"DI_SYNC_ANALYZE", "DI_SYNC_PROBE_TIMEOUT", "DI_BLIND_POLL_BUDGET", "READ_BLIND_POLL_BUDGET",
+	"ARTIFACT_FETCH_TIMEOUT"}
 
 // Upstream describes one Azure container the gateway fronts.
 type Upstream struct {
@@ -44,25 +49,13 @@ type Upstream struct {
 	// MaxInflight bounds concurrent upstream calls. A slot is held from admission to completion,
 	// so this is simultaneously the client-facing concurrency limit.
 	MaxInflight int
-	// Timeout bounds one complete logical analyze, including any fallback polling.
+	// Timeout bounds one synchronous attempt on a document sent whole, its download included.
 	Timeout time.Duration
 }
 
 // Enabled reports whether this surface is configured. None of a disabled surface's other
 // settings is validated, and it gets no empty-API-key warning.
 func (u Upstream) Enabled() bool { return u.BaseURL != "" }
-
-// SyncMode controls use of a container's synchronous analyze route.
-type SyncMode string
-
-const (
-	// SyncAuto probes for the route and falls back permanently if it is absent.
-	SyncAuto SyncMode = "auto"
-	// SyncForce uses the route without probing and treats its absence as a hard error.
-	SyncForce SyncMode = "force"
-	// SyncOff never uses the route; always submit-and-poll with affinity.
-	SyncOff SyncMode = "off"
-)
 
 // Config is the fully validated gateway configuration.
 type Config struct {
@@ -77,36 +70,12 @@ type Config struct {
 	DI   Upstream
 	Read Upstream
 
-	// DISyncMode selects how the undocumented DI :syncAnalyze route is used.
-	DISyncMode SyncMode
-	// DIBlindPollBudget caps consecutive 404s tolerated while polling a degraded DI operation
-	// whose owning replica cannot be reached through router affinity.
-	DIBlindPollBudget int
-	// ReadBlindPollBudget is the equivalent of DIBlindPollBudget for the Read surface. Read
-	// reaches the affinity poll only on the rare degraded-202 path, but a DI-named variable
-	// silently governing Read behaviour is a surprise an operator should not have to discover.
-	ReadBlindPollBudget int
-	// DISyncProbeTimeout bounds the attempt on the undocumented :syncAnalyze route.
-	//
-	// It is deliberately far shorter than DI_UPSTREAM_TIMEOUT. The route is declared in some
-	// builds' swagger and still never answers — one probed container held the connection open for
-	// more than five minutes on a blank 200x120 image. Without a separate bound, every job in
-	// auto mode would burn the whole upstream timeout on that route before falling back.
-	DISyncProbeTimeout time.Duration
-
 	// QueueDepth is how many admitted-but-unstarted jobs may wait per surface. Zero means a
 	// submit is rejected with 429 the moment every slot is busy.
 	QueueDepth int
 
 	// SplitPages is the most pages one part may hold; 0 turns splitting off.
 	SplitPages int
-
-	// ArtifactFetchTimeout bounds the whole result-file phase of one job.
-	//
-	// Artifacts are a bonus, not the result: the analysis is already stored by the time they are
-	// fetched. Without an aggregate budget a wedged container turns N figures into N times the
-	// per-request timeout, which outlasts any shutdown grace and gets the pod SIGKILLed.
-	ArtifactFetchTimeout time.Duration
 
 	// UploadTimeout bounds how long a client may take to stream its request body while holding an
 	// admission slot.
@@ -141,7 +110,6 @@ func Load() (*Config, error) {
 		Addr:          env("GATEWAY_ADDR", ":8080"),
 		PublicBaseURL: strings.TrimRight(env("PUBLIC_BASE_URL", ""), "/"),
 		DataDir:       env("DATA_DIR", "/data"),
-		DISyncMode:    SyncMode(strings.ToLower(env("DI_SYNC_ANALYZE", string(SyncAuto)))),
 		LogLevel:      strings.ToLower(env("LOG_LEVEL", "info")),
 		LogFormat:     strings.ToLower(env("LOG_FORMAT", "json")),
 		DI: Upstream{
@@ -194,14 +162,6 @@ func Load() (*Config, error) {
 	if c.Read.MaxInflight, err = envInt("READ_MAX_INFLIGHT", 4); err != nil && c.Read.Enabled() {
 		collect(err)
 	}
-	if c.DIBlindPollBudget, err = envInt("DI_BLIND_POLL_BUDGET", 60); err != nil &&
-		c.DI.Enabled() {
-		collect(err)
-	}
-	if c.ReadBlindPollBudget, err = envInt("READ_BLIND_POLL_BUDGET", 60); err != nil &&
-		c.Read.Enabled() {
-		collect(err)
-	}
 
 	if c.ResultTTL, err = envDuration("RESULT_TTL", 24*time.Hour); err != nil {
 		collect(err)
@@ -209,13 +169,7 @@ func Load() (*Config, error) {
 	if c.GCInterval, err = envDuration("GC_INTERVAL", 5*time.Minute); err != nil {
 		collect(err)
 	}
-	if c.ArtifactFetchTimeout, err = envDuration("ARTIFACT_FETCH_TIMEOUT", 2*time.Minute); err != nil {
-		collect(err)
-	}
 	if c.UploadTimeout, err = envDuration("UPLOAD_TIMEOUT", 10*time.Minute); err != nil {
-		collect(err)
-	}
-	if c.DISyncProbeTimeout, err = envDuration("DI_SYNC_PROBE_TIMEOUT", 60*time.Second); err != nil {
 		collect(err)
 	}
 	// As above, only an enabled surface's own timeout is validated.
@@ -257,11 +211,6 @@ func Load() (*Config, error) {
 	if c.DataDir == "" {
 		collect(errors.New("DATA_DIR must be set"))
 	}
-	switch c.DISyncMode {
-	case SyncAuto, SyncForce, SyncOff:
-	default:
-		collect(fmt.Errorf("DI_SYNC_ANALYZE must be auto, force or off, got %q", c.DISyncMode))
-	}
 	if c.QueueDepth < 0 {
 		collect(errors.New("QUEUE_DEPTH must not be negative"))
 	}
@@ -283,14 +232,8 @@ func Load() (*Config, error) {
 	if c.GCInterval <= 0 {
 		collect(errors.New("GC_INTERVAL must be positive"))
 	}
-	if c.ArtifactFetchTimeout <= 0 {
-		collect(errors.New("ARTIFACT_FETCH_TIMEOUT must be positive"))
-	}
 	if c.UploadTimeout <= 0 {
 		collect(errors.New("UPLOAD_TIMEOUT must be positive"))
-	}
-	if c.DISyncProbeTimeout <= 0 {
-		collect(errors.New("DI_SYNC_PROBE_TIMEOUT must be positive"))
 	}
 
 	if len(errs) > 0 {
@@ -378,35 +321,30 @@ func (c *Config) Redacted() map[string]any {
 		return u.MaxInflight
 	}
 	return map[string]any{
-		"addr":                 c.Addr,
-		"publicBaseUrl":        c.PublicBaseURL,
-		"dataDir":              c.DataDir,
-		"splitPages":           c.SplitPages,
-		"diEnabled":            c.DI.Enabled(),
-		"diUpstreamUrl":        SafeURL(c.DI.BaseURL),
-		"diUpstreamApiKey":     redact(c.DI.APIKey),
-		"diMaxInflight":        inflight(c.DI),
-		"diUpstreamTimeout":    c.DI.Timeout.String(),
-		"diSyncAnalyze":        string(c.DISyncMode),
-		"diBlindPollBudget":    c.DIBlindPollBudget,
-		"readBlindPollBudget":  c.ReadBlindPollBudget,
-		"diSyncProbeTimeout":   c.DISyncProbeTimeout.String(),
-		"readEnabled":          c.Read.Enabled(),
-		"readUpstreamUrl":      SafeURL(c.Read.BaseURL),
-		"readUpstreamApiKey":   redact(c.Read.APIKey),
-		"readMaxInflight":      inflight(c.Read),
-		"readSyncTimeout":      c.Read.Timeout.String(),
-		"queueDepth":           c.QueueDepth,
-		"resultTtl":            c.ResultTTL.String(),
-		"gcInterval":           c.GCInterval.String(),
-		"diskHighWatermark":    c.DiskHighWatermark,
-		"maxRequestBytes":      c.MaxRequestBytes,
-		"maxResultBytes":       c.MaxResultBytes,
-		"uploadTimeout":        c.UploadTimeout.String(),
-		"artifactFetchTimeout": c.ArtifactFetchTimeout.String(),
-		"shutdownGrace":        c.ShutdownGrace.String(),
-		"logLevel":             c.LogLevel,
-		"logFormat":            c.LogFormat,
+		"addr":               c.Addr,
+		"publicBaseUrl":      c.PublicBaseURL,
+		"dataDir":            c.DataDir,
+		"splitPages":         c.SplitPages,
+		"diEnabled":          c.DI.Enabled(),
+		"diUpstreamUrl":      SafeURL(c.DI.BaseURL),
+		"diUpstreamApiKey":   redact(c.DI.APIKey),
+		"diMaxInflight":      inflight(c.DI),
+		"diUpstreamTimeout":  c.DI.Timeout.String(),
+		"readEnabled":        c.Read.Enabled(),
+		"readUpstreamUrl":    SafeURL(c.Read.BaseURL),
+		"readUpstreamApiKey": redact(c.Read.APIKey),
+		"readMaxInflight":    inflight(c.Read),
+		"readSyncTimeout":    c.Read.Timeout.String(),
+		"queueDepth":         c.QueueDepth,
+		"resultTtl":          c.ResultTTL.String(),
+		"gcInterval":         c.GCInterval.String(),
+		"diskHighWatermark":  c.DiskHighWatermark,
+		"maxRequestBytes":    c.MaxRequestBytes,
+		"maxResultBytes":     c.MaxResultBytes,
+		"uploadTimeout":      c.UploadTimeout.String(),
+		"shutdownGrace":      c.ShutdownGrace.String(),
+		"logLevel":           c.LogLevel,
+		"logFormat":          c.LogFormat,
 	}
 }
 

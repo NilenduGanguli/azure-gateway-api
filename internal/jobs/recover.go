@@ -3,6 +3,8 @@ package jobs
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/NilenduGanguli/azure-gateway-api/internal/azerr"
@@ -111,14 +113,14 @@ func (m *Manager) recoverOne(ctx context.Context, r *surfaceRunner, job *store.J
 	// already consumed it.
 	if !m.store.Blob.Exists(job.ID, store.KindInput) {
 		log.Warn("orphaned job has no input document; failing it")
-		m.failJob(ctx, r, job.ID, azerr.Internal(r.analyzer.Surface(),
-			"The analysis was interrupted and could not be resumed."), 0, 0)
+		m.failJob(ctx, r, job.ID, azerr.Internal(r.surface,
+			"The analysis was interrupted and could not be resumed."), 0, 0, 0, 0)
 		return false
 	}
 	if job.Attempts >= maxAttempts {
 		log.Warn("orphaned job exhausted its attempts; failing it")
-		m.failJob(ctx, r, job.ID, azerr.Internal(r.analyzer.Surface(),
-			"The analysis was interrupted repeatedly and could not be completed."), 0, 0)
+		m.failJob(ctx, r, job.ID, azerr.Internal(r.surface,
+			"The analysis was interrupted repeatedly and could not be completed."), 0, 0, 0, 0)
 		return false
 	}
 
@@ -213,6 +215,7 @@ func (m *Manager) sweepOnce(ctx context.Context, reclaim bool) {
 	}
 
 	m.sweepOrphanBlobs(ctx, now)
+	m.sweepWork(now)
 
 	if reclaim {
 		// Catch workers that died while this process kept running. The boot pass cannot cover
@@ -221,6 +224,52 @@ func (m *Manager) sweepOnce(ctx context.Context, reclaim bool) {
 	}
 
 	m.evictUnderPressure(ctx)
+}
+
+// workAge is how old a work folder must be before the sweeper may remove it. An hour is past the
+// longest part timeout many times over, and the claims check already protects every folder whose
+// job or :syncAnalyze request is still running here.
+const workAge = time.Hour
+
+// WorkRoot is where the engines and :syncAnalyze keep per-job scratch folders: part PDFs, merged
+// results, and a synchronous request's saved body.
+func WorkRoot(dataDir string) string { return filepath.Join(dataDir, "work") }
+
+// sweepWork removes work folders left behind by a crash.
+//
+// The engine removes its folder on every return path, so a folder that outlives its job means
+// the process died mid-analysis. The job itself is re-run from its stored input, never from the
+// folder, so nothing in it is worth keeping: a job's folder goes once the job is no longer
+// claimed in this process, and a sync-<id> folder once its request is no longer tracked. Both
+// must also be older than workAge, so a folder created a moment before its claim is never caught.
+func (m *Manager) sweepWork(now time.Time) {
+	root := WorkRoot(m.store.DataDir())
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			m.log.Warn("could not scan the work folder", "error", err)
+		}
+		return
+	}
+	cutoff := now.Add(-workAge)
+	var removed int
+	for _, e := range entries {
+		if !e.IsDir() || m.claimed(e.Name()) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(root, e.Name())); err != nil {
+			m.log.Warn("could not remove a stale work folder", "folder", e.Name(), "error", err)
+			continue
+		}
+		removed++
+	}
+	if removed > 0 {
+		m.log.Info("removed work folders left by a previous run", "count", removed)
+	}
 }
 
 // evictUnderPressure drops the oldest completed jobs when the volume approaches full.

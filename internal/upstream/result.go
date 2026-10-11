@@ -11,7 +11,6 @@ import (
 
 	"github.com/NilenduGanguli/azure-gateway-api/internal/azerr"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/jsonx"
-	"github.com/NilenduGanguli/azure-gateway-api/internal/store"
 )
 
 // Result is a successful analysis.
@@ -28,46 +27,23 @@ type Result struct {
 	// a client the way the container would has to know which one it holds.
 	Bare bool
 
-	Mode           store.UpstreamMode
 	UpstreamMS     int64
 	UpstreamStatus int
-	// UpstreamOpID is the container's own operation id, set only when the asynchronous path ran.
-	// It is what the result-file endpoints are addressed by.
-	UpstreamOpID string
-
-	// affinity is the job's connection pool and cookie jar, kept alive past Analyze whenever an
-	// upstream operation exists. The result-file endpoints are addressed by that operation's id,
-	// which is meaningful only to the replica that minted it — fetching the searchable PDF or a
-	// figure over the shared pool lands on an arbitrary replica and 404s.
-	affinity *affinityClient
 }
 
 // Size is the length of the analyzeResult member.
 func (r *Result) Size() int64 { return r.End - r.Start }
 
-// Cleanup removes the temporary upstream response and releases the job's affinity client. It is
-// safe to call more than once.
+// Cleanup removes the temporary upstream response. It is safe to call more than once, and on nil.
 func (r *Result) Cleanup() {
 	if r == nil {
 		return
-	}
-	if r.affinity != nil {
-		r.affinity.close()
-		r.affinity = nil
 	}
 	if r.Path == "" {
 		return
 	}
 	_ = os.Remove(r.Path)
 	r.Path = ""
-}
-
-// client returns the HTTP client a follow-up call about this result must use.
-func (r *Result) client(fallback *http.Client) *http.Client {
-	if r != nil && r.affinity != nil {
-		return r.affinity.http
-	}
-	return fallback
 }
 
 // jsonUnmarshal is a thin alias so the shared helpers read the same everywhere.
@@ -222,18 +198,11 @@ func inspectOperation(path string, size int64, surface azerr.Surface) (*operatio
 type statusString string
 
 const (
-	statusNotStarted statusString = "notStarted"
-	statusRunning    statusString = "running"
-	statusSucceeded  statusString = "succeeded"
-	statusFailed     statusString = "failed"
+	statusSucceeded statusString = "succeeded"
+	statusFailed    statusString = "failed"
 )
 
-func isFailed(s string) bool    { return strings.EqualFold(s, string(statusFailed)) }
-func isSucceeded(s string) bool { return strings.EqualFold(s, string(statusSucceeded)) }
-func isPending(s string) bool {
-	return strings.EqualFold(s, string(statusRunning)) ||
-		strings.EqualFold(s, string(statusNotStarted))
-}
+func isFailed(s string) bool { return strings.EqualFold(s, string(statusFailed)) }
 
 func min64(a, b int64) int64 {
 	if a < b {
