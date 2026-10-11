@@ -4,6 +4,7 @@ go 1.26.0
 
 require (
 	github.com/pdfcpu/pdfcpu v0.16.1
+	github.com/rivo/uniseg v0.4.7
 	modernc.org/sqlite v1.58.0
 )
 
