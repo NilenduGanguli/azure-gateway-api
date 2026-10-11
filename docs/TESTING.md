@@ -238,7 +238,7 @@ deserialiser. Break one and the failure is remote, opaque and blamed on the wron
 | `TestStatusStringsAreExact` | `fidelity_test.go` | Only `notStarted`, `running`, `succeeded`, `failed` are terminal-safe across all four SDK families. |
 | `TestPollBodyIsAlwaysJSONWithStatus` | `fidelity_test.go` | Python raises on an empty body, .NET treats it as failure, Java NPEs. |
 | `TestNeverRedirects` / `TestNeverCompressesUnlessAsked` | `fidelity_test.go` | .NET sets `AllowAutoRedirect = false` and sends no `Accept-Encoding`. |
-| `TestReadBareFailedStatusIsTranslated` | `behaviour_test.go` | Read's bare `{"status":"Failed"}` must become lowercase `failed` with a real error object. |
+| `TestReadBareFailedStatusIsTranslated` | `behaviour_test.go` | Read's bare `{"status":"Failed"}` must become lowercase `failed`. The envelope carries no `error` member, which `ReadOperationResult` does not declare (`TestFailedReadEnvelopeHasNoErrorMember`). |
 | `TestLegacyFormRecognizerPrefixIsServed` | `legacy_family_test.go` | `Operation-Location` must echo the family the caller arrived on. |
 | `TestPollNeverReturnsABodyWithoutStatus` | `sync_test.go` | A succeeded row whose result blob has gone must answer `200 failed`, never a bare 500 that Java deserialises into an NPE. |
 | `TestSignalDoesNotAbortInFlightRequests` | `shutdown_test.go` | SIGTERM must not cancel in-flight handlers; `Shutdown` must actually wait. |

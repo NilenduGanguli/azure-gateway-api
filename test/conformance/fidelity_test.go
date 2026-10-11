@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -316,6 +317,27 @@ func TestFailedAnalysisIsHTTP200(t *testing.T) {
 	}
 	if _, ok := body["error"]; !ok {
 		t.Error("failed DI envelope has no error object")
+	}
+}
+
+// TestFailedReadEnvelopeHasNoErrorMember: ReadOperationResult declares status, the two
+// timestamps and analyzeResult, and nothing else, in v3.0, v3.1 and v3.2 alike, and no real Read
+// response carries an error member. A failed Read operation is exactly {"status":"failed", ...}:
+// the diagnostic goes to the gateway's log and /_gw/jobs, never onto the wire.
+func TestFailedReadEnvelopeHasNoErrorMember(t *testing.T) {
+	h := newHarness(t, harnessOpts{read: mockazure.Options{FailAnalysis: true}})
+	resp := h.post(readAnalyze, "%PDF-1.7 fake")
+	loc := resp.Header.Get("Operation-Location")
+	_ = resp.Body.Close()
+
+	body := h.pollUntil(loc, "failed")
+	keys := make([]string, 0, len(body))
+	for k := range body {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if got := strings.Join(keys, " "); got != "createdDateTime lastUpdatedDateTime status" {
+		t.Errorf("failed Read envelope has members %q, want only status and the two timestamps", got)
 	}
 }
 

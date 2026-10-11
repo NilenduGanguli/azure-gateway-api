@@ -245,10 +245,11 @@ func (s *Server) poll(w http.ResponseWriter, r *http.Request, surface azerr.Surf
 		// That is how both containers behave, and it is the dominant failure mode on both
 		// surfaces: code switching on HTTP status alone mis-maps every analysis failure.
 		//
-		// The Read schema models no error member for a failed operation. One is included anyway:
-		// generated SDK models ignore unknown properties, and a failure with no diagnostics at
-		// all is exactly the dead end the container's own {"status":"Failed"} creates.
-		if job.ErrorJSON != "" {
+		// Only the DI envelope has an error member. ReadOperationResult declares none in v3.0,
+		// v3.1 or v3.2, and the service never sends one, so a failed Read operation is just
+		// {"status":"failed", ...}; its diagnostic is in the log and in /_gw/jobs. See
+		// azerr.OperationError's own contract.
+		if job.ErrorJSON != "" && surface != azerr.SurfaceRead {
 			var e azerr.Error
 			if json.Unmarshal([]byte(job.ErrorJSON), &e) == nil && e.Code != "" {
 				env.Error = &e

@@ -572,10 +572,13 @@ megabytes — and both are bounded (`maxErrorBody` = 64 KiB for the top-level er
 `errors` array) so a misbehaving upstream cannot pin memory.
 
 What the client then sees: the gateway's own poll response for a failed job is **HTTP 200** with
-`"status":"failed"` and an `error` object, on **both** surfaces. Including it on Read deviates from
-the Read schema deliberately: generated SDK models ignore unknown properties, and a failure with no
-diagnostics is exactly the dead end the container's own bare `{"status":"Failed"}` creates. The
-comment in `(*Server).poll` in `internal/surface/surface.go` says so. Related: the bare
+`"status":"failed"` on **both** surfaces. Only the DI envelope carries an `error` object. A failed
+Read envelope is exactly `{"status":"failed","createdDateTime":…,"lastUpdatedDateTime":…}`, because
+`ReadOperationResult` declares no `error` member in any version and the service never sends one.
+The diagnosis found above goes to the gateway's log and to `/_gw/jobs`. Until 2026-10-11 the
+gateway added an `error` member on Read too, and the strict schema validation in
+`test/conformance/azureshape_test.go` flagged it. The comment in `(*Server).poll` in
+`internal/surface/surface.go` says so. Related: the bare
 `{"status":"Failed"}` — capital F, no code, no message — that CV `syncAnalyze` produces is matched
 case-insensitively by `azerr.ParseUpstream` and by `isFailed` on every path that *interprets* it.
 It is not rewritten on the client-facing synchronous passthroughs: the container returns it at HTTP
