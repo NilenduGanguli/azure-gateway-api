@@ -489,6 +489,275 @@ def test_sync_analyze_large_pdf():
                 R.ok(f"{name} page spans are ascending and inside the merged content")
 
 
+# ------------------------------------------------------------------ strict SDK model round trip
+#
+# The checks above prove the SDKs accept the gateway's answers. These prove the answers carry
+# nothing the SDK models do not know and lack nothing they require: every member of a poll body is
+# walked against the SDK's own model, a member it has no attribute for, a missing required member,
+# a JSON type the model would not produce (an integer written as a float, a string for a number),
+# an enum value outside the model's, or an explicit null is a failure, and the model must give the
+# body back unchanged — as_dict() for Document Intelligence, a serialize round trip for Read. A body
+# that passes is one a generated model reads without parking anything in additional_properties.
+
+import datetime as _dt
+import enum
+import json
+import re
+import typing
+
+_RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
+
+
+def _json_type(v):
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "bool"
+    return {int: "int", float: "float", str: "str", list: "array", dict: "object"}.get(type(v), type(v).__name__)
+
+
+def _diff(a, b, path, out):
+    """Differences between the input a and its round trip b, as (path, detail)."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        for k in a:
+            if k not in b:
+                out.append((f"{path}.{k}", "lost in the round trip"))
+            else:
+                _diff(a[k], b[k], f"{path}.{k}", out)
+        for k in b:
+            if k not in a:
+                out.append((f"{path}.{k}", "added by the round trip"))
+    elif isinstance(a, list) and isinstance(b, list):
+        if len(a) != len(b):
+            out.append((path, f"{len(a)} items became {len(b)}"))
+        for i, (x, y) in enumerate(zip(a, b)):
+            _diff(x, y, f"{path}[{i}]", out)
+    elif a != b or _json_type(a) != _json_type(b) and not (
+            {_json_type(a), _json_type(b)} <= {"int", "float"} and a == b):
+        out.append((path, f"{a!r:.60} became {b!r:.60}"))
+
+
+def _di_models():
+    """azure-ai-documentintelligence's model base and models, wherever this version keeps them."""
+    from azure.ai.documentintelligence import models
+    try:
+        from azure.ai.documentintelligence import _model_base as base
+    except ImportError:
+        from azure.ai.documentintelligence._utils import model_base as base
+    return base, models
+
+
+def _di_strict(base, models, cls, data, path, bad, _hints={}):
+    """Walk data against the typespec model cls, recording every departure in bad."""
+    if cls not in _hints:
+        cls.__new__(cls)  # computes _attr_to_rest_field
+        hints = typing.get_type_hints(cls, globalns=vars(__import__(cls.__module__, fromlist=["_"])),
+                                      localns={"_models": models})
+        _hints[cls] = {rf._rest_name: hints.get(attr, typing.Any)
+                       for attr, rf in cls._attr_to_rest_field.items()}
+    fields = _hints[cls]
+    for k in data:
+        if k not in fields:
+            bad.append((f"{path}.{k}", f"{cls.__name__} has no member {k!r}"))
+    for name, hint in fields.items():
+        if name not in data:
+            if not (typing.get_origin(hint) is typing.Union and type(None) in typing.get_args(hint)):
+                bad.append((f"{path}.{name}", f"{cls.__name__}.{name} is required"))
+            continue
+        _di_value(base, models, data[name], hint, f"{path}.{name}", bad)
+
+
+def _di_value(base, models, value, hint, path, bad):
+    origin, args = typing.get_origin(hint), typing.get_args(hint)
+    if origin is typing.Union:
+        if value is None:
+            bad.append((path, "an explicit null, where the service leaves the member out"))
+            return
+        rest = [a for a in args if a is not type(None)]
+        enums = [a for a in rest if isinstance(a, type) and issubclass(a, enum.Enum)]
+        if enums and str in rest:
+            if not isinstance(value, str) or value not in [e.value for e in enums[0]]:
+                bad.append((path, f"{value!r} is not a {enums[0].__name__}"))
+            return
+        if len(rest) == 1:
+            _di_value(base, models, value, rest[0], path, bad)
+        return
+    if origin is typing.Literal:
+        if value not in args:
+            bad.append((path, f"{value!r} is not one of {args}"))
+    elif origin in (list, typing.List):
+        if not isinstance(value, list):
+            bad.append((path, f"an array is expected, not {_json_type(value)}"))
+            return
+        for i, v in enumerate(value):
+            _di_value(base, models, v, args[0], f"{path}[{i}]", bad)
+    elif origin in (dict, typing.Dict):
+        if isinstance(value, dict):
+            for k, v in value.items():
+                _di_value(base, models, v, args[1], f"{path}.{k}", bad)
+    elif isinstance(hint, type) and issubclass(hint, base.Model):
+        if not isinstance(value, dict):
+            bad.append((path, f"{hint.__name__} expects an object, not {_json_type(value)}"))
+            return
+        _di_strict(base, models, hint, value, path, bad)
+    elif hint is int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            bad.append((path, f"an integer is expected, not {_json_type(value)} {value!r:.40}"))
+    elif hint is float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            bad.append((path, f"a number is expected, not {_json_type(value)}"))
+    elif hint is str or hint is bool:
+        if not isinstance(value, hint):
+            bad.append((path, f"{hint.__name__} is expected, not {_json_type(value)}"))
+    elif hint is _dt.datetime:
+        if not isinstance(value, str) or not _RFC3339.match(value):
+            bad.append((path, f"{value!r} is not an RFC 3339 date-time"))
+    elif isinstance(hint, type) and issubclass(hint, enum.Enum):
+        if value not in [e.value for e in hint]:
+            bad.append((path, f"{value!r} is not a {hint.__name__}"))
+
+
+def di_round_trip(envelope):
+    """Departures of a DI poll body from azure-ai-documentintelligence's models, or [] for none."""
+    base, models = _di_models()
+    bad = []
+    known = {"status", "createdDateTime", "lastUpdatedDateTime", "error", "analyzeResult"}
+    for k in envelope:
+        if k not in known:
+            bad.append((k, f"AnalyzeOperation has no member {k!r}"))
+    for k in ("createdDateTime", "lastUpdatedDateTime"):
+        _di_value(base, models, envelope.get(k), _dt.datetime, k, bad)
+    _di_value(base, models, envelope.get("status"),
+              typing.Union[str, models.DocumentIntelligenceOperationStatus], "status", bad)
+    result = envelope.get("analyzeResult")
+    if result is not None:
+        _di_strict(base, models, models.AnalyzeResult, result, "analyzeResult", bad)
+        # The poller does exactly this with the body's analyzeResult.
+        model = base._deserialize(models.AnalyzeResult, result)
+        back = json.loads(json.dumps(model.as_dict(), cls=base.SdkJSONEncoder))
+        _diff(result, back, "analyzeResult", bad)
+    return bad
+
+
+def read_round_trip(envelope):
+    """Departures of a Read poll body from the Computer Vision SDK's msrest models, or []."""
+    from azure.cognitiveservices.vision.computervision import models
+    from msrest import Deserializer, Serializer
+    from msrest.serialization import Model
+
+    classes = {k: v for k, v in vars(models).items() if isinstance(v, type)}
+    bad = []
+
+    def walk(cls, data, path):
+        keys = {v["key"]: (attr, v["type"]) for attr, v in cls._attribute_map.items()}
+        rules = getattr(cls, "_validation", {}) or {}
+        for k in data:
+            if k not in keys:
+                bad.append((f"{path}.{k}", f"{cls.__name__} has no member {k!r}"))
+        for key, (attr, typ) in keys.items():
+            if key not in data:
+                if rules.get(attr, {}).get("required"):
+                    bad.append((f"{path}.{key}", f"{cls.__name__}.{attr} is required"))
+                continue
+            value(data[key], typ, f"{path}.{key}")
+
+    def value(v, typ, path):
+        if v is None:
+            bad.append((path, "an explicit null"))
+        elif typ.startswith("["):
+            if not isinstance(v, list):
+                bad.append((path, f"an array is expected, not {_json_type(v)}"))
+                return
+            for i, item in enumerate(v):
+                value(item, typ[1:-1], f"{path}[{i}]")
+        elif typ in ("int", "long"):
+            if isinstance(v, bool) or not isinstance(v, int):
+                bad.append((path, f"an integer is expected, not {_json_type(v)}"))
+        elif typ == "float":
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                bad.append((path, f"a number is expected, not {_json_type(v)}"))
+        elif typ == "str":
+            if not isinstance(v, str):
+                bad.append((path, f"a string is expected, not {_json_type(v)}"))
+        elif typ == "iso-8601":
+            if not isinstance(v, str) or not _RFC3339.match(v):
+                bad.append((path, f"{v!r} is not an RFC 3339 date-time"))
+        elif typ in classes:
+            cls = classes[typ]
+            if issubclass(cls, enum.Enum):
+                if v not in [e.value for e in cls]:
+                    bad.append((path, f"{v!r} is not a {typ}"))
+            elif issubclass(cls, Model):
+                if isinstance(v, dict):
+                    walk(cls, v, path)
+                else:
+                    bad.append((path, f"{typ} expects an object"))
+
+    walk(models.ReadOperationResult, envelope, "")
+    obj = Deserializer(classes)("ReadOperationResult", envelope)
+    back = json.loads(json.dumps(Serializer(classes).body(obj, "ReadOperationResult", keep_readonly=True)))
+    diffs = []
+    _diff(envelope, back, "", diffs)
+    # msrest respells a date-time it round-trips (…:16Z becomes …:16.000Z); the value is the same.
+    bad += [d for d in diffs if not re.search(r"DateTime$", d[0])]
+    return bad
+
+
+def _poll_raw(url, timeout_s):
+    """Poll an operation by urllib until it is terminal; return its JSON body."""
+    import urllib.request
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            body = json.loads(resp.read())
+        if body.get("status") in ("succeeded", "failed"):
+            return body
+        time.sleep(0.3)
+    raise TimeoutError(f"{url} never finished")
+
+
+def test_strict_sdk_round_trip():
+    """The large PDF, split and merged, read strictly through each SDK's own models."""
+    print(f"\nstrict SDK model round trip, {LARGE_PAGES}-page PDF")
+    import urllib.request
+
+    pdf = sample_pdf(LARGE_PAGES)
+    if pdf is None:
+        R.skip("strict SDK round trip", "pip install pillow to build the PDF")
+        return
+    for name, submit, check in (
+        ("azure-ai-documentintelligence AnalyzeResult",
+         f"{GATEWAY}/documentintelligence/documentModels/prebuilt-layout:analyze?api-version=2024-11-30",
+         di_round_trip),
+        ("computer vision ReadOperationResult", f"{GATEWAY}/vision/v3.2/read/analyze", read_round_trip),
+    ):
+        try:
+            req = urllib.request.Request(submit, data=pdf, method="POST",
+                                         headers={"Content-Type": "application/pdf"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                location = resp.headers["Operation-Location"]
+            body = _poll_raw(location, LARGE_TIMEOUT_S)
+        except Exception as e:  # noqa: BLE001
+            R.bad(name, f"{type(e).__name__}: {e}")
+            continue
+        if body.get("status") != "succeeded":
+            R.bad(name, f"the operation ended {body.get('status')}")
+            continue
+        try:
+            bad = check(body)
+        except ImportError as e:
+            R.skip(name, f"the SDK is not installed ({e})")
+            continue
+        except Exception as e:  # noqa: BLE001
+            R.bad(name, f"the SDK could not read the body: {type(e).__name__}: {e}")
+            continue
+        if bad:
+            shown = "; ".join(f"{p}: {d}" for p, d in bad[:5])
+            R.bad(name, f"{len(bad)} departures from the SDK model, e.g. {shown}")
+        else:
+            R.ok(f"{name}: every member known, typed and given back unchanged")
+
+
 def write_pdf(argv):
     """write-pdf PAGES PATH: write sample_pdf(PAGES) to PATH, for scripts/e2e-local.sh."""
     if len(argv) != 2 or not argv[0].isdigit() or int(argv[0]) < 1:
@@ -511,6 +780,7 @@ def main():
     test_document_intelligence_large_pdf()
     test_read_large_pdf()
     test_sync_analyze_large_pdf()
+    test_strict_sdk_round_trip()
 
     print("\n" + "=" * 60)
     print(f"{len(R.passed)} passed, {len(R.failed)} failed")
