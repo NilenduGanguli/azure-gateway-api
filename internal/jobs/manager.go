@@ -14,16 +14,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"mime"
 	"net/url"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/NilenduGanguli/azure-gateway-api/internal/azerr"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/config"
-	"github.com/NilenduGanguli/azure-gateway-api/internal/jsonx"
+	"github.com/NilenduGanguli/azure-gateway-api/internal/engine"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/store"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/upstream"
 )
@@ -43,8 +41,13 @@ var ErrBusy = errors.New("jobs: no capacity")
 
 // surfaceRunner is one surface's worker pool and admission gate.
 type surfaceRunner struct {
-	name     string
-	analyzer upstream.Analyzer
+	name    string
+	surface azerr.Surface
+	// engine runs each job's analysis. Its scheduler, not the runner, bounds the calls the
+	// container sees: a split job makes several at once, and :syncAnalyze requests share the
+	// same slots, so only one scheduler per surface can hold the container to MaxInflight.
+	engine *engine.Engine
+	client *upstream.Client
 	// admits bounds work in the system: one token per accepted-but-unfinished job. Its capacity
 	// is MaxInflight + QueueDepth, so with the default QueueDepth of zero a submit is rejected
 	// the moment every worker is busy.
@@ -52,16 +55,12 @@ type surfaceRunner struct {
 	queue  chan string
 	// workers is how many jobs actually run at once.
 	workers int
-	// upstream bounds concurrent calls into the container. It is separate from admits because
-	// admits is sized MaxInflight+QueueDepth: with a queue configured, admission alone would let
-	// synchronous passthroughs put more work on the container than MaxInflight allows.
-	upstream chan struct{}
 	// metadata bounds the read-only proxy lane. Those calls are cheap and must not be able to
 	// starve analysis, nor pile up without limit against a wedged container.
 	metadata chan struct{}
 }
 
-// Manager runs jobs for both surfaces.
+// Manager runs jobs for the configured surfaces.
 type Manager struct {
 	cfg   *config.Config
 	store *store.Store
@@ -103,13 +102,20 @@ type Manager struct {
 }
 
 // Options configures a Manager.
+//
+// A surface whose engine is nil is not configured: it gets no runner, so it admits nothing and
+// its routes are not registered.
 type Options struct {
 	Config *config.Config
 	Store  *store.Store
 	Logger *slog.Logger
-	DI     upstream.Analyzer
-	Read   upstream.Analyzer
-	Now    func() time.Time
+	DI     *engine.Engine
+	Read   *engine.Engine
+	// DIClient and ReadClient serve health checks and the GET passthroughs. Each is nil exactly
+	// when its engine is.
+	DIClient   *upstream.Client
+	ReadClient *upstream.Client
+	Now        func() time.Time
 }
 
 // New builds a Manager. Start must be called to begin processing.
@@ -126,8 +132,14 @@ func New(opts Options) *Manager {
 		runners: map[string]*surfaceRunner{},
 		claims:  map[string]struct{}{},
 	}
-	m.runners[SurfaceDI] = newRunner(SurfaceDI, opts.DI, opts.Config.DI.MaxInflight, opts.Config.QueueDepth)
-	m.runners[SurfaceRead] = newRunner(SurfaceRead, opts.Read, opts.Config.Read.MaxInflight, opts.Config.QueueDepth)
+	if opts.DI != nil {
+		m.runners[SurfaceDI] = newRunner(SurfaceDI, azerr.SurfaceDI, opts.DI, opts.DIClient,
+			opts.Config.DI.MaxInflight, opts.Config.QueueDepth)
+	}
+	if opts.Read != nil {
+		m.runners[SurfaceRead] = newRunner(SurfaceRead, azerr.SurfaceRead, opts.Read,
+			opts.ReadClient, opts.Config.Read.MaxInflight, opts.Config.QueueDepth)
+	}
 	return m
 }
 
@@ -137,18 +149,23 @@ const (
 	SurfaceRead = "read"
 )
 
-func newRunner(name string, a upstream.Analyzer, inflight, queueDepth int) *surfaceRunner {
+func newRunner(name string, s azerr.Surface, e *engine.Engine, c *upstream.Client,
+	inflight, queueDepth int) *surfaceRunner {
 	if inflight < 1 {
 		inflight = 1
+	}
+	if c == nil {
+		c = e.Client()
 	}
 	capacity := inflight + queueDepth
 	return &surfaceRunner{
 		name:     name,
-		analyzer: a,
+		surface:  s,
+		engine:   e,
+		client:   c,
 		admits:   make(chan struct{}, capacity),
 		queue:    make(chan string, capacity),
 		workers:  inflight,
-		upstream: make(chan struct{}, inflight),
 		metadata: make(chan struct{}, 4),
 	}
 }
@@ -246,15 +263,6 @@ func (m *Manager) Admit(surface string) (release func(), err error) {
 	}
 }
 
-// AdmitUpstream reserves one of the container's concurrency slots.
-//
-// Workers hold one for the duration of an analysis and synchronous passthroughs hold one for the
-// duration of their call, so the container never sees more than MaxInflight concurrent requests
-// regardless of how the admission queue is configured.
-func (m *Manager) AdmitUpstream(surface string) (release func(), err error) {
-	return acquire(m.runners[surface], func(r *surfaceRunner) chan struct{} { return r.upstream })
-}
-
 // AdmitMetadata reserves a slot on the read-only proxy lane.
 func (m *Manager) AdmitMetadata(surface string) (release func(), err error) {
 	return acquire(m.runners[surface], func(r *surfaceRunner) chan struct{} { return r.metadata })
@@ -272,6 +280,24 @@ func acquire(r *surfaceRunner, pick func(*surfaceRunner) chan struct{}) (func(),
 	default:
 		return nil, ErrBusy
 	}
+}
+
+// Track marks a :syncAnalyze request's work folder as in use until release is called, so the
+// sweeper cannot remove it from under a long analysis.
+func (m *Manager) Track(id string) (release func()) {
+	if !m.claim(id) {
+		return func() {}
+	}
+	var once sync.Once
+	return func() { once.Do(func() { m.unclaim(id) }) }
+}
+
+// claimed reports whether this process has id queued, running or tracked.
+func (m *Manager) claimed(id string) bool {
+	m.claimMu.Lock()
+	defer m.claimMu.Unlock()
+	_, ok := m.claims[id]
+	return ok
 }
 
 // claim reserves a job id for this process, reporting false if it is already claimed.
@@ -315,27 +341,41 @@ func (m *Manager) Enqueue(surface, jobID string) error {
 	}
 }
 
-// Capacity reports current occupancy for the admin surface.
+// Capacity reports current occupancy for the admin surface, for configured surfaces only.
+//
+// The upstream numbers come from the engine's scheduler, which every analysis call on the surface
+// goes through. The key names are the admin surface's contract and stay stable.
 func (m *Manager) Capacity() map[string]map[string]int {
 	out := map[string]map[string]int{}
 	for name, r := range m.runners {
+		st := r.engine.Sched().Stats()
 		out[name] = map[string]int{
-			"inFlight":      len(r.admits),
-			"limit":         cap(r.admits),
-			"workers":       r.workers,
-			"queued":        len(r.queue),
-			"upstreamInUse": len(r.upstream),
-			"upstreamLimit": cap(r.upstream),
-			"metadataInUse": len(r.metadata),
+			"inFlight":        len(r.admits),
+			"limit":           cap(r.admits),
+			"workers":         r.workers,
+			"queued":          len(r.queue),
+			"upstreamInUse":   st.InUse,
+			"upstreamWaiting": st.Waiting,
+			"upstreamLimit":   st.Limit,
+			"metadataInUse":   len(r.metadata),
 		}
 	}
 	return out
 }
 
-// Analyzer exposes a surface's upstream client, for health reporting.
-func (m *Manager) Analyzer(surface string) upstream.Analyzer {
+// Client is a configured surface's upstream client, for health checks and the GET passthroughs,
+// or nil when the surface is not configured.
+func (m *Manager) Client(surface string) *upstream.Client {
 	if r, ok := m.runners[surface]; ok {
-		return r.analyzer
+		return r.client
+	}
+	return nil
+}
+
+// Engine is a configured surface's engine, or nil when the surface is not configured.
+func (m *Manager) Engine(surface string) *engine.Engine {
+	if r, ok := m.runners[surface]; ok {
+		return r.engine
 	}
 	return nil
 }
@@ -354,8 +394,9 @@ func (m *Manager) worker(ctx context.Context, r *surfaceRunner, n int) {
 
 // run executes one job to a terminal state.
 //
-// The admission slot is released here rather than at submit time, so the number of concurrent
-// upstream calls is bounded by the same number that bounds accepted work.
+// The admission slot is released here rather than at submit time, so accepted work stays bounded
+// until it is finished. The calls the job makes into the container are bounded separately, by the
+// engine's scheduler.
 func (m *Manager) run(ctx context.Context, r *surfaceRunner, owner, id string) {
 	log := m.log.With("job", id, "surface", r.name)
 
@@ -365,7 +406,7 @@ func (m *Manager) run(ctx context.Context, r *surfaceRunner, owner, id string) {
 		if rec := recover(); rec != nil {
 			log.Error("worker panicked", "panic", rec)
 			m.failJob(context.WithoutCancel(ctx), r, id,
-				azerr.Internal(r.analyzer.Surface(), "An unexpected error occurred."), 0, 0)
+				azerr.Internal(r.surface, "An unexpected error occurred."), 0, 0, 0, 0)
 		}
 	}()
 
@@ -387,40 +428,27 @@ func (m *Manager) run(ctx context.Context, r *surfaceRunner, owner, id string) {
 	stopHeartbeat := m.startHeartbeat(ctx, id)
 	defer stopHeartbeat()
 
-	// Hold a container slot for the analysis itself, so synchronous passthroughs and workers
-	// together never exceed MaxInflight against the upstream.
-	releaseUpstream, err := m.AdmitUpstream(r.name)
-	for err != nil {
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(100 * time.Millisecond):
-		}
-		releaseUpstream, err = m.AdmitUpstream(r.name)
-	}
-	defer releaseUpstream()
-
-	doc := upstream.Document{
-		ContentType: job.ContentType,
-		Size:        job.InputBytes,
-		Open: func() (io.ReadCloser, error) {
-			f, _, err := m.store.Blob.Open(id, store.KindInput)
-			return f, err
-		},
-	}
 	query, _ := url.ParseQuery(job.Query)
-
-	res, err := r.analyzer.Analyze(ctx, doc, upstream.Request{
-		ModelID:          job.ModelID,
-		Query:            query,
-		Prefix:           job.Prefix,
-		RequireOperation: wantsArtifacts(query),
+	out, err := r.engine.Run(ctx, engine.Input{
+		JobID:       id,
+		ContentType: job.ContentType,
+		Path:        m.store.Blob.Path(id, store.KindInput),
+		Size:        job.InputBytes,
+		ModelID:     job.ModelID,
+		Prefix:      job.Prefix,
+		Query:       query,
 	})
 	if err != nil {
+		var attempts, parts int
+		var upstreamMS int64
+		if out != nil {
+			attempts, parts, upstreamMS = out.Attempts, out.Parts, out.UpstreamMS
+			out.Cleanup()
+		}
 		// Cancellation is checked first and on the context itself, not on the error. During
-		// shutdown the upstream client may already have wrapped the cancellation in a
-		// surface-shaped error, and classifying on the error alone would mark a job terminally
-		// failed that the recovery pass could have resumed — after its 202 was already sent.
+		// shutdown the engine may already have wrapped the cancellation in a surface-shaped
+		// error, and classifying on the error alone would mark a job terminally failed that the
+		// recovery pass could have resumed — after its 202 was already sent.
 		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			log.Info("job interrupted by shutdown; it will be recovered on the next start")
 			return
@@ -431,25 +459,28 @@ func (m *Manager) run(ctx context.Context, r *surfaceRunner, owner, id string) {
 			// and internal packages ("open /data/blobs/ab/cd/....input: no such file"), and this
 			// message is served to any unauthenticated caller polling the operation.
 			log.Error("analysis failed with an unmapped error", "error", err)
-			apiErr = azerr.Internal(r.analyzer.Surface(), "")
+			apiErr = azerr.Internal(r.surface, "")
 		}
 		log.Warn("analysis failed", "code", apiErr.Code, "message", apiErr.Message)
-		m.failJob(context.WithoutCancel(ctx), r, id, apiErr, 0, 0)
+		m.failJob(context.WithoutCancel(ctx), r, id, apiErr, 0, upstreamMS, attempts, parts)
 		return
 	}
-	defer res.Cleanup()
+	defer out.Cleanup()
 
-	if err := m.finish(ctx, r, job, res); err != nil {
+	size, err := m.finish(ctx, job, out)
+	if err != nil {
 		log.Error("could not persist result", "error", err)
 		m.failJob(context.WithoutCancel(ctx), r, id,
-			azerr.Internal(r.analyzer.Surface(), "The result could not be stored."), 0, res.UpstreamMS)
+			azerr.Internal(r.surface, "The result could not be stored."), 0, out.UpstreamMS,
+			out.Attempts, out.Parts)
 		return
 	}
-	log.Info("job succeeded",
-		"mode", string(res.Mode), "upstreamMs", res.UpstreamMS, "resultBytes", res.Size())
+	log.Info("job succeeded", "upstreamMs", out.UpstreamMS, "attempts", out.Attempts,
+		"parts", out.Parts, "fallback", out.Fallback, "resultBytes", size)
 }
 
-// finish composes and stores the exact envelope the gateway will later serve.
+// finish composes and stores the exact envelope the gateway will later serve, and returns its
+// size.
 //
 // Writing the final bytes now, rather than assembling them per poll, means a successful poll is a
 // plain file stream with an exact Content-Length: no re-serialisation, and no parsing of a result
@@ -457,19 +488,19 @@ func (m *Manager) run(ctx context.Context, r *surfaceRunner, owner, id string) {
 // ctx is the live worker context, used only to notice shutdown. The store writes below run under
 // a derived uncancellable context: the analysis is already done, and losing it to a signal would
 // mean paying the container to redo it.
-func (m *Manager) finish(ctx context.Context, r *surfaceRunner, job *store.Job, res *upstream.Result) error {
+func (m *Manager) finish(ctx context.Context, job *store.Job, out *engine.Output) (int64, error) {
 	storeCtx := context.WithoutCancel(ctx)
 
-	src, err := os.Open(res.Path)
+	src, err := os.Open(out.Path)
 	if err != nil {
-		return fmt.Errorf("jobs: reopen upstream result: %w", err)
+		return 0, fmt.Errorf("jobs: reopen engine output: %w", err)
 	}
 	defer func() { _ = src.Close() }()
 
 	now := m.now()
 	w, err := m.store.Blob.Create(job.ID, store.KindResult, 0)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	prefix := fmt.Sprintf(
@@ -478,222 +509,51 @@ func (m *Manager) finish(ctx context.Context, r *surfaceRunner, job *store.Job, 
 
 	if _, err := io.WriteString(w, prefix); err != nil {
 		w.Abort()
-		return err
+		return 0, err
 	}
-	if _, err := io.Copy(w, io.NewSectionReader(src, res.Start, res.End-res.Start)); err != nil {
+	if _, err := io.Copy(w, io.NewSectionReader(src, out.Start, out.End-out.Start)); err != nil {
 		w.Abort()
-		return err
+		return 0, err
 	}
 	if _, err := io.WriteString(w, "}"); err != nil {
 		w.Abort()
-		return err
+		return 0, err
 	}
 	size := w.Written()
 	if err := w.Commit(); err != nil {
-		return err
+		return 0, err
 	}
 
-	hasPDF, figures := m.fetchArtifacts(ctx, storeCtx, r, job, res)
-
 	ok, err := m.store.Succeed(storeCtx, job.ID, m.store.Blob.Path(job.ID, store.KindResult), size,
-		res.Mode, res.UpstreamMS, hasPDF, strings.Join(figures, ","), now)
+		out.UpstreamMS, out.Attempts, out.Parts, now)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if !ok {
 		// The row went away while this job ran — a client DELETE, or disk-pressure eviction. The
-		// artifacts just written reference nothing, so they are removed here rather than left for
-		// the orphan sweep to find later.
+		// result just written references nothing, so it is removed here rather than left for the
+		// orphan sweep to find later.
 		m.log.Info("job completed but its row was already deleted; discarding the result",
 			"job", job.ID)
 		_ = m.store.Blob.RemoveAll(job.ID)
-		return nil
+		return size, nil
 	}
 	// The input is only needed to retry the upstream call, which can no longer happen.
 	_ = m.store.Blob.Remove(job.ID, store.KindInput)
-	return nil
-}
-
-// fetchArtifacts eagerly retrieves result files the client asked for.
-//
-// They must be fetched now: the result-file endpoints are addressed by the container's own
-// operation id, whose lifetime is governed by the container's StorageTimeToLiveInMinutes and whose
-// owning replica may disappear at any time.
-//
-// The phase is bounded twice over, because an artifact is a bonus and the analysis it belongs to
-// is already stored. It gets one aggregate budget, so a wedged container cannot turn N figures
-// into N times the per-request timeout; and it stops between artifacts once the worker context is
-// cancelled, so a shutdown is never held up by work no client is waiting on. A missing artifact
-// yields a clean 404 from the gateway, which is a far better outcome than a SIGKILLed pod.
-//
-// liveCtx observes shutdown; storeCtx survives it, for the writes that must land.
-func (m *Manager) fetchArtifacts(liveCtx, storeCtx context.Context, r *surfaceRunner,
-	job *store.Job, res *upstream.Result) (hasPDF bool, figures []string) {
-
-	di, ok := r.analyzer.(*upstream.DIClient)
-	if !ok || res.UpstreamOpID == "" {
-		return false, nil
-	}
-	query, _ := url.ParseQuery(job.Query)
-	outputs := outputSet(query)
-	if len(outputs) == 0 {
-		return false, nil
-	}
-	log := m.log.With("job", job.ID)
-
-	budget := m.cfg.ArtifactFetchTimeout
-	if budget <= 0 {
-		budget = 2 * time.Minute
-	}
-	actx, cancel := context.WithTimeout(storeCtx, budget)
-	defer cancel()
-
-	// abort reports whether to stop fetching, and says why once.
-	var aborted bool
-	abort := func(what string) bool {
-		if aborted {
-			return true
-		}
-		switch {
-		case liveCtx.Err() != nil:
-			log.Warn("shutting down; skipping remaining result files", "pending", what)
-		case actx.Err() != nil:
-			log.Warn("result-file budget exhausted; skipping the rest",
-				"budget", budget.String(), "pending", what)
-		default:
-			return false
-		}
-		aborted = true
-		return true
-	}
-
-	if outputs["pdf"] {
-		if !abort("pdf") {
-			path, _, ct, err := di.FetchArtifact(actx, res, job.Prefix, job.ModelID, "/pdf", query)
-			switch {
-			case err != nil:
-				log.Warn("could not fetch searchable pdf", "error", err)
-			case !isPDF(ct):
-				// A probed container answers this route 200 with application/json. Storing that
-				// as a PDF would serve a client a file that is not one, with the wrong
-				// Content-Type, and look like a successful capture.
-				log.Warn("result-file endpoint did not return a pdf; not storing it",
-					"contentType", ct)
-				_ = os.Remove(path)
-			default:
-				if err := m.moveInto(path, job.ID, store.KindPDF); err != nil {
-					log.Warn("could not store searchable pdf", "error", err)
-				} else {
-					hasPDF = true
-				}
-			}
-		}
-	}
-
-	if outputs["figures"] {
-		for _, figID := range figureIDs(res, log) {
-			if abort("figure " + figID) {
-				break
-			}
-			path, _, _, err := di.FetchArtifact(actx, res, job.Prefix, job.ModelID,
-				"/figures/"+url.PathEscape(figID), query)
-			if err != nil {
-				log.Warn("could not fetch figure", "figure", figID, "error", err)
-				continue
-			}
-			if err := m.moveInto(path, job.ID, store.KindFigure(figID)); err != nil {
-				log.Warn("could not store figure", "figure", figID, "error", err)
-				continue
-			}
-			figures = append(figures, figID)
-		}
-	}
-	return hasPDF, figures
-}
-
-// moveInto installs a downloaded artifact into the blob store atomically.
-func (m *Manager) moveInto(tmpPath, jobID string, kind store.Kind) error {
-	f, err := os.Open(tmpPath)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		_ = f.Close()
-		_ = os.Remove(tmpPath)
-	}()
-	_, err = m.store.Blob.WriteFrom(jobID, kind, f, 0)
-	return err
-}
-
-// figureIDs pulls the figure identifiers out of an analyzeResult.
-//
-// Only the figures member is decoded, located by byte range, so a large result is not loaded to
-// read a short list.
-func figureIDs(res *upstream.Result, log *slog.Logger) []string {
-	f, err := os.Open(res.Path)
-	if err != nil {
-		return nil
-	}
-	defer func() { _ = f.Close() }()
-
-	section := io.NewSectionReader(f, res.Start, res.End-res.Start)
-	start, end, found, err := jsonx.ValueRange(section, res.End-res.Start, "figures")
-	if err != nil || !found {
-		return nil
-	}
-	const maxFiguresBytes = 4 << 20
-	if end-start > maxFiguresBytes {
-		log.Warn("figures list too large to enumerate", "bytes", end-start)
-		return nil
-	}
-	raw := make([]byte, end-start)
-	if _, err := section.ReadAt(raw, start); err != nil && !errors.Is(err, io.EOF) {
-		return nil
-	}
-	var figs []struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(raw, &figs); err != nil {
-		return nil
-	}
-	out := make([]string, 0, len(figs))
-	for _, fg := range figs {
-		if fg.ID != "" {
-			out = append(out, fg.ID)
-		}
-	}
-	return out
-}
-
-// outputSet parses the DI output query parameter, which may repeat or be comma-separated.
-func outputSet(q url.Values) map[string]bool {
-	out := map[string]bool{}
-	for _, v := range q["output"] {
-		for _, part := range strings.Split(v, ",") {
-			part = strings.ToLower(strings.TrimSpace(part))
-			if part != "" {
-				out[part] = true
-			}
-		}
-	}
-	return out
-}
-
-// wantsArtifacts reports whether a submit needs the container's operation id to survive the call.
-func wantsArtifacts(q url.Values) bool {
-	o := outputSet(q)
-	return o["pdf"] || o["figures"]
+	return size, nil
 }
 
 // failJob records a terminal failure with the Azure-shaped error the client will receive.
+//
+// attempts and parts are the failed run's counts, 0 when it never reached the container.
 func (m *Manager) failJob(ctx context.Context, r *surfaceRunner, id string, e *azerr.APIError,
-	upstreamStatus int, upstreamMS int64) {
+	upstreamStatus int, upstreamMS int64, attempts, parts int) {
 	payload, err := json.Marshal(e.OperationError())
 	if err != nil {
 		payload = []byte(`{"code":"InternalServerError","message":"An unexpected error occurred."}`)
 	}
-	ok, err := m.store.Fail(ctx, id, string(payload), store.UpstreamMode(""),
-		upstreamStatus, upstreamMS, m.now())
+	ok, err := m.store.Fail(ctx, id, string(payload), upstreamStatus, upstreamMS, attempts, parts,
+		m.now())
 	if err != nil {
 		m.log.Error("could not record job failure", "job", id, "error", err)
 	}
@@ -723,13 +583,4 @@ func (m *Manager) startHeartbeat(ctx context.Context, id string) func() {
 		}
 	}()
 	return func() { close(done) }
-}
-
-// isPDF reports whether a Content-Type actually denotes a PDF.
-func isPDF(contentType string) bool {
-	ct, _, err := mime.ParseMediaType(contentType)
-	if err != nil {
-		return false
-	}
-	return ct == "application/pdf"
 }

@@ -18,12 +18,66 @@ import (
 	"github.com/NilenduGanguli/azure-gateway-api/internal/admin"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/azerr"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/config"
+	"github.com/NilenduGanguli/azure-gateway-api/internal/engine"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/httpx"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/jobs"
+	"github.com/NilenduGanguli/azure-gateway-api/internal/pdfsplit"
+	"github.com/NilenduGanguli/azure-gateway-api/internal/sched"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/store"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/surface"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/upstream"
 )
+
+// splitConcurrency and splitBudget bound PDF splitting across both surfaces: pdfcpu holds a whole
+// document in memory, so the number of documents cut at once is what bounds the memory splitting
+// can take, and the budget stops one pathological file holding a slot for the whole job deadline.
+const (
+	splitConcurrency = 2
+	splitBudget      = 60 * time.Second
+)
+
+// Engines are the configured surfaces' engines and upstream clients. A surface that is not
+// configured has nil for both.
+type Engines struct {
+	DI, Read             *engine.Engine
+	DIClient, ReadClient *upstream.Client
+}
+
+// NewEngines builds an engine and an upstream client for each configured surface.
+//
+// The binary and the conformance suite both build their engines here, for the reason NewHandler
+// exists: two hand-built copies of this wiring drifted before, and the suite then tested a gateway
+// production did not run. Each surface gets its own scheduler, sized MaxInflight, because that is
+// the container's concurrency limit and every call to it — a job's parts, its hedges, a client's
+// :syncAnalyze — goes through that one scheduler. The splitter is shared, because it bounds the
+// process's memory, not a container.
+func NewEngines(cfg *config.Config, st *store.Store, log *slog.Logger) Engines {
+	splitter := pdfsplit.NewSplitter(splitConcurrency, splitBudget)
+	workRoot := jobs.WorkRoot(cfg.DataDir)
+	build := func(s azerr.Surface, up config.Upstream, name string) (*engine.Engine, *upstream.Client) {
+		// The blob root receives the containers' answers, so the blob sweeper reclaims a file a
+		// process left behind when it died mid-download.
+		client := upstream.NewClient(s, up, st.Blob.Root(), cfg.MaxResultBytes)
+		e := engine.New(engine.Options{
+			Client:       client,
+			Sched:        sched.New(up.MaxInflight),
+			Splitter:     splitter,
+			SplitPages:   cfg.SplitPages,
+			WorkRoot:     workRoot,
+			WholeTimeout: up.Timeout,
+			Log:          log.With("surface", name),
+		})
+		return e, client
+	}
+	var out Engines
+	if cfg.DI.Enabled() {
+		out.DI, out.DIClient = build(azerr.SurfaceDI, cfg.DI, jobs.SurfaceDI)
+	}
+	if cfg.Read.Enabled() {
+		out.Read, out.ReadClient = build(azerr.SurfaceRead, cfg.Read, jobs.SurfaceRead)
+	}
+	return out
+}
 
 // Deps is everything the handler needs that outlives a request.
 type Deps struct {

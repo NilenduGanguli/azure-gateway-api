@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/NilenduGanguli/azure-gateway-api/internal/azerr"
-	"github.com/NilenduGanguli/azure-gateway-api/internal/store"
 )
 
 // Reasons label an attempt for the retry metric and the attempt log. A failing status is labelled
@@ -152,7 +151,6 @@ func (c *Client) readResult(ctx, actx context.Context, resp *http.Response, star
 	case view.HasResult:
 		return Attempt{Outcome: Success, Status: resp.StatusCode, Result: &Result{
 			Path: path, Start: view.Start, End: view.End, Bare: view.Bare,
-			Mode:           store.ModeSync,
 			UpstreamMS:     time.Since(started).Milliseconds(),
 			UpstreamStatus: resp.StatusCode,
 		}}

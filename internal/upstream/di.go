@@ -12,7 +12,6 @@ import (
 
 	"github.com/NilenduGanguli/azure-gateway-api/internal/azerr"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/config"
-	"github.com/NilenduGanguli/azure-gateway-api/internal/store"
 )
 
 // DIPathPrefix is the literal path segment the Document Intelligence surface is served under.
@@ -244,7 +243,6 @@ func (c *DIClient) trySync(ctx context.Context, ac *affinityClient, doc Document
 		}
 		return &Result{
 			Path: path, Start: view.Start, End: view.End,
-			Mode:           store.ModeSync,
 			UpstreamMS:     time.Since(started).Milliseconds(),
 			UpstreamStatus: http.StatusOK,
 		}, nil
@@ -273,7 +271,6 @@ func (c *DIClient) trySync(ctx context.Context, ac *affinityClient, doc Document
 		if err != nil {
 			return nil, err
 		}
-		res.Mode = store.ModeDegraded
 		res.UpstreamMS = time.Since(started).Milliseconds()
 		res.UpstreamOpID = id
 		return res, nil
@@ -345,7 +342,6 @@ func (c *DIClient) analyzeAsync(ctx context.Context, ac *affinityClient, doc Doc
 	if err != nil {
 		return nil, err
 	}
-	res.Mode = store.ModeAsyncFallback
 	res.UpstreamMS = time.Since(started).Milliseconds()
 	res.UpstreamOpID = id
 	return res, nil

@@ -3,7 +3,6 @@ package conformance
 import (
 	"context"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -15,7 +14,6 @@ import (
 	"github.com/NilenduGanguli/azure-gateway-api/internal/jobs"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/mockazure"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/store"
-	"github.com/NilenduGanguli/azure-gateway-api/internal/upstream"
 )
 
 // TestSignalDoesNotAbortInFlightRequests is a regression test for a graceful shutdown that was
@@ -110,8 +108,7 @@ func TestBootRecoveryReclaimsJobsWithUnexpiredLeases(t *testing.T) {
 	defer readC.Close()
 
 	cfg := &config.Config{
-		DataDir: dir, DISyncMode: config.SyncAuto, DIBlindPollBudget: 5, DISyncProbeTimeout: 30 * time.Second,
-		ResultTTL: time.Hour, GCInterval: time.Hour, DiskHighWatermark: 0.99, MaxRequestBytes: 1 << 20,
+		DataDir: dir, ResultTTL: time.Hour, GCInterval: time.Hour, DiskHighWatermark: 0.99, MaxRequestBytes: 1 << 20,
 		DI:   config.Upstream{BaseURL: diC.URL(), MaxInflight: 2, Timeout: 20 * time.Second},
 		Read: config.Upstream{BaseURL: readC.URL(), MaxInflight: 2, Timeout: 20 * time.Second},
 	}
@@ -147,17 +144,7 @@ func TestBootRecoveryReclaimsJobsWithUnexpiredLeases(t *testing.T) {
 	}
 	defer func() { _ = st2.Close() }()
 
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	manager := jobs.New(jobs.Options{
-		Config: cfg, Store: st2, Logger: log,
-		DI:   upstream.NewDI(cfg.DI, cfg.DISyncMode, cfg.DIBlindPollBudget, st2.Blob.Root(), cfg.MaxRequestBytes, cfg.DISyncProbeTimeout),
-		Read: upstream.NewRead(cfg.Read, cfg.DIBlindPollBudget, st2.Blob.Root(), cfg.MaxRequestBytes),
-	})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	manager.Start(ctx)
-	defer manager.Stop()
-	manager.Recover(ctx)
+	startManager(t, cfg, st2)
 
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {

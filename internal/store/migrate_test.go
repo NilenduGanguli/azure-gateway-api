@@ -599,7 +599,8 @@ func TestSchemaFromScratchEqualsMigrated(t *testing.T) {
 // the map fails the test too, so adding a migration means adding its hash here.
 func TestReleasedMigrationsAreUnchanged(t *testing.T) {
 	pinned := map[string]string{
-		"0001_initial.sql": "de6eedb8ab8389d825f538658c3382eeeb905bc6cd0a4d60902af11ce10663eb",
+		"0001_initial.sql":   "de6eedb8ab8389d825f538658c3382eeeb905bc6cd0a4d60902af11ce10663eb",
+		"0002_sync_only.sql": "45f86340a8abb57b3ab16337c443caffe984947e85de99a4227ba28aae09b2f7",
 	}
 	for name, want := range pinned {
 		body, err := fs.ReadFile(migrationFS, "migrations/"+name)
@@ -1001,5 +1002,55 @@ func TestSplitStatements(t *testing.T) {
 	// The version-1 schema is the table and its three indexes.
 	if got := splitStatements(legacySchema); len(got) != 4 {
 		t.Errorf("the version-1 schema split into %d statements, want 4: %q", len(got), got)
+	}
+}
+
+// TestSyncOnlyMigrationKeepsRows covers migration 0002 on a volume in service: a version-1
+// database with a finished job and the four async-path columns filled. The row survives with
+// every remaining field intact, the dropped columns are gone, and the two new counters read 0,
+// because no run before the migration counted them.
+func TestSyncOnlyMigrationKeepsRows(t *testing.T) {
+	dir := t.TempDir()
+	const id = "00000000-0000-4000-8000-00000000b002"
+	now := time.Now().Unix()
+	legacyDatabase(t, dir, legacySchema, func(db *sql.DB) error {
+		_, err := db.Exec(`INSERT INTO jobs (id, surface, model_id, status, created_at, updated_at,
+			expires_at, result_bytes, upstream_ms, upstream_mode, upstream_op_url, has_pdf,
+			figures, prefix) VALUES (?, 'di', 'prebuilt-layout', ?, ?, ?, ?, 99, 1234,
+			'degraded-202', 'http://container/op', 1, '1.1,1.2', '/formrecognizer')`,
+			id, string(StatusSucceeded), now, now, now+3600)
+		return err
+	})
+
+	s := openVolume(t, dir)
+	if s.Migration.To < 2 {
+		t.Fatalf("migrated to version %d, want at least 2", s.Migration.To)
+	}
+	job, err := s.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("the row is unreadable after 0002: %v", err)
+	}
+	if job.Status != StatusSucceeded || job.ResultBytes != 99 || job.UpstreamMS != 1234 ||
+		job.Prefix != "/formrecognizer" || job.ModelID != "prebuilt-layout" {
+		t.Errorf("the row changed: %+v", job)
+	}
+	if job.UpstreamAttempts != 0 || job.UpstreamParts != 0 {
+		t.Errorf("new counters are attempts=%d parts=%d, want 0 and 0",
+			job.UpstreamAttempts, job.UpstreamParts)
+	}
+	rows, err := s.r.Query(`SELECT name FROM pragma_table_info('jobs')`)
+	if err != nil {
+		t.Fatalf("table info: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan column: %v", err)
+		}
+		switch name {
+		case "upstream_op_url", "has_pdf", "figures", "upstream_mode":
+			t.Errorf("column %s survived migration 0002", name)
+		}
 	}
 }

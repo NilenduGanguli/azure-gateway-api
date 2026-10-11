@@ -126,8 +126,8 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	for _, name := range []string{jobs.SurfaceDI, jobs.SurfaceRead} {
-		if a := s.jobs.Analyzer(name); a != nil {
-			rep.Upstreams = append(rep.Upstreams, a.Health(ctx))
+		if c := s.jobs.Client(name); c != nil {
+			rep.Upstreams = append(rep.Upstreams, c.Health(ctx))
 		}
 	}
 	if counts, err := s.store.Stats(ctx); err == nil {
@@ -162,27 +162,29 @@ type jobView struct {
 	Surface     string `json:"surface"`
 	ModelID     string `json:"modelId,omitempty"`
 	Status      string `json:"status"`
-	Mode        string `json:"upstreamMode,omitempty"`
 	CreatedAt   string `json:"createdAt"`
 	UpdatedAt   string `json:"updatedAt"`
 	ExpiresAt   string `json:"expiresAt"`
 	InputBytes  int64  `json:"inputBytes"`
 	ResultBytes int64  `json:"resultBytes"`
 	UpstreamMS  int64  `json:"upstreamMs"`
-	Attempts    int    `json:"attempts"`
-	Error       string `json:"error,omitempty"`
-	HasPDF      bool   `json:"hasPdf,omitempty"`
-	Figures     string `json:"figures,omitempty"`
+	// Attempts counts runs of the job: more than one means a crash or restart re-ran it.
+	Attempts int `json:"attempts"`
+	// UpstreamAttempts counts the last run's calls to the container, retries and hedges
+	// included; UpstreamParts is how many parts it was analysed in, 1 when sent whole.
+	UpstreamAttempts int    `json:"upstreamAttempts"`
+	UpstreamParts    int    `json:"upstreamParts"`
+	Error            string `json:"error,omitempty"`
 }
 
 func toView(j *store.Job) jobView {
 	return jobView{
-		ID: j.ID, Surface: j.Surface, ModelID: j.ModelID,
-		Status: string(j.Status), Mode: string(j.Mode),
+		ID: j.ID, Surface: j.Surface, ModelID: j.ModelID, Status: string(j.Status),
 		CreatedAt: j.CreatedAt.Format(time.RFC3339), UpdatedAt: j.UpdatedAt.Format(time.RFC3339),
 		ExpiresAt:  j.ExpiresAt.Format(time.RFC3339),
 		InputBytes: j.InputBytes, ResultBytes: j.ResultBytes, UpstreamMS: j.UpstreamMS,
-		Attempts: j.Attempts, Error: j.ErrorJSON, HasPDF: j.HasPDF, Figures: j.Figures,
+		Attempts: j.Attempts, UpstreamAttempts: j.UpstreamAttempts, UpstreamParts: j.UpstreamParts,
+		Error: j.ErrorJSON,
 	}
 }
 
@@ -297,8 +299,8 @@ func (s *Server) containerStatus(w http.ResponseWriter, r *http.Request) {
 
 	var unhealthy []string
 	for _, name := range []string{jobs.SurfaceDI, jobs.SurfaceRead} {
-		if a := s.jobs.Analyzer(name); a != nil {
-			if h := a.Health(ctx); !h.OK {
+		if c := s.jobs.Client(name); c != nil {
+			if h := c.Health(ctx); !h.OK {
 				unhealthy = append(unhealthy, h.Name)
 			}
 		}

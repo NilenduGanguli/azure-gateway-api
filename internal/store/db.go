@@ -35,19 +35,6 @@ const (
 	StatusFailed     Status = "failed"
 )
 
-// UpstreamMode records which strategy actually serviced a job, for diagnostics and for the
-// admin surface. It is how an operator sees whether :syncAnalyze is working on their image.
-type UpstreamMode string
-
-const (
-	// ModeSync means the container's synchronous analyze route returned the result directly.
-	ModeSync UpstreamMode = "sync"
-	// ModeDegraded means the sync route answered 202 and the gateway had to poll with affinity.
-	ModeDegraded UpstreamMode = "degraded-202"
-	// ModeAsyncFallback means the sync route was absent and the gateway used :analyze + polling.
-	ModeAsyncFallback UpstreamMode = "async-fallback"
-)
-
 // Job is one client-visible operation.
 type Job struct {
 	ID          string
@@ -68,17 +55,16 @@ type Job struct {
 	Attempts    int
 	LeaseOwner  string
 	LeaseUntil  time.Time
-	Mode        UpstreamMode
-	UpstreamOp  string
 	UpStatus    int
 	UpstreamMS  int64
 	ClientReqID string
-	// Prefix is the path family the client used, so the upstream call and any later result-file
-	// fetch use the same one.
+	// Prefix is the path family the client used, so the upstream call uses the same one.
 	Prefix string
-	// HasPDF and Figures record which extra artifacts were persisted alongside the result.
-	HasPDF  bool
-	Figures string // comma-separated figure ids
+	// UpstreamAttempts is how many synchronous calls the job's last run made against the
+	// container, retries, hedges and re-checks included. Attempts, by contrast, counts runs.
+	UpstreamAttempts int
+	// UpstreamParts is how many parts the document was analysed in: 1 when it went whole.
+	UpstreamParts int
 }
 
 // Store owns the job database and the blob store.
@@ -215,28 +201,25 @@ func (s *Store) Create(ctx context.Context, j *Job) error {
 
 const jobColumns = `id, surface, model_id, api_version, status, created_at, updated_at,
 	expires_at, request_query, content_type, input_path, input_bytes, result_path, result_bytes,
-	error_json, attempts, lease_owner, lease_until, upstream_mode, upstream_op_url,
-	upstream_status, upstream_ms, client_request_id, has_pdf, figures, prefix`
+	error_json, attempts, lease_owner, lease_until, upstream_status, upstream_ms,
+	client_request_id, prefix, upstream_attempts, upstream_parts`
 
 func scanJob(sc interface{ Scan(...any) error }) (*Job, error) {
 	var j Job
 	var created, updated, expires, lease int64
-	var status, mode string
-	var hasPDF int
+	var status string
 	err := sc.Scan(&j.ID, &j.Surface, &j.ModelID, &j.APIVersion, &status, &created, &updated,
 		&expires, &j.Query, &j.ContentType, &j.InputPath, &j.InputBytes, &j.ResultPath,
-		&j.ResultBytes, &j.ErrorJSON, &j.Attempts, &j.LeaseOwner, &lease, &mode, &j.UpstreamOp,
-		&j.UpStatus, &j.UpstreamMS, &j.ClientReqID, &hasPDF, &j.Figures, &j.Prefix)
+		&j.ResultBytes, &j.ErrorJSON, &j.Attempts, &j.LeaseOwner, &lease, &j.UpStatus,
+		&j.UpstreamMS, &j.ClientReqID, &j.Prefix, &j.UpstreamAttempts, &j.UpstreamParts)
 	if err != nil {
 		return nil, err
 	}
 	j.Status = Status(status)
-	j.Mode = UpstreamMode(mode)
 	j.CreatedAt = time.Unix(created, 0).UTC()
 	j.UpdatedAt = time.Unix(updated, 0).UTC()
 	j.ExpiresAt = time.Unix(expires, 0).UTC()
 	j.LeaseUntil = time.Unix(lease, 0).UTC()
-	j.HasPDF = hasPDF != 0
 	return &j, nil
 }
 
@@ -279,19 +262,17 @@ func (s *Store) Heartbeat(ctx context.Context, id string, leaseUntil time.Time) 
 // It reports ok=false when no row matched, which means the job was deleted while it ran — by a
 // client DELETE or by disk-pressure eviction. The caller must then discard the artifacts it just
 // wrote, or they stay on the volume with nothing referencing them.
-func (s *Store) Succeed(ctx context.Context, id, resultPath string, resultBytes int64,
-	mode UpstreamMode, upstreamMS int64, hasPDF bool, figures string, now time.Time) (bool, error) {
-	pdf := 0
-	if hasPDF {
-		pdf = 1
-	}
+//
+// attempts and parts are the run's upstream call count and part count, for the admin surface.
+func (s *Store) Succeed(ctx context.Context, id, resultPath string, resultBytes, upstreamMS int64,
+	attempts, parts int, now time.Time) (bool, error) {
 	res, err := s.w.ExecContext(ctx, `
-		UPDATE jobs SET status = ?, result_path = ?, result_bytes = ?, upstream_mode = ?,
-		                upstream_ms = ?, has_pdf = ?, figures = ?, updated_at = ?,
+		UPDATE jobs SET status = ?, result_path = ?, result_bytes = ?, upstream_ms = ?,
+		                upstream_attempts = ?, upstream_parts = ?, updated_at = ?,
 		                lease_owner = '', lease_until = 0, input_path = ''
 		WHERE id = ?`,
-		string(StatusSucceeded), resultPath, resultBytes, string(mode), upstreamMS,
-		pdf, figures, now.Unix(), id)
+		string(StatusSucceeded), resultPath, resultBytes, upstreamMS, attempts, parts,
+		now.Unix(), id)
 	if err != nil {
 		return false, err
 	}
@@ -301,13 +282,15 @@ func (s *Store) Succeed(ctx context.Context, id, resultPath string, resultBytes 
 
 // Fail records a terminal failure with the Azure-shaped error object to serve to the client.
 // Like Succeed, it reports ok=false when the row is already gone.
-func (s *Store) Fail(ctx context.Context, id, errorJSON string, mode UpstreamMode,
-	upstreamStatus int, upstreamMS int64, now time.Time) (bool, error) {
+func (s *Store) Fail(ctx context.Context, id, errorJSON string, upstreamStatus int,
+	upstreamMS int64, attempts, parts int, now time.Time) (bool, error) {
 	res, err := s.w.ExecContext(ctx, `
-		UPDATE jobs SET status = ?, error_json = ?, upstream_mode = ?, upstream_status = ?,
-		                upstream_ms = ?, updated_at = ?, lease_owner = '', lease_until = 0
+		UPDATE jobs SET status = ?, error_json = ?, upstream_status = ?, upstream_ms = ?,
+		                upstream_attempts = ?, upstream_parts = ?, updated_at = ?,
+		                lease_owner = '', lease_until = 0
 		WHERE id = ?`,
-		string(StatusFailed), errorJSON, string(mode), upstreamStatus, upstreamMS, now.Unix(), id)
+		string(StatusFailed), errorJSON, upstreamStatus, upstreamMS, attempts, parts,
+		now.Unix(), id)
 	if err != nil {
 		return false, err
 	}
@@ -315,17 +298,12 @@ func (s *Store) Fail(ctx context.Context, id, errorJSON string, mode UpstreamMod
 	return n > 0, err
 }
 
-// upstream_op_url is read back into Job.UpstreamOp but is never written, and deliberately so.
-//
-// It was added to let a restart resume polling a degraded 202 instead of re-submitting. That
-// cannot work here: the containers keep their result store instance-local, and polls only find
-// an operation because the job's own connection pool and cookie jar pin them to the replica that
-// owns it. Neither survives the process. A resumed poll would land on an arbitrary replica, spend
-// its blind-poll budget on 404s, and then fail a job that a re-submit would have completed — so
-// recovery re-submits from the persisted input, and the column stays inert. It is kept rather
-// than dropped because migrating an existing PVC database is a worse trade than an unused column.
-
 // Requeue returns a job to notStarted so it can be picked up again after a crash.
+//
+// Recovery always re-runs a job from its persisted input. Nothing about an earlier run's upstream
+// call is resumable: every call is a synchronous attempt through HAProxy, so there is no
+// container-side operation to go back to, and the job's input is the only state that survives
+// the process.
 //
 // It takes a lease even though no worker holds the job yet. That lease is what stops the periodic
 // reclaim pass from picking the same row up again in the window between requeueing it and a worker

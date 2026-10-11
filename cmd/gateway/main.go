@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -27,7 +28,6 @@ import (
 	"github.com/NilenduGanguli/azure-gateway-api/internal/logging"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/probe"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/store"
-	"github.com/NilenduGanguli/azure-gateway-api/internal/upstream"
 )
 
 // Build metadata, set with -ldflags at build time.
@@ -105,20 +105,19 @@ func serve() error {
 
 	st, err := store.Open(store.Options{
 		DataDir:      cfg.DataDir,
-		ReadPoolSize: cfg.DI.MaxInflight + cfg.Read.MaxInflight + 8,
+		ReadPoolSize: inflight(cfg.DI) + inflight(cfg.Read) + 8,
 	})
 	if err != nil {
 		return err
 	}
 	defer func() { _ = st.Close() }()
+	logMigration(log, st.Migration)
 
-	tempDir := st.Blob.Root()
-	diClient := upstream.NewDI(cfg.DI, cfg.DISyncMode, cfg.DIBlindPollBudget, tempDir,
-		cfg.MaxResultBytes, cfg.DISyncProbeTimeout)
-	readClient := upstream.NewRead(cfg.Read, cfg.ReadBlindPollBudget, tempDir, cfg.MaxResultBytes)
-
+	engines := app.NewEngines(cfg, st, log)
 	manager := jobs.New(jobs.Options{
-		Config: cfg, Store: st, Logger: log, DI: diClient, Read: readClient,
+		Config: cfg, Store: st, Logger: log,
+		DI: engines.DI, Read: engines.Read,
+		DIClient: engines.DIClient, ReadClient: engines.ReadClient,
 	})
 
 	// Two separate lifetimes. signalCtx only *triggers* the drain; runCtx is what requests and
@@ -173,8 +172,10 @@ func serve() error {
 			"diUpstream", config.SafeURL(cfg.DI.BaseURL),
 			"readUpstream", config.SafeURL(cfg.Read.BaseURL),
 			"dataDir", cfg.DataDir,
-			"diMaxInflight", cfg.DI.MaxInflight,
-			"readMaxInflight", cfg.Read.MaxInflight,
+			// A surface that is not configured has no capacity, so it reports 0 rather than an
+			// unused default, as /_gw/config does.
+			"diMaxInflight", inflight(cfg.DI),
+			"readMaxInflight", inflight(cfg.Read),
 			"splitPages", cfg.SplitPages,
 			"resultTtl", cfg.ResultTTL.String(),
 		)
@@ -213,6 +214,25 @@ func serve() error {
 
 	log.Info("shutdown complete")
 	return nil
+}
+
+// inflight is a surface's concurrency limit, or 0 when it is not configured.
+func inflight(u config.Upstream) int {
+	if !u.Enabled() {
+		return 0
+	}
+	return u.MaxInflight
+}
+
+// logMigration reports what opening the store did to its schema. A migration and its backup are
+// the first thing to check after an upgrade, and the backup's path is what a rollback needs.
+func logMigration(log *slog.Logger, m store.MigrationReport) {
+	if m.From == m.To && !m.Legacy {
+		log.Info("job store schema is current", "version", m.To)
+		return
+	}
+	log.Info("job store schema migrated", "from", m.From, "to", m.To, "backup", m.Backup,
+		"legacy", m.Legacy, "took", m.Took.String())
 }
 
 func runProbe() error {

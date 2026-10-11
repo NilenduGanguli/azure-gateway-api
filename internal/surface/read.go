@@ -41,15 +41,9 @@ func readOperationLocation(base, id string) string {
 	return base + readPrefix + "/analyzeResults/" + url.PathEscape(id)
 }
 
-// readSyncAnalyze passes a synchronous read straight through.
-//
-// This is the one genuinely stateless call available against either container: it mints no
-// operation id, so it load-balances correctly across replicas with no affinity and no shared
-// result store.
+// readSyncAnalyze serves a synchronous read through the engine; see syncAnalyze.
 func (s *Server) readSyncAnalyze(w http.ResponseWriter, r *http.Request) {
-	s.passthrough(w, r, azerr.SurfaceRead, jobs.SurfaceRead, upstream.Request{
-		Query: upstreamQuery(r.URL.Query()),
-	})
+	s.syncAnalyze(w, r, azerr.SurfaceRead, jobs.SurfaceRead, "", "")
 }
 
 func (s *Server) readPoll(w http.ResponseWriter, r *http.Request) {

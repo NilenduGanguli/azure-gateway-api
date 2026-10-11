@@ -5,57 +5,10 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-	"time"
-
-	"github.com/NilenduGanguli/azure-gateway-api/internal/config"
 
 	"github.com/NilenduGanguli/azure-gateway-api/internal/mockazure"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/store"
 )
-
-// TestSyncPassthroughResolvesADegraded202 is a regression test for the worst client-visible
-// failure the review found.
-//
-// The container's synchronous route is not contractually synchronous — it degrades to 202 under
-// memory pressure. Relaying that 202 handed the caller an empty body and no operation id, because
-// the header carrying it is dropped (it names an in-cluster address, and the Read container
-// corrupts it outright). The analysis was paid for and unreachable. The gateway now polls it out.
-func TestSyncPassthroughResolvesADegraded202(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		path string
-		opts harnessOpts
-	}{
-		{"document intelligence", diSync, harnessOpts{
-			di: mockazure.Options{Sync: mockazure.Sync202, PollsBeforeSuccess: 2}}},
-		{"computer vision read", readSync, harnessOpts{
-			read: mockazure.Options{Sync: mockazure.Sync202, PollsBeforeSuccess: 2}}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			h := newHarness(t, tc.opts)
-			resp := h.post(tc.path, "%PDF-1.7 fake")
-			defer func() { _ = resp.Body.Close() }()
-
-			if resp.StatusCode == http.StatusAccepted {
-				t.Fatal("the gateway relayed the container's 202; the caller has no operation id " +
-					"and no result, and the analysis has already been paid for")
-			}
-			if resp.StatusCode != http.StatusOK {
-				t.Fatalf("got %d, want 200", resp.StatusCode)
-			}
-			body := decode(t, resp)
-			if body["status"] != "succeeded" {
-				t.Errorf("status is %v, want succeeded", body["status"])
-			}
-			if _, ok := body["analyzeResult"]; !ok {
-				t.Error("resolved synchronous response carries no analyzeResult")
-			}
-			if resp.Header.Get("Operation-Location") != "" {
-				t.Error("a synchronous response must not carry Operation-Location")
-			}
-		})
-	}
-}
 
 // TestPollNeverReturnsABodyWithoutStatus is a regression test.
 //
@@ -92,37 +45,6 @@ func TestPollNeverReturnsABodyWithoutStatus(t *testing.T) {
 	}
 	if _, ok := body["error"]; !ok {
 		t.Error("the failed envelope carries no error object")
-	}
-}
-
-// TestResourceScoped404DoesNotDisableTheSyncRoute is a regression test.
-//
-// Latching the synchronous capability off is process-wide and permanent, so treating every 404 as
-// "this route does not exist" meant one request naming a missing model disabled the fast path for
-// every later job until the pod restarted.
-func TestResourceScoped404DoesNotDisableTheSyncRoute(t *testing.T) {
-	h := newHarness(t, harnessOpts{di: mockazure.Options{Sync: mockazure.SyncModelNotFound}})
-
-	// A job against the model the container rejects.
-	resp := h.post(diAnalyze, "%PDF-1.7 fake")
-	loc := resp.Header.Get("Operation-Location")
-	_ = resp.Body.Close()
-	h.pollUntil(loc, "failed")
-
-	before := countCalls(h.di.Requests(), ":syncAnalyze")
-	if before == 0 {
-		t.Fatal("the synchronous route was never tried")
-	}
-
-	// A later job must still try the synchronous route.
-	resp2 := h.post(diAnalyze, "%PDF-1.7 fake")
-	loc2 := resp2.Header.Get("Operation-Location")
-	_ = resp2.Body.Close()
-	h.pollUntil(loc2, "failed")
-
-	if after := countCalls(h.di.Requests(), ":syncAnalyze"); after == before {
-		t.Error("a model-not-found 404 latched the synchronous capability off; only a 404 that " +
-			"means the route is unrouted should do that")
 	}
 }
 
@@ -323,51 +245,6 @@ func TestLegacyFormRecognizerPrefixIsServed(t *testing.T) {
 	}
 }
 
-// TestHungSyncRouteFallsBackQuickly is a regression test for the worst operational trap the probe
-// found: a container that declares :syncAnalyze in its own swagger and then never answers it.
-//
-// Without a bound of its own, the attempt inherits DI_UPSTREAM_TIMEOUT — fifteen minutes by
-// default — and every job pays it before falling back to the route that works. The probe timeout
-// caps the attempt, and the capability latches off so later jobs skip it entirely.
-func TestHungSyncRouteFallsBackQuickly(t *testing.T) {
-	h := newHarness(t, harnessOpts{
-		di: mockazure.Options{Sync: mockazure.SyncHang},
-		tweak: func(c *config.Config) {
-			c.DISyncProbeTimeout = 2 * time.Second
-			c.DI.Timeout = 60 * time.Second // what the attempt would otherwise inherit
-		},
-	})
-
-	started := time.Now()
-	resp := h.post(diAnalyze, "%PDF-1.7 fake")
-	loc := resp.Header.Get("Operation-Location")
-	_ = resp.Body.Close()
-
-	h.pollUntil(loc, "succeeded")
-	elapsed := time.Since(started)
-
-	if elapsed > 30*time.Second {
-		t.Errorf("the job took %v; a hung synchronous route must be abandoned at the probe "+
-			"timeout, not at the upstream timeout", elapsed)
-	}
-	if !h.di.Called(":analyze") {
-		t.Error("the gateway never fell back to :analyze")
-	}
-	assertJobMode(t, h, "async-fallback")
-
-	// A second job must not pay the probe again.
-	before := countCalls(h.di.Requests(), ":syncAnalyze")
-	resp2 := h.post(diAnalyze, "%PDF-1.7 fake")
-	loc2 := resp2.Header.Get("Operation-Location")
-	_ = resp2.Body.Close()
-	h.pollUntil(loc2, "succeeded")
-
-	if after := countCalls(h.di.Requests(), ":syncAnalyze"); after != before {
-		t.Errorf("the hung route was probed again on a later job (%d then %d); the capability "+
-			"should have latched off", before, after)
-	}
-}
-
 // TestProxyPreservesUpstreamStatus is a regression test.
 //
 // A probed layout-4.0 build answers /info and /documentModels with a bodyless 404 — it declares
@@ -395,63 +272,23 @@ func TestProxyPreservesUpstreamStatus(t *testing.T) {
 	}
 }
 
-// TestProxyNormalisesUnparseableUpstreamBody checks the other half: a non-empty body the SDKs
+// TestSyncNormalisesUnparseableUpstreamBody checks the other half: a non-empty body the SDKs
 // cannot parse — HTML from an nginx sidecar — becomes a well-formed error at the container's own
-// status, not a 500.
-func TestProxyNormalisesUnparseableUpstreamBody(t *testing.T) {
+// status, not a 500. (A 413 is the one status that is not kept: it is unmodelled on both surfaces,
+// so it becomes the documented 400 ContentTooLarge.)
+func TestSyncNormalisesUnparseableUpstreamBody(t *testing.T) {
 	h := newHarness(t, harnessOpts{
-		di: mockazure.Options{SyncErrorStatus: http.StatusRequestEntityTooLarge},
+		di: mockazure.Options{SyncErrorStatus: http.StatusConflict},
 	})
 
 	resp := h.post(diSync, "%PDF-1.7 fake")
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusRequestEntityTooLarge {
-		t.Errorf("got %d, want the container's own %d",
-			resp.StatusCode, http.StatusRequestEntityTooLarge)
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("got %d, want the container's own %d", resp.StatusCode, http.StatusConflict)
 	}
 	body := decode(t, resp)
 	if body["error"] == nil {
 		t.Errorf("body is not a Document Intelligence error object: %v", body)
-	}
-}
-
-// TestSyncOffSteersTheClientRouteAway is a regression test.
-//
-// DI_SYNC_ANALYZE=off correctly kept background jobs off a :syncAnalyze route that never answers,
-// but the client-facing passthrough ignored the setting and called it anyway — so on the build
-// this exists for, a client hit exactly the hang the operator had configured around. The
-// passthrough now submits to :analyze and polls the operation out instead, so the caller still
-// gets one synchronous answer.
-func TestSyncOffSteersTheClientRouteAway(t *testing.T) {
-	h := newHarness(t, harnessOpts{
-		di: mockazure.Options{Sync: mockazure.SyncHang, PollsBeforeSuccess: 1},
-		tweak: func(c *config.Config) {
-			c.DISyncMode = config.SyncOff
-			c.DI.Timeout = 30 * time.Second
-		},
-	})
-
-	started := time.Now()
-	resp := h.post(diSync, "%PDF-1.7 fake")
-	defer func() { _ = resp.Body.Close() }()
-	elapsed := time.Since(started)
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("got %d, want 200 — the call should have been served via :analyze",
-			resp.StatusCode)
-	}
-	if elapsed > 20*time.Second {
-		t.Errorf("took %v; with DI_SYNC_ANALYZE=off the hanging route must not be called", elapsed)
-	}
-	if h.di.Called(":syncAnalyze") {
-		t.Error("the client-facing passthrough called :syncAnalyze despite DI_SYNC_ANALYZE=off")
-	}
-	if !h.di.Called(":analyze") {
-		t.Error("the call was not routed through :analyze")
-	}
-	body := decode(t, resp)
-	if body["status"] != "succeeded" || body["analyzeResult"] == nil {
-		t.Errorf("resolved response is not a completed envelope: %v", body)
 	}
 }

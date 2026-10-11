@@ -9,7 +9,6 @@ import (
 
 	"github.com/NilenduGanguli/azure-gateway-api/internal/azerr"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/config"
-	"github.com/NilenduGanguli/azure-gateway-api/internal/store"
 )
 
 // ReadPathPrefix is the path the Computer Vision Read surface is served under.
@@ -100,7 +99,6 @@ func (c *ReadClient) Analyze(ctx context.Context, doc Document, req Request) (*R
 		}
 		return &Result{
 			Path: path, Start: view.Start, End: view.End,
-			Mode:           store.ModeSync,
 			UpstreamMS:     time.Since(started).Milliseconds(),
 			UpstreamStatus: http.StatusOK,
 		}, nil
@@ -123,7 +121,6 @@ func (c *ReadClient) Analyze(ctx context.Context, doc Document, req Request) (*R
 		if err != nil {
 			return nil, err
 		}
-		res.Mode = store.ModeDegraded
 		res.UpstreamMS = time.Since(started).Milliseconds()
 		res.UpstreamOpID = id
 		return res, nil
@@ -176,7 +173,6 @@ func (c *ReadClient) analyzeAsync(ctx context.Context, ac *affinityClient, doc D
 	if err != nil {
 		return nil, err
 	}
-	res.Mode = store.ModeAsyncFallback
 	res.UpstreamMS = time.Since(started).Milliseconds()
 	res.UpstreamOpID = id
 	return res, nil

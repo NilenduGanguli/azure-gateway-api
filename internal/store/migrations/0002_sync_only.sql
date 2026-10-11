@@ -1,0 +1,6 @@
+ALTER TABLE jobs DROP COLUMN upstream_op_url;
+ALTER TABLE jobs DROP COLUMN has_pdf;
+ALTER TABLE jobs DROP COLUMN figures;
+ALTER TABLE jobs DROP COLUMN upstream_mode;
+ALTER TABLE jobs ADD COLUMN upstream_attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN upstream_parts INTEGER NOT NULL DEFAULT 0;

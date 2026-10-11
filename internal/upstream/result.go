@@ -11,7 +11,6 @@ import (
 
 	"github.com/NilenduGanguli/azure-gateway-api/internal/azerr"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/jsonx"
-	"github.com/NilenduGanguli/azure-gateway-api/internal/store"
 )
 
 // Result is a successful analysis.
@@ -28,7 +27,6 @@ type Result struct {
 	// a client the way the container would has to know which one it holds.
 	Bare bool
 
-	Mode           store.UpstreamMode
 	UpstreamMS     int64
 	UpstreamStatus int
 	// UpstreamOpID is the container's own operation id, set only when the asynchronous path ran.

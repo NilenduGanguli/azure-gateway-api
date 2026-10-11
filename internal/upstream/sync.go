@@ -10,7 +10,6 @@ import (
 
 	"github.com/NilenduGanguli/azure-gateway-api/internal/azerr"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/config"
-	"github.com/NilenduGanguli/azure-gateway-api/internal/store"
 )
 
 // SyncOutcome is the result of a client-facing synchronous analyze.
@@ -117,7 +116,6 @@ func (b *base) syncAnalyze(ctx context.Context, path string, q url.Values, conte
 		ac.close()
 		return nil, err
 	}
-	res.Mode = store.ModeDegraded
 	res.UpstreamOpID = opID
 	return &SyncOutcome{Resolved: res, release: ac.close}, nil
 }

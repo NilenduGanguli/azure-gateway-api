@@ -2,8 +2,6 @@ package conformance
 
 import (
 	"context"
-	"io"
-	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
@@ -14,7 +12,6 @@ import (
 	"github.com/NilenduGanguli/azure-gateway-api/internal/jobs"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/mockazure"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/store"
-	"github.com/NilenduGanguli/azure-gateway-api/internal/upstream"
 )
 
 // TestDIUsesSyncAnalyzeWhenAvailable checks the happy path: the undocumented synchronous route is
@@ -35,33 +32,12 @@ func TestDIUsesSyncAnalyzeWhenAvailable(t *testing.T) {
 	}
 }
 
-// TestDISyncDegradesTo202AndStillSucceeds covers the case Microsoft called "not standard or
-// documented behavior": the synchronous route answers 202 under memory pressure, leaving an
-// operation that only the answering replica knows about.
-func TestDISyncDegradesTo202AndStillSucceeds(t *testing.T) {
-	h := newHarness(t, harnessOpts{
-		di: mockazure.Options{Sync: mockazure.Sync202, PollsBeforeSuccess: 2},
-	})
-
-	resp := h.post(diAnalyze, "%PDF-1.7 fake")
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("submit returned %d, want 202", resp.StatusCode)
-	}
-	loc := resp.Header.Get("Operation-Location")
-	_ = resp.Body.Close()
-
-	body := h.pollUntil(loc, "succeeded")
-	if body["status"] != "succeeded" {
-		t.Fatalf("status is %v, want succeeded", body["status"])
-	}
-	if !h.di.Called("analyzeResults") {
-		t.Error("gateway did not poll the container after the synchronous call degraded to 202")
-	}
-	assertJobMode(t, h, "degraded-202")
-}
-
-// TestDIFallsBackWhenSyncRouteMissing covers image builds that do not serve :syncAnalyze at all.
-func TestDIFallsBackWhenSyncRouteMissing(t *testing.T) {
+// TestDIRouteMissingFailsTheJob covers an image build that does not serve :syncAnalyze at all,
+// whether it says so with Kestrel's bodyless 404 or an UnhandledEndpointException 500. That is a
+// deployment fault no retry fixes, and there is no asynchronous route to fall back to: the
+// operation it would mint lives on one autoscaled pod. The job fails at once, and :analyze is never
+// called.
+func TestDIRouteMissingFailsTheJob(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		mode mockazure.SyncBehavior
@@ -75,69 +51,18 @@ func TestDIFallsBackWhenSyncRouteMissing(t *testing.T) {
 			resp := h.post(diAnalyze, "%PDF-1.7 fake")
 			loc := resp.Header.Get("Operation-Location")
 			_ = resp.Body.Close()
-			h.pollUntil(loc, "succeeded")
-
-			if !h.di.Called(":analyze") {
-				t.Error("gateway never fell back to :analyze")
+			body := h.pollUntil(loc, "failed")
+			if body["status"] != "failed" {
+				t.Fatalf("status is %v, want failed", body["status"])
 			}
-			assertJobMode(t, h, "async-fallback")
-
-			// The capability latch means a second job must not re-probe the missing route.
-			before := countCalls(h.di.Requests(), ":syncAnalyze")
-			resp2 := h.post(diAnalyze, "%PDF-1.7 fake")
-			loc2 := resp2.Header.Get("Operation-Location")
-			_ = resp2.Body.Close()
-			h.pollUntil(loc2, "succeeded")
-
-			if after := countCalls(h.di.Requests(), ":syncAnalyze"); after != before {
-				t.Errorf("gateway re-probed :syncAnalyze on a later job (%d then %d calls); the "+
-					"capability should latch off", before, after)
+			if h.di.Called(":analyze") {
+				t.Error("the gateway fell back to :analyze, whose operation lives on one pod")
+			}
+			if n := h.di.SyncCalls(); n != 1 {
+				t.Errorf("the container saw %d synchronous calls, want 1: a missing route is not "+
+					"retried", n)
 			}
 		})
-	}
-}
-
-// TestPollSurvivesWrongReplica404 is the core resilience case. The containers' default result
-// store is instance-local, so a poll routed to another replica 404s. The gateway must absorb that
-// and keep trying rather than failing the client's operation.
-func TestPollSurvivesWrongReplica404(t *testing.T) {
-	h := newHarness(t, harnessOpts{
-		di: mockazure.Options{
-			Sync:               mockazure.Sync202,
-			PollsBeforeSuccess: 3,
-			WrongReplicaEvery:  2, // every other poll lands on a replica with no record
-		},
-	})
-
-	resp := h.post(diAnalyze, "%PDF-1.7 fake")
-	loc := resp.Header.Get("Operation-Location")
-	_ = resp.Body.Close()
-
-	body := h.pollUntil(loc, "succeeded")
-	if body["status"] != "succeeded" {
-		t.Fatalf("status is %v; the gateway failed an operation it should have recovered", body["status"])
-	}
-}
-
-// TestBlindPollBudgetIsBounded checks the other side of that tolerance: an operation whose owning
-// replica is genuinely gone must fail rather than poll forever.
-func TestBlindPollBudgetIsBounded(t *testing.T) {
-	h := newHarness(t, harnessOpts{
-		di: mockazure.Options{
-			Sync:               mockazure.Sync202,
-			PollsBeforeSuccess: 1000,
-			WrongReplicaEvery:  1, // every poll misses: the owner is gone
-		},
-		tweak: func(c *config.Config) { c.DIBlindPollBudget = 3 },
-	})
-
-	resp := h.post(diAnalyze, "%PDF-1.7 fake")
-	loc := resp.Header.Get("Operation-Location")
-	_ = resp.Body.Close()
-
-	body := h.pollUntil(loc, "failed")
-	if body["status"] != "failed" {
-		t.Fatalf("status is %v, want failed once the blind-poll budget is spent", body["status"])
 	}
 }
 
@@ -221,42 +146,6 @@ func TestLargeResultIsStreamedIntact(t *testing.T) {
 	}
 	if strings.Trim(padding, "x") != "" {
 		t.Error("padding content was corrupted")
-	}
-}
-
-// TestArtifactsAreCapturedEagerly checks that output=pdf forces the asynchronous upstream path,
-// because result files are addressed by the container's own operation id and a synchronous call
-// never mints one.
-func TestArtifactsAreCapturedEagerly(t *testing.T) {
-	h := newHarness(t, harnessOpts{di: mockazure.Options{Sync: mockazure.Sync200}})
-
-	resp := h.post(diAnalyze+"&output=pdf", "%PDF-1.7 fake")
-	loc := resp.Header.Get("Operation-Location")
-	_ = resp.Body.Close()
-	h.pollUntil(loc, "succeeded")
-
-	if h.di.Called(":syncAnalyze") {
-		t.Error("output=pdf used the synchronous route, which mints no operation id to fetch the " +
-			"PDF from")
-	}
-	if !h.di.Called("/pdf") {
-		t.Error("gateway never fetched the searchable PDF")
-	}
-
-	// The stored artifact must then be servable from the gateway.
-	id := loc[strings.LastIndex(loc, "/")+1:]
-	if i := strings.Index(id, "?"); i >= 0 {
-		id = id[:i]
-	}
-	pdf := h.get("/documentintelligence/documentModels/prebuilt-layout/analyzeResults/" + id +
-		"/pdf?api-version=" + apiVersion)
-	defer func() { _ = pdf.Body.Close() }()
-	if pdf.StatusCode != http.StatusOK {
-		t.Fatalf("PDF fetch returned %d, want 200", pdf.StatusCode)
-	}
-	data, _ := io.ReadAll(pdf.Body)
-	if !strings.HasPrefix(string(data), "%PDF") {
-		t.Errorf("stored PDF is not a PDF: %q", truncate(string(data)))
 	}
 }
 
@@ -370,8 +259,7 @@ func TestCrashRecoveryResumesAcceptedJobs(t *testing.T) {
 	defer readC.Close()
 
 	cfg := &config.Config{
-		DataDir: dir, DISyncMode: config.SyncAuto, DIBlindPollBudget: 5, DISyncProbeTimeout: 30 * time.Second,
-		ResultTTL: time.Hour, GCInterval: time.Hour, DiskHighWatermark: 0.99, MaxRequestBytes: 1 << 20,
+		DataDir: dir, ResultTTL: time.Hour, GCInterval: time.Hour, DiskHighWatermark: 0.99, MaxRequestBytes: 1 << 20,
 		DI:   config.Upstream{BaseURL: diC.URL(), MaxInflight: 2, Timeout: 20 * time.Second},
 		Read: config.Upstream{BaseURL: readC.URL(), MaxInflight: 2, Timeout: 20 * time.Second},
 	}
@@ -405,17 +293,7 @@ func TestCrashRecoveryResumesAcceptedJobs(t *testing.T) {
 	}
 	defer func() { _ = st2.Close() }()
 
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	manager := jobs.New(jobs.Options{
-		Config: cfg, Store: st2, Logger: log,
-		DI:   upstream.NewDI(cfg.DI, cfg.DISyncMode, cfg.DIBlindPollBudget, st2.Blob.Root(), cfg.MaxRequestBytes, cfg.DISyncProbeTimeout),
-		Read: upstream.NewRead(cfg.Read, cfg.DIBlindPollBudget, st2.Blob.Root(), cfg.MaxRequestBytes),
-	})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	manager.Start(ctx)
-	defer manager.Stop()
-	manager.Recover(ctx)
+	startManager(t, cfg, st2)
 
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
@@ -427,25 +305,4 @@ func TestCrashRecoveryResumesAcceptedJobs(t *testing.T) {
 	}
 	job, _ := st2.Get(context.Background(), id)
 	t.Fatalf("orphaned job was never recovered; status is %q", job.Status)
-}
-
-func assertJobMode(t *testing.T, h *harness, want string) {
-	t.Helper()
-	list, err := h.store.Recent(context.Background(), 5)
-	if err != nil || len(list) == 0 {
-		t.Fatalf("no jobs recorded: %v", err)
-	}
-	if got := string(list[0].Mode); got != want {
-		t.Errorf("job ran in mode %q, want %q", got, want)
-	}
-}
-
-func countCalls(requests []string, substr string) int {
-	var n int
-	for _, p := range requests {
-		if strings.Contains(p, substr) {
-			n++
-		}
-	}
-	return n
 }
