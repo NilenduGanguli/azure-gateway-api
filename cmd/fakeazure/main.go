@@ -72,7 +72,9 @@ func parseFlags(args []string, stderr io.Writer) (settings, error) {
 	fs.DurationVar(&s.opts.Latency, "latency", 0, "delay each synchronous call by `DUR`")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "usage: fakeazure [-di ADDR] [-read ADDR] [flags]\n\n"+
-			"Serves paged fake Azure containers until interrupted. Page flags apply to both.\n\n")
+			"Serves paged fake Azure containers until interrupted. Page flags apply to both.\n"+
+			"An ADDR with no host, such as :5001, listens on every interface, and the URL\n"+
+			"printed for it names 127.0.0.1.\n\n")
 		fs.PrintDefaults()
 	}
 

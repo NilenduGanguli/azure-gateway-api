@@ -95,8 +95,10 @@ flowchart LR
 
 `cmd/gateway` sits on top and wires everything; every other row depends only on rows listed *above*
 it, with one exception — `httpx` also depends on `ids`, which the table lists later. `config`,
-`logging`, `azerr`, `ids`, `jsonx`, `store` and `mockazure` have no gateway-internal dependencies at
-all.
+`logging`, `azerr`, `ids`, `jsonx` and `store` have no gateway-internal dependencies at all.
+`mockazure` builds its paged fake's answers from the splitting packages (`docgen`, `pdfsplit`,
+`pdftest`, `textunit`, and through them pdfcpu), which this table does not list yet; the
+documentation pass for the sync-only and splitting work (plan T16) adds them.
 
 | Package | Owns | Depends on (internal) |
 |---|---|---|
@@ -114,7 +116,7 @@ all.
 | `internal/admin` | `/_gw/{live,ready,health,version,config,jobs,metrics}` plus container-shaped `/status` and `/ready` | `config`, `httpx`, `jobs`, `store`, `upstream` |
 | `internal/app` | assembles the served handler: both surfaces, admin, the catch-all and the middleware chain. Exists so `cmd/gateway` and `test/conformance` cannot build different gateways — they did, and the suite could not see the difference | `admin`, `azerr`, `config`, `httpx`, `jobs`, `store`, `surface`, `upstream` |
 | `internal/probe` | the live-container capability probe behind `gateway probe` | `config` |
-| `internal/mockazure` | in-process fakes of both containers **including their failure modes** | — |
+| `internal/mockazure` | in-process fakes of both containers **including their failure modes**, and the paged fake that answers per page from `docgen` | `docgen`, `pdfsplit`, `pdftest`, `textunit` |
 
 `internal/surface` is deliberately one package rather than two. The two surfaces differ only in
 URL shape and error vocabulary; splitting them would have duplicated the whole lifecycle to

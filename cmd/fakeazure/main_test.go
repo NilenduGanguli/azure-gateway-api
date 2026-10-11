@@ -187,3 +187,25 @@ func TestRunFailsWhenItCannotListen(t *testing.T) {
 		t.Error("the DI fake still accepts connections after run failed")
 	}
 }
+
+// -di :5001 listens on every interface but prints a URL to hand the gateway: loopback, not the
+// wildcard address.
+func TestRunPrintsALoopbackURLForEveryInterface(t *testing.T) {
+	pr, pw := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, settings{di: ":0"}, pw) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	line, err := bufio.NewReader(pr).ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading the address: %v", err)
+	}
+	url, ok := strings.CutPrefix(strings.TrimSpace(line), "DI_UPSTREAM_URL=http://127.0.0.1:")
+	if !ok || url == "" {
+		t.Fatalf("printed %q, want DI_UPSTREAM_URL=http://127.0.0.1:PORT", line)
+	}
+}

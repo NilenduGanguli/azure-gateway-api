@@ -73,7 +73,8 @@ type Options struct {
 	FailSyncBare bool
 	// PadResultBytes inflates the result so streaming paths are exercised with a large body.
 	PadResultBytes int
-	// Latency delays each analyze call.
+	// Latency delays each synchronous call the container serves. A call whose client gives up
+	// during it ends there, and Close cuts it rather than waiting it out.
 	Latency time.Duration
 	// StatusUnhealthy makes /status report an invalid key.
 	StatusUnhealthy bool
@@ -519,7 +520,15 @@ func (c *Container) serveSync(w http.ResponseWriter, r *http.Request, di bool) {
 	c.hits.Add(1)
 
 	if c.opts.Latency > 0 {
-		time.Sleep(c.opts.Latency)
+		// Not a plain sleep: a client that gives up during it is gone, so the call ends and its
+		// slot comes back at once, and Close cuts the call rather than waiting it out.
+		select {
+		case <-time.After(c.opts.Latency):
+		case <-r.Context().Done():
+			return
+		case <-c.done:
+			panic(http.ErrAbortHandler)
+		}
 	}
 	if c.paged != nil {
 		c.paged.serveSync(c, w, r, body, di)

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"sync"
 	"time"
 
@@ -46,7 +47,8 @@ const (
 // of its document's pages, or those pages= selects. Hang, HangFirst, FailFirst and BadContent are
 // checked in that order, after HAProxy's checks, the key check and Latency, and apply to
 // synchronous calls only: those are all the gateway makes, and the asynchronous route stays a
-// clean reference for the probe.
+// clean reference for the probe. A call whose client leaves before they are checked spends none
+// of them.
 type PagedOptions struct {
 	// Surface selects the container: DI or Read. DI serves both API families.
 	Surface Surface
@@ -70,7 +72,7 @@ type PagedOptions struct {
 	// with or without pages=, so a part holding the first pages of its document is indistinguishable
 	// from an original and is never bad; give a later page.
 	BadOnlyWhenSplit bool
-	// Latency delays each synchronous call the container serves.
+	// Latency delays each synchronous call the container serves, as Options.Latency does.
 	Latency time.Duration
 	// APIKey, when set, is the Ocp-Apim-Subscription-Key every analyze call must carry.
 	APIKey string
@@ -119,8 +121,23 @@ func ListenPaged(addr string, o PagedOptions) (*Container, error) {
 	_ = s.Listener.Close()
 	s.Listener = l
 	s.Start()
+	// Start names the server by its listener's address, which for ":5001" is the wildcard
+	// "[::]:5001": an address to listen on, not one to print for the gateway's settings or to put
+	// in Operation-Location.
+	s.URL = "http://" + dialable(l.Addr())
 	c.server = s
 	return c, nil
+}
+
+// dialable is the host:port a client on this host dials to reach a listener on addr. A listener on
+// the unspecified address accepts on every interface, loopback included, so 127.0.0.1 stands in
+// for it; Go listens on the unspecified address dual-stack, so that holds for "[::]" as well.
+func dialable(addr net.Addr) string {
+	tcp, ok := addr.(*net.TCPAddr)
+	if !ok || !tcp.IP.IsUnspecified() {
+		return addr.String()
+	}
+	return net.JoinHostPort("127.0.0.1", strconv.Itoa(tcp.Port))
 }
 
 func newPaged(o PagedOptions) (*Container, *http.ServeMux) {
@@ -143,8 +160,9 @@ func newPaged(o PagedOptions) (*Container, *http.ServeMux) {
 // Calls returns, for every synchronous analyze a paged fake served, the original pages it
 // covered, in arrival order. A call is listed once the container has worked out its pages, before
 // any hang or injected failure, so a hung call is listed while it hangs. Calls HAProxy turned away,
-// calls refused for their key or their parameters, and asynchronous calls are not listed. A plain
-// fake returns nil.
+// calls refused for their key or their parameters, calls whose client left before their pages were
+// worked out (during Latency, say), and asynchronous calls are not listed. A plain fake returns
+// nil.
 func (c *Container) Calls() [][]int {
 	if c.paged == nil {
 		return nil
@@ -190,7 +208,10 @@ func (p *paged) analyse(w http.ResponseWriter, r *http.Request, body []byte, di 
 		a.unit = u
 	}
 
-	sent := identify(r.Context(), document(r, body))
+	// Parsed whatever the client does meanwhile: pdfcpu stops on a cancelled context, and a body
+	// it stops on would be taken for one unreadable page, so a call abandoned mid-parse would be
+	// listed as page 1 and spend page 1's injected failures. serveSync drops such a call instead.
+	sent := identify(context.WithoutCancel(r.Context()), document(r, body))
 	a.pages, a.split = sent, !isOriginal(sent)
 	a.numbering = docgen.Local
 	if !a.split {
@@ -227,6 +248,12 @@ func (p *paged) analyse(w http.ResponseWriter, r *http.Request, body []byte, di 
 func (p *paged) serveSync(c *Container, w http.ResponseWriter, r *http.Request, body []byte, di bool) {
 	a, ok := p.analyse(w, r, body, di)
 	if !ok {
+		return
+	}
+	// A client that has left gets no answer, so the call ends here: it is not listed and spends
+	// no hang or failure, which is what a test cancelling calls (a hedge's loser, a part that
+	// timed out) needs to count the calls the container really analysed.
+	if r.Context().Err() != nil {
 		return
 	}
 	p.mu.Lock()

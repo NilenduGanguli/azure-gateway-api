@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -356,11 +357,14 @@ func TestPagedHangBlocksUntilTheRequestEnds(t *testing.T) {
 			c := NewPaged(PagedOptions{Surface: rt.surface, Hang: map[int]bool{5: true}})
 			defer c.Close()
 
+			// Cut here, not in the goroutine: partOf may call t.Fatal, which only the test's own
+			// goroutine may.
+			part := partOf(t, 8, 4, 5, 6)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			held := make(chan error, 1)
 			go func() {
-				_, err := tryPostDoc(ctx, c, rt.sync, "application/pdf", partOf(t, 8, 4, 5, 6))
+				_, err := tryPostDoc(ctx, c, rt.sync, "application/pdf", part)
 				held <- err
 			}()
 			waitUntil(t, "the hung call to be recorded", func() bool { return len(c.Calls()) == 1 })
@@ -614,6 +618,116 @@ func TestPagedLatency(t *testing.T) {
 	}
 }
 
+// A client that gives up does not change what it sent. The fake still works out the pages of a
+// call whose client has left, rather than taking an unparsed body for page 1: that would list the
+// call under the wrong pages and spend page 1's injected failures on it.
+func TestPagedIdentifiesTheSentPagesAfterTheClientHasLeft(t *testing.T) {
+	for _, rt := range pagedRoutes {
+		t.Run(rt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			r := httptest.NewRequestWithContext(ctx, http.MethodPost, rt.sync, nil)
+			r.Header.Set("Content-Type", "application/pdf")
+			p := &paged{}
+			a, ok := p.analyse(httptest.NewRecorder(), r, partOf(t, 9, 7, 8, 9), rt.surface == DI)
+			if !ok {
+				t.Fatal("analyse refused the call")
+			}
+			if !slices.Equal(a.pages, []int{7, 8, 9}) || !a.split || a.numbering != docgen.Local {
+				t.Errorf("analysed pages %v (split %v, numbering %v), want the part [7 8 9], Local",
+					a.pages, a.split, a.numbering)
+			}
+		})
+	}
+}
+
+// A call whose client gives up while Latency holds it ends there: it is not listed and spends no
+// injected failure or hang, so a test that cancels calls (a hedge's loser, a part that timed out)
+// sees only the calls the container actually analysed. Its Capacity slot comes straight back.
+func TestPagedCallAbandonedDuringLatencyUsesNothing(t *testing.T) {
+	const latency = 400 * time.Millisecond
+	for _, rt := range pagedRoutes {
+		t.Run(rt.name, func(t *testing.T) {
+			c := NewPaged(PagedOptions{Surface: rt.surface, Latency: latency,
+				FailFirst: map[int]int{1: 1, 7: 1}, HangFirst: map[int]bool{8: true}})
+			defer c.Close()
+			part := partOf(t, 9, 7, 8, 9)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			held := make(chan error, 1)
+			go func() {
+				_, err := tryPostDoc(ctx, c, rt.sync, "application/pdf", part)
+				held <- err
+			}()
+			waitUntil(t, "the call to reach the container", func() bool { return c.Hits() == 1 })
+			cancel()
+			if err := <-held; !errors.Is(err, context.Canceled) {
+				t.Fatalf("abandoned call ended with %v, want context canceled", err)
+			}
+			waitUntil(t, "the abandoned call's slot to come back", func() bool {
+				return c.inflight.Load() == 0
+			})
+			wantCalls(t, c)
+
+			// Page 7 still owes its failure and page 8 its hang; page 1 was never touched.
+			if r := postDoc(t, c, rt.sync, "application/pdf", partOf(t, 9, 7)); r.status !=
+				http.StatusServiceUnavailable {
+				t.Errorf("first call covering page 7: status %d, want its 503", r.status)
+			}
+			if r := postDoc(t, c, withQuery(rt.sync, "pages=1"), "application/pdf",
+				pdftest.Make(9)); r.status != http.StatusServiceUnavailable {
+				t.Errorf("first call covering page 1: status %d, want its 503", r.status)
+			}
+			hang, stop := context.WithTimeout(context.Background(), latency+300*time.Millisecond)
+			defer stop()
+			if _, err := tryPostDoc(hang, c, withQuery(rt.sync, "pages=8"), "application/pdf",
+				pdftest.Make(9)); !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("first call covering page 8 ended with %v, want it to hang", err)
+			}
+			wantCalls(t, c, []int{7}, []int{1}, []int{8})
+		})
+	}
+}
+
+// Closing the container does not wait out the Latency of a call it is holding: the call is cut,
+// on a plain fake and a paged one alike.
+func TestCloseCutsCallsWaitingOutLatency(t *testing.T) {
+	const latency = 3 * time.Second
+	for _, tc := range []struct {
+		name string
+		make func() *Container
+	}{
+		{"plain", func() *Container { return NewDI(Options{Latency: latency}) }},
+		{"paged", func() *Container { return NewPaged(PagedOptions{Surface: DI, Latency: latency}) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := tc.make()
+			doc := pdftest.Make(1)
+			held := make(chan error, 1)
+			go func() {
+				r, err := tryPostDoc(context.Background(), c, pagedRoutes[0].sync, "application/pdf", doc)
+				if err == nil {
+					err = r.err
+					if err == nil {
+						err = errors.New("answered with status " + http.StatusText(r.status))
+					}
+				}
+				held <- err
+			}()
+			waitUntil(t, "the call to reach the container", func() bool { return c.Hits() == 1 })
+
+			begun := time.Now()
+			c.Close()
+			if took := time.Since(begun); took > latency/2 {
+				t.Errorf("Close took %v: it waited out the call's %v latency", took, latency)
+			}
+			if err := <-held; err == nil || strings.HasPrefix(err.Error(), "answered") {
+				t.Errorf("the call ended with %v, want the connection cut", err)
+			}
+		})
+	}
+}
+
 // Closing the container ends the calls it is holding. They are cut, not answered: an empty 200
 // would read as a result with nothing in it.
 func TestPagedCloseEndsHungCalls(t *testing.T) {
@@ -696,6 +810,33 @@ func TestListenPagedServesOnTheGivenAddress(t *testing.T) {
 	if _, err := ListenPaged(strings.TrimPrefix(c.URL(), "http://"), PagedOptions{}); err == nil ||
 		!strings.Contains(err.Error(), "mockazure") {
 		t.Errorf("second listener on the same address: %v", err)
+	}
+}
+
+// A fake listening on every interface (fakeazure -di :5001) gives a URL a client on this host can
+// use, not the wildcard address it listens on: the URL is printed for the gateway's settings and
+// is where Operation-Location sends a poll.
+func TestListenPagedOnEveryInterfaceGivesALoopbackURL(t *testing.T) {
+	for _, addr := range []string{":0", "0.0.0.0:0", "[::]:0"} {
+		t.Run(addr, func(t *testing.T) {
+			c, err := ListenPaged(addr, PagedOptions{Surface: DI})
+			if err != nil {
+				t.Skipf("this host cannot listen on %s: %v", addr, err)
+			}
+			defer c.Close()
+			if !regexp.MustCompile(`^http://127\.0\.0\.1:[1-9][0-9]*$`).MatchString(c.URL()) {
+				t.Fatalf("URL is %q, want http://127.0.0.1:PORT", c.URL())
+			}
+			sub := postDoc(t, c, pagedRoutes[0].submit, "application/pdf", pdftest.Make(2))
+			loc := sub.header.Get("Operation-Location")
+			if sub.status != http.StatusAccepted || !strings.HasPrefix(loc, c.URL()+"/") {
+				t.Fatalf("submit: status %d, Operation-Location %q; want it under %s", sub.status, loc,
+					c.URL())
+			}
+			if poll := fetch(t, http.MethodGet, loc); poll.status != http.StatusOK {
+				t.Errorf("poll of %s: status %d", loc, poll.status)
+			}
+		})
 	}
 }
 
