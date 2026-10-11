@@ -18,21 +18,42 @@ import (
 // service, seeing that part alone, cannot know which section the text belongs to and gives it
 // one of its own; analysing the whole document, it would have kept the text in the section the
 // previous page left open. The merge restores that: a part's leading content without a heading is
-// a continuation, and it is folded into the section open at the end of the parts before it — the
-// deepest last section of their tree.
+// a continuation, and it is folded into the sections open at the end of the parts before it:
+// content into the deepest last section of their tree, an untitled wrapper into the open section
+// at its own depth.
+//
+// The sections left open are a path down that tree: the root's last element when it is a section,
+// that section's last element when it is one, and so on to the deepest. In the whole document the
+// sections on the path above the one a continuation goes into hold it too, as the section they
+// hold, and a real section's spans are its elements' extent, sub-sections included
+// (py_layout_figures's section 2 spans its sections 3 and 4, thirdparty_docler_markdown_2page's
+// section 2 its section 3). So a continuation's spans are appended to every section on the path
+// above it as well, and the root keeps every part's own spans whatever becomes of its elements
+// (py_layout_multipage_table_span_pdf's root is one span over both pages).
 //
 // A continuation comes in one of three shapes:
 //
-//   - the part's root starts with section 1, a section of elements only (no sections inside it)
-//     whose first element is not a heading paragraph: section 1 is the continuation, and it
-//     disappears into the open section;
+//   - the part's root starts with section 1, and section 1 has no heading: its first element is
+//     not a heading paragraph. Section 1 is the continuation, and it disappears into the deepest
+//     open section, which takes its elements and spans. A sub-section pointer among those
+//     elements comes along, renumbered, and the sub-section becomes the open section's, as the
+//     whole document nests it: thirdparty_docler_markdown_2page's page 2 opens with two untitled
+//     paragraphs and a section, all three held by the section page 1 leaves open.
+//     Section 1 may instead open with section 2, and section 2 with section 3: untitled sections
+//     that wrap the ones below them, the shape a part has when a nested section crosses the cut.
+//     Such a wrapper continues the open section at its own depth — section 1 the root's last
+//     section, section 2 that one's — and takes its sub-section pointers there, less the one to
+//     the next section of the chain, which disappears with it. The chain ends at a section that
+//     opens with content, which continues the deepest open section, or at one that opens with a
+//     heading, which stays a section of its own inside the last wrapper's;
 //   - the part's root starts with elements that are neither sections nor heading paragraphs and
 //     goes on to a section: that run, up to the first section or heading, is the continuation,
-//     and it moves into the open section. Its spans are the root's, clipped to where the run's
-//     own elements start and end, as every real section's spans are its elements' extent;
+//     and it moves into the deepest open section. Its spans are the root's, clipped to where the
+//     run's own elements start and end, as every real section's spans are its elements' extent;
 //   - the part has no section but its root, and the root's first element is not a heading
 //     paragraph: everything the root holds is the continuation, as a part with no heading at all
-//     is, and the root contributes no elements or spans of its own.
+//     is, and it moves into the deepest open section; the root contributes no elements, and its
+//     spans, which are the content's, stay the merged root's too.
 //
 // py_layout_multipage_table_span_pdf is the evidence: its second section, a heading on page 1 and
 // a table that continues onto page 2, is one section with one span over both pages, while each
@@ -44,16 +65,43 @@ import (
 // A heading paragraph ends the run: the service keeps a title in the root itself
 // (py_layout_figures's root opens with its title), so it stays there with what follows it.
 //
+// Content without a heading can only continue the deepest open section, since a section holds its
+// own elements before its sub-sections. Where a heading in the part would have nested in the
+// whole document — under the section left open, or beside it — the part alone cannot say: the
+// service gives no heading levels. The merge keeps the part's own nesting, relative to the
+// sections its untitled ones continue, which is the whole document's wherever the part's tree is
+// the whole document's cut at the page.
+//
 // A heading is a paragraph whose role is title or sectionHeading. Anything else — a part whose
-// leading content has a heading, a leading section with sections inside it, no section left open
-// because the previous parts hold their content in the root directly, an open section without
-// spans or elements to extend — is left as the parts give it.
+// leading content has a heading, a chain of untitled sections deeper than the path left open, no
+// section left open because the previous parts hold their content in the root directly, an open
+// section without spans or elements to extend — is left as the parts give it.
 
-// continuation is a part's leading content that continues the section open before the part.
+// continuation is content of a part that continues a section open before the part.
 type continuation struct {
 	p        *part
-	elements json.RawMessage // a JSON array of element pointers, in p's numbering
+	elements json.RawMessage // a JSON array of element pointers, in p's numbering; nil for spans only
 	spans    []span          // in p's offsets
+}
+
+// lead is how a part's leading content continues the path of sections left open before it.
+type lead struct {
+	// conts[j] is what the open section at depth j+1 takes: elements and spans where the content
+	// or a wrapper is folded into it, spans alone where it only holds the section that takes them.
+	// A zero continuation (nil p) takes nothing.
+	conts []continuation
+	// into[i-1] is the depth of the open section the part's section i was folded into.
+	into []int
+}
+
+// content folds content without a heading into the deepest open section, and its spans into the
+// sections from depth from+1 down to it.
+func (l *lead) content(c continuation, from int) {
+	d := len(l.conts)
+	for j := from; j < d-1; j++ {
+		l.conts[j] = continuation{p: c.p, spans: c.spans}
+	}
+	l.conts[d-1] = c
 }
 
 // sectionAt names a section of a part by its index in the part's own sections array (≥ 1).
@@ -174,11 +222,11 @@ func sectionIndex(ptr string) (int, bool) {
 	return parseIndex([]byte(n))
 }
 
-// planContinuations decides, part by part, which parts' leading content continues the section
-// open before them, and which section that is. It runs before anything is written, once every
-// root is read, and holds only the continuations themselves.
+// planContinuations decides, part by part, which parts' leading content continues the sections
+// left open before them, and which sections those are. It runs before anything is written, once
+// every root is read, and holds only the continuations themselves.
 func (m *merger) planContinuations() error {
-	var open *sectionAt // the section the next part's leading content would continue
+	var open []sectionAt // the path of sections left open, the root's own first; empty for none
 	for j, p := range m.with {
 		r := m.roots[j]
 		secs, err := readSections(p)
@@ -191,36 +239,56 @@ func (m *merger) planContinuations() error {
 				return err
 			}
 		}
-		if open != nil && p.k > 0 && len(rootElems) > 0 && !p.isHeading(rootElems[0]) {
-			c, err := m.leadingContinuation(p, r, secs, rootElems)
-			if err != nil {
+		var l *lead
+		if len(open) > 0 && p.k > 0 && len(rootElems) > 0 && !p.isHeading(rootElems[0]) {
+			if l, err = m.leadingContinuation(p, r, secs, rootElems, len(open)); err != nil {
 				return err
 			}
-			if c != nil {
-				m.folds[*open] = append(m.folds[*open], *c)
+		}
+		if l != nil {
+			for d, at := range open {
+				if c := l.conts[d]; c.p != nil {
+					m.folds[at] = append(m.folds[at], c)
+				}
 			}
 		}
 		if p.rootMoved {
-			continue // the open section stays open
+			continue // the open sections stay open
 		}
-		next, err := m.lastOpenSection(p, secs, rootElems)
+		path, err := m.openPath(p, secs, rootElems)
 		if err != nil {
 			return err
 		}
-		if next != nil && next.i == 1 && p.secDrop == 1 {
-			continue // the part ends in its continuation, which went into the open section
-		}
-		if next != nil || len(rootElems) > p.rootDrop {
-			open = next
+		switch {
+		case len(path) > 0:
+			open = reopen(p, open, l, path)
+		case len(rootElems) > p.rootDrop:
+			open = nil // the part ends in its root, which closes every section
 		}
 	}
 	return nil
 }
 
-// leadingContinuation returns part p's continuation, or nil if its leading content is not one.
-// It marks the part accordingly: section 1 dropped with the root's pointer to it, the root's
-// leading run dropped, or all of its root's content moved.
-func (m *merger) leadingContinuation(p *part, r *root, secs []json.RawMessage, rootElems []string) (*continuation, error) {
+// reopen is the path left open after part p, from the sections path its tree ends in: a section
+// of p's folded into an open section stands for that section and the ones above it.
+func reopen(p *part, open []sectionAt, l *lead, path []int) []sectionAt {
+	var next []sectionAt
+	for _, i := range path {
+		if l != nil && i <= len(l.into) {
+			next = slices.Clone(open[:l.into[i-1]])
+			continue
+		}
+		next = append(next, sectionAt{p.k, i})
+	}
+	return next
+}
+
+// leadingContinuation returns how part p's leading content continues the depth sections left
+// open before it, or nil if it is no continuation. It marks the part accordingly: its leading
+// sections dropped with the root's pointer to the first, the root's leading run dropped, or all
+// of its root's content moved.
+func (m *merger) leadingContinuation(p *part, r *root, secs []json.RawMessage, rootElems []string, depth int) (*lead, error) {
+	l := &lead{conts: make([]continuation, depth)}
 	if len(secs) == 1 {
 		// No section but the root: the root's content continues the open section, unless it
 		// holds a section pointer, which a part with one section cannot resolve anyway.
@@ -231,45 +299,104 @@ func (m *merger) leadingContinuation(p *part, r *root, secs []json.RawMessage, r
 		}
 		v, _ := r.get("elements")
 		p.rootMoved = true
-		return &continuation{p: p, elements: v, spans: r.spans}, nil
+		l.content(continuation{p: p, elements: v, spans: r.spans}, 0)
+		return l, nil
 	}
 	i, ok := sectionIndex(rootElems[0])
 	if !ok {
-		return m.leadingRun(p, r, rootElems)
+		c, err := m.leadingRun(p, r, rootElems)
+		if c == nil || err != nil {
+			return nil, err
+		}
+		l.content(*c, 0)
+		return l, nil
 	}
 	if i != 1 {
 		return nil, nil
 	}
-	s1, err := readObject(p.k, secs[1], "section 1")
-	if err != nil {
-		return nil, err
-	}
-	ev, hasElems := s1.get("elements")
-	sv, hasSpans := s1.get("spans")
-	if !hasElems || !hasSpans {
-		return nil, nil
-	}
-	elems, err := pointers(p.k, ev, "section 1")
-	if err != nil {
-		return nil, err
-	}
-	if len(elems) == 0 || p.isHeading(elems[0]) {
-		return nil, nil
-	}
-	for _, e := range elems {
-		if _, ok := sectionIndex(e); ok {
+	return m.leadingSections(p, secs, l)
+}
+
+// chainLink is one of the untitled sections a part opens with.
+type chainLink struct {
+	elements json.RawMessage
+	spans    []span
+	wrapper  bool // it opens with the next section of the chain
+}
+
+// leadingSections fills l with the chain of untitled sections part p opens with, from section 1:
+// wrappers, each opening with the next, then a section that opens with content. It is no
+// continuation when section 1 has a heading, when the chain is deeper than the open path, or when
+// a section on it cannot be read as one — without spans or elements, or wrapping a section that
+// is not the next in the part's numbering, as every real section's first sub-section is.
+func (m *merger) leadingSections(p *part, secs []json.RawMessage, l *lead) (*lead, error) {
+	depth := len(l.conts)
+	var chain []chainLink
+	for i := 1; ; i++ {
+		if i >= len(secs) {
+			return nil, nil
+		}
+		what := "section " + strconv.Itoa(i)
+		s, err := readObject(p.k, secs[i], what)
+		if err != nil {
+			return nil, err
+		}
+		ev, hasElems := s.get("elements")
+		sv, hasSpans := s.get("spans")
+		if !hasElems || !hasSpans {
+			return nil, nil
+		}
+		elems, err := pointers(p.k, ev, what)
+		if err != nil {
+			return nil, err
+		}
+		if len(elems) == 0 {
+			return nil, nil
+		}
+		if p.isHeading(elems[0]) {
+			if len(chain) == 0 {
+				return nil, nil
+			}
+			break // a section of its own, inside the last wrapper's
+		}
+		if i > depth {
+			return nil, nil
+		}
+		spans, err := readSpans(p.k, sv)
+		if err != nil {
+			return nil, err
+		}
+		if err := m.spansWithin(p, spans, what); err != nil {
+			return nil, err
+		}
+		next, wrapper := sectionIndex(elems[0])
+		chain = append(chain, chainLink{elements: ev, spans: spans, wrapper: wrapper})
+		if !wrapper {
+			break
+		}
+		if next != i+1 {
 			return nil, nil
 		}
 	}
-	spans, err := readSpans(p.k, sv)
-	if err != nil {
-		return nil, err
+	n := len(chain)
+	for i, c := range chain {
+		if i < n-1 { // its pointer to the next link, which is folded too
+			var err error
+			if _, c.elements, err = splitArray(p.k, c.elements, 1); err != nil {
+				return nil, err
+			}
+		}
+		cont := continuation{p: p, elements: c.elements, spans: c.spans}
+		if c.wrapper {
+			l.conts[i] = cont
+			l.into = append(l.into, i+1)
+			continue
+		}
+		l.content(cont, i)
+		l.into = append(l.into, depth)
 	}
-	if err := m.spansWithin(p, spans, "section 1"); err != nil {
-		return nil, err
-	}
-	p.secDrop, p.rootDrop = 1, 1
-	return &continuation{p: p, elements: ev, spans: spans}, nil
+	p.secDrop, p.rootDrop = n, 1
+	return l, nil
 }
 
 // leadingRun returns the continuation a root opens with when its first element is neither a
@@ -373,22 +500,23 @@ func leafPointer(ptr string) (string, int, bool) {
 	return "", 0, false
 }
 
-// lastOpenSection follows part p's tree from its root through each last element that is a
-// section, and returns the section it ends at, or nil when the root's own last element is not a
-// section. A section the merge cannot extend — without spans or elements — closes nothing and
-// opens nothing: nil.
-func (m *merger) lastOpenSection(p *part, secs []json.RawMessage, rootElems []string) (*sectionAt, error) {
+// openPath follows part p's tree from its root through each last element that is a section, and
+// returns the sections it passes, the root's first. It is empty when the root's own last element
+// is not a section, and when a section on the way cannot be extended — without spans or elements —
+// since no fold could reach below it: such a section closes everything and opens nothing.
+func (m *merger) openPath(p *part, secs []json.RawMessage, rootElems []string) ([]int, error) {
 	elems := rootElems
-	at := 0
+	var path []int
 	for range secs { // a well-formed tree is no deeper than it has sections
 		if len(elems) == 0 {
 			break
 		}
 		i, ok := sectionIndex(elems[len(elems)-1])
-		if !ok || i < 1 || i >= len(secs) || i == at {
+		if !ok || i < 1 || i >= len(secs) || slices.Contains(path, i) {
 			break
 		}
-		s, err := readObject(p.k, secs[i], "section "+strconv.Itoa(i))
+		what := "section " + strconv.Itoa(i)
+		s, err := readObject(p.k, secs[i], what)
 		if err != nil {
 			return nil, err
 		}
@@ -396,15 +524,12 @@ func (m *merger) lastOpenSection(p *part, secs []json.RawMessage, rootElems []st
 		if _, hasSpans := s.get("spans"); !hasElems || !hasSpans {
 			return nil, nil
 		}
-		if elems, err = pointers(p.k, ev, "section "+strconv.Itoa(i)); err != nil {
+		if elems, err = pointers(p.k, ev, what); err != nil {
 			return nil, err
 		}
-		at = i
+		path = append(path, i)
 	}
-	if at == 0 {
-		return nil, nil
-	}
-	return &sectionAt{p.k, at}, nil
+	return path, nil
 }
 
 // spansWithin checks that spans the merge will shift lie within the part's content.
@@ -438,7 +563,8 @@ func (m *merger) appendSpans(out []span, p *part, spans []span) []span {
 }
 
 // writeSection writes one of part p's sections after the root, renumbered, and extended with the
-// continuations folded into it.
+// continuations folded into it: their elements, and their spans, which a section above the one
+// that takes the elements gets too.
 func (m *merger) writeSection(bw *bufio.Writer, p *part, i int, raw json.RawMessage, index int) error {
 	prefix := []jsonx.PathElem{{Key: "sections"}, {IsIndex: true, Index: index}}
 	folds := m.folds[sectionAt{p.k, i}]
@@ -494,11 +620,15 @@ func (m *merger) writeSection(bw *bufio.Writer, p *part, i int, raw json.RawMess
 }
 
 // writeElements writes one elements array made of several parts' element arrays, each renumbered
-// by its own part.
+// by its own part. A continuation without elements, which extends a section's spans alone, adds
+// none.
 func (m *merger) writeElements(bw *bufio.Writer, lists []continuation, prefix []jsonx.PathElem) error {
 	bw.WriteByte('[')
 	total := 0
 	for _, l := range lists {
+		if l.elements == nil {
+			continue
+		}
 		n, err := jsonx.CountItems(bytes.NewReader(l.elements), 0, int64(len(l.elements)))
 		if err != nil {
 			return jsonErr(l.p.k, "section elements", err)

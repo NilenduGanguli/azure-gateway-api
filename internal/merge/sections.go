@@ -31,7 +31,8 @@ import (
 // covers furniture the service left out.
 //
 // A part whose leading content has no heading continues the section the parts before it left
-// open, and is folded into that section rather than given one of its own (continue.go).
+// open, and is folded into that section rather than given one of its own; the sections above it
+// take the content's spans, as the root does (continue.go).
 //
 // A part without sections contributes none, which is only right when it has no content either: a
 // run of blank pages. If any part has sections, a part with content but none would leave its
@@ -430,14 +431,13 @@ func (m *merger) writeRootElements(bw *bufio.Writer) error {
 
 // writeRootSpans writes the merged root's spans: every root's in part order, shifted into merged
 // offsets, a part's first span joined to the span before it where only the page separator lies
-// between them (appendSpans). A root whose content continues an earlier part's section gives its
-// spans to that section instead.
+// between them (appendSpans). A root whose content continues an earlier part's section keeps its
+// spans here as well as giving them to that section: the root's spans cover all the content its
+// sections hold, as py_layout_multipage_table_span_pdf's one span over both pages does.
 func (m *merger) writeRootSpans(bw *bufio.Writer) {
 	var out []span
 	for j, r := range m.roots {
-		if p := m.with[j]; !p.rootMoved {
-			out = m.appendSpans(out, p, r.spans)
-		}
+		out = m.appendSpans(out, m.with[j], r.spans)
 	}
 	writeSpans(bw, out)
 }

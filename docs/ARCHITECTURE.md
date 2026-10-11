@@ -619,7 +619,7 @@ other, so that no order keeps them all, are an `ErrCheck`.
 | `pages[].pageNumber`, and `pageNumber` in every `boundingRegions[]` element | mapped to the original page |
 | strings in any `elements` array matching `/(paragraphs\|tables\|figures\|sections\|keyValuePairs)/N` | index plus the earlier parts' element count for that member |
 | `figures[].id` (`"<page>.<n>"`) | the page mapped to the original; `<n>` kept |
-| `sections` | **one root**, as Azure produces: its `elements` are every part's root elements in order, shifted; its `spans` every root's own spans, shifted, a part's first span joined to the previous part's last **only where nothing but the page separator lies between them** (the earlier root ends where its part does and this one starts where its part does), so the root never covers the page furniture and blank pages the service leaves out of it; other members from the first root that has them. Non-root sections follow in part order, part *k*'s section *i* ≥ 1 becoming `1 + Σ_{j<k}(sections_j − 1 − drop_j) + (i − 1 − drop_k)`. **A section continues across a cut** (below): a part whose leading content has no heading is folded into the deepest last section the earlier parts left open, and leaves its own part — `drop_k = 1` when it was section 1. A part with no sections is allowed only when it has no content, whichever part it is |
+| `sections` | **one root**, as Azure produces: its `elements` are every part's root elements in order, shifted, less what continues an earlier part's section; its `spans` every root's own spans, shifted — a root whose content all continues an earlier part's section included — a part's first span joined to the previous part's last **only where nothing but the page separator lies between them** (the earlier root ends where its part does and this one starts where its part does), so the root never covers the page furniture and blank pages the service leaves out of it; other members from the first root that has them. Non-root sections follow in part order, part *k*'s section *i* ≥ 1 becoming `1 + Σ_{j<k}(sections_j − 1 − drop_j) + (i − 1 − drop_k)`. **A section continues across a cut** (below): a part whose leading content has no heading is folded into the sections the earlier parts left open — content into the deepest, an untitled wrapper into the one at its own depth — and leaves its own part — `drop_k` is the number of its leading untitled sections folded, 1 for an untitled section 1. A part with no sections is allowed only when it has no content, whichever part it is |
 | other arrays (`paragraphs`, `tables`, `figures`, `styles`, `warnings`, unknown arrays) | concatenated in part order with the rules above applied structurally |
 
 **A section that continues across a cut.** A section runs from its heading to the next heading at
@@ -627,14 +627,40 @@ its level or above, so a cut inside one leaves the next part opening with conten
 heading; the service, seeing that part alone, gives it a section of its own, where for the whole
 document it would have kept it in the section left open (`py_layout_multipage_table_span_pdf`: a
 heading on page 1 and a table running onto page 2 are one section with one span). The merge folds
-such leading content into the deepest last section of the earlier parts' tree — its elements
-appended, its spans appended and joined across the separator. A heading is a `title` or
-`sectionHeading` paragraph. The leading content is one of:
+such leading content into the sections the earlier parts left open — content into the deepest,
+an untitled wrapper into the one at its own depth (below) — its elements appended, its spans
+appended and joined across the separator. A heading is a `title` or
+`sectionHeading` paragraph.
 
-- **an untitled section 1**: the root opens with section 1, whose first element is not a heading
-  and which holds elements only. Section 1 and the root's pointer to it are dropped
-  (`drop_k = 1`). This is the shape the service gives untitled content before a heading
-  (`java_layout`, `js_layout_selection_marks`);
+The sections left open are a **path**: the root's last element when it is a section, that
+section's last element when it is one, and so on to the deepest. In the whole document the
+sections on the path above the one a continuation goes into hold it too, and a real section's
+spans are its elements' extent, sub-sections included (`py_layout_figures`'s section 2 spans its
+sections 3 and 4). So a continuation's spans are appended to **every section on the path above
+it** as well, and the **root keeps every part's own spans** whatever becomes of its elements. The
+path stops at a section it has already passed — a last element pointing back up, which no real
+tree has — so no section is on it twice or takes a continuation twice. The leading content is one
+of:
+
+- **an untitled section 1**: the root opens with section 1, whose first element is not a heading.
+  Section 1 and the root's pointer to it are dropped (`drop_k = 1`), and the deepest open section
+  takes its elements and spans. This is the shape the service gives untitled content before a
+  heading (`java_layout`, `js_layout_selection_marks`). Section 1 may hold sub-sections after its
+  content: their pointers come along, renumbered, and they become the open section's
+  sub-sections, as the whole document nests them (`thirdparty_docler_markdown_2page` cut at its
+  page break: page 2 opens with an untitled section holding two paragraphs and a section, and all
+  three belong to the section page 1 leaves open);
+- **a chain of untitled wrappers**: section 1 opens with section 2, section 2 perhaps with
+  section 3 — the shape a part has when the whole document's nested sections cross the cut, its
+  tree that document's cut at the page. A wrapper continues the open section **at its own
+  depth** (section 1 the root's last section, section 2 that one's), taking its elements less its
+  pointer to the next link, which is folded too. The chain ends at a section that opens with
+  content, which continues the deepest open section, or at one that opens with a heading, which
+  stays a section of its own inside the last wrapper's open section. `drop_k` is the number of
+  sections folded. A chain deeper than the open path has nothing to continue at its top and is
+  left as the part gives it, and so is a wrapper that opens with a section other than the next in
+  the part's numbering — every real section's first sub-section is the next — since where the
+  chain goes on is then a guess;
 - **an untitled run in the root**: the root opens with elements that are neither sections nor
   headings, and a section follows them. The run, up to the first section or heading paragraph,
   leaves the root; its spans are the root's clipped to where the run's own elements start and end
@@ -644,7 +670,20 @@ appended, its spans appended and joined across the separator. A heading is a `ti
   No real output has this shape, but it is the same content as the first, and the two merge
   identically;
 - **a root-only part**: the part has no section but its root, and the root's first element is not
-  a heading. Everything the root holds is folded, and the root contributes no elements.
+  a heading. Everything the root holds is folded and the root contributes no elements; its spans
+  stay the merged root's too (`py_layout_multipage_table_span_pdf` with page 2 as a root-only
+  part merges to the whole document's sections, its root one span over both pages).
+
+**What the part cannot say.** Content without a heading can only continue the deepest open
+section, since a section holds its own elements before its sub-sections — that much is exact.
+Where a *heading* in the part would have nested in the whole document — under the section left
+open, or beside it or one of its ancestors — depends on heading levels the service does not
+return, so no rule can be right for every document. The merge keeps the part's own nesting
+**relative to the sections its untitled ones continue**: a section inside the untitled section 1
+becomes a sub-section of the deepest open section, one inside a wrapper a sub-section of the open
+section at the wrapper's depth, and one in the root stays in the root. Where the part's tree is the
+whole document's cut at the page, as `realcut` cuts it, that gives the whole document's sections
+back (the real-data tests); where it is a choice, `TestContinuationOfANestedSection` asserts it.
 
 Anything else — leading content with a heading, no section left open because the earlier parts
 hold their content in the root directly, an open section without spans or elements to extend — is

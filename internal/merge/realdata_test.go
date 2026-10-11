@@ -41,9 +41,11 @@ var realDI = []string{
 // output; only the numbering is the merge's, and ComposeDI checks the figure ids against the
 // inputs independently of it. figureIDs are the ids the whole must carry, written out by hand.
 //
-// A root-only part placed after a part that leaves a section open is a continuation whose root
-// contributes no spans (continue.go), and realcut cannot cut such a whole back into parts the
-// merge accepts; TestContinuationOfARootOnlyPart covers that shape, so these orders avoid it.
+// A root-only part placed after a part that leaves a section open continues that section
+// (continue.go), so the last two cut back at their pages into parts that continue it as realcut
+// cuts a section crossing a page — an untitled section 1 — and merge back to the same whole. The
+// root keeps the root-only part's spans; were they the section's alone, the cut would leave that
+// part a root without a span, which the merge refuses.
 var composedDI = []struct {
 	results   []string
 	figureIDs []string
@@ -60,6 +62,13 @@ var composedDI = []struct {
 	// A root of two spans around a blank page, then figures on pages 4 and 5.
 	{[]string{"py_layout_multipage_transform", "py_layout_barcodes", "js_layout_selection_marks"},
 		[]string{"4.1", "5.1", "5.2"}},
+	// Root-only parts continuing an open section: two pages with no heading, a blank one among
+	// them, then a figure, all in py_layout_figures's section 5.
+	{[]string{"py_layout_figures", "java_layout_with_pages", "py_layout_barcodes"},
+		[]string{"1.1", "4.1"}},
+	// The same after a section opened by a title, figures on both pages.
+	{[]string{"js_layout_selection_marks", "py_layout_barcodes"},
+		[]string{"1.1", "1.2", "2.1"}},
 }
 
 // composed joins the named real results into one whole, and returns it as loadReal does.
@@ -269,8 +278,8 @@ func TestMergeReproducesRealReadOutputs(t *testing.T) {
 // The exception is a part with no heading and no section but its root, whose content continues
 // the section the part before it left open (continue.go): realcut gives such a part back as one
 // section under its root, the shape a part has when a section crosses a cut, where the service
-// gives a part with no heading a root that holds its content directly. Its sections are checked
-// by TestContinuationOfARootOnlyPart instead.
+// gives a part with no heading a root that holds its content directly. Only its root's spans are
+// compared; its sections are checked by TestContinuationOfARootOnlyPart instead.
 func TestRealResultsAsParts(t *testing.T) {
 	for _, tc := range []struct {
 		names     []string
@@ -301,6 +310,12 @@ func TestRealResultsAsParts(t *testing.T) {
 					t.Fatalf("part %d (%s) cut back from the merge does not parse: %v", k, name, err)
 				}
 				if k == tc.continues {
+					// Its root's spans come back all the same: the merged root keeps them.
+					ws := realcut.Encode(realcut.Items(want.Get("sections"))[0].Get("spans"))
+					gs := realcut.Encode(realcut.Items(got.Get("sections"))[0].Get("spans"))
+					if !bytes.Equal(gs, ws) {
+						t.Errorf("part %d (%s): root spans %s cut back from the merge, want %s", k, name, gs, ws)
+					}
 					want.Del("sections")
 					got.Del("sections")
 				}
@@ -356,8 +371,9 @@ func realParts(t *testing.T, names []string) (parts [][]byte, plan [][]int) {
 // TestContinuationOfARootOnlyPart: py_layout_figures ends inside its section 5, a heading and the
 // paragraphs after it; java_layout_with_pages has no heading, so its root holds its content
 // directly. Analysed as one document, that content has no heading of its own and stays in
-// section 5: the merged section 5 gains java's elements and spans, and the merged root and
-// section list are py_layout_figures's.
+// section 5: the merged section 5 gains java's elements and spans, the merged section list is
+// py_layout_figures's, and so are the merged root's elements. The root's spans are
+// py_layout_figures's and then java's, since the root covers what its sections hold.
 func TestContinuationOfARootOnlyPart(t *testing.T) {
 	parts, plan := realParts(t, []string{"py_layout_figures", "java_layout_with_pages"})
 	merged, err := mergeCut(t, parts, plan, true)
@@ -385,8 +401,18 @@ func TestContinuationOfARootOnlyPart(t *testing.T) {
 	if len(gotSecs) != len(figSecs) {
 		t.Fatalf("%d sections, want py_layout_figures's %d", len(gotSecs), len(figSecs))
 	}
-	if g, w := realcut.Encode(gotSecs[0]), realcut.Encode(figSecs[0]); !bytes.Equal(g, w) {
-		t.Errorf("root %s, want py_layout_figures's %s", g, w)
+	// java's root span, shifted past the first part's content and the separator, and not joined
+	// to py_layout_figures's, which stops before its page footer.
+	content, _ := fig.Get("content").Str()
+	shift := textunit.Len(content, textunit.TextElements) + 1
+	javaRoot := realcut.Items(javaSecs[0].Get("spans"))[0]
+	jo, _ := javaRoot.Get("offset").Int()
+	jl, _ := javaRoot.Get("length").Int()
+	javaSpan := fmt.Sprintf(`{"offset":%d,"length":%d}`, jo+shift, jl)
+	wantRoot := fmt.Sprintf(`{"spans":[{"offset":36,"length":1260},%s],"elements":%s}`,
+		javaSpan, realcut.Encode(figSecs[0].Get("elements")))
+	if g := string(realcut.Encode(gotSecs[0])); g != wantRoot {
+		t.Errorf("root %s, want %s", g, wantRoot)
 	}
 	for i := 1; i < 5; i++ {
 		if g, w := realcut.Encode(gotSecs[i]), realcut.Encode(figSecs[i]); !bytes.Equal(g, w) {
@@ -426,13 +452,8 @@ func TestContinuationOfARootOnlyPart(t *testing.T) {
 		t.Errorf("section 5 elements\n%v\nwant\n%v", gotElems, want)
 	}
 	// Its spans: its own, which stop before py_layout_figures's page footer, and java's root
-	// span shifted past the first part's content and the separator.
-	content, _ := fig.Get("content").Str()
-	shift := textunit.Len(content, textunit.TextElements) + 1
-	javaRoot := realcut.Items(javaSecs[0].Get("spans"))[0]
-	jo, _ := javaRoot.Get("offset").Int()
-	jl, _ := javaRoot.Get("length").Int()
-	wantSpans := fmt.Sprintf(`[{"offset":477,"length":819},{"offset":%d,"length":%d}]`, jo+shift, jl)
+	// span, as the root's.
+	wantSpans := fmt.Sprintf(`[{"offset":477,"length":819},%s]`, javaSpan)
 	if g := string(realcut.Encode(gotSecs[5].Get("spans"))); g != wantSpans {
 		t.Errorf("section 5 spans %s, want %s", g, wantSpans)
 	}
@@ -560,4 +581,154 @@ func TestContinuationBeforeASectionInTheRoot(t *testing.T) {
 			}
 		})
 	}
+}
+
+// rootOnly gives a part the shape the service gives a part with no heading at all: its content
+// straight in its root, and no section but the root. realcut cuts a part that continues a section
+// as an untitled section 1 under its root, the shape it has in the whole document; the service,
+// analysing the part's pages alone, gives a page with no heading a root that holds it directly
+// (java_layout_with_pages, py_layout_barcodes). The root keeps its own spans.
+func rootOnly(t *testing.T, b []byte) []byte {
+	t.Helper()
+	r, err := realcut.Parse(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secs := realcut.Items(r.Get("sections"))
+	if len(secs) != 2 {
+		t.Fatalf("test data: %d sections, want a root and its section 1", len(secs))
+	}
+	if e := realcut.Encode(secs[0].Get("elements")); string(e) != `["/sections/1"]` {
+		t.Fatalf("test data: root elements %s, want only section 1", e)
+	}
+	secs[0].Set("elements", secs[1].Get("elements"))
+	r.Set("sections", realcut.ArrNode(secs[0]))
+	return realcut.Encode(r)
+}
+
+// sameSections fails the test unless the merged result's sections are the whole document's.
+func sameSections(t *testing.T, want *realcut.Node, got []byte) {
+	t.Helper()
+	g, err := realcut.Parse(got)
+	if err != nil {
+		t.Fatalf("merged output does not parse: %v", err)
+	}
+	ws, gs := realcut.Items(want.Get("sections")), realcut.Items(g.Get("sections"))
+	for i := range max(len(ws), len(gs)) {
+		var w, s []byte
+		if i < len(ws) {
+			w = realcut.Encode(ws[i])
+		}
+		if i < len(gs) {
+			s = realcut.Encode(gs[i])
+		}
+		if !bytes.Equal(w, s) {
+			t.Errorf("sections[%d]\n got %s\nwant %s", i, s, w)
+		}
+	}
+}
+
+// TestRootOnlyContinuationReproducesTheWhole: py_layout_multipage_table_span_pdf's page 2 is the
+// rest of a table whose section opens on page 1. Analysed alone, page 2 has no heading, so its
+// root holds the table directly. Merged after page 1, the table continues page 1's open section,
+// and the merged sections are the whole document's: the root one span over both pages — page 2's
+// root spans are the root's as much as the section's — and section 2 one span from its heading
+// to the table's end.
+func TestRootOnlyContinuationReproducesTheWhole(t *testing.T) {
+	want, whole := loadReal(t, diPath("py_layout_multipage_table_span_pdf"))
+	plan := [][]int{{1}, {2}}
+	parts, _, err := realcut.CutDI(whole, plan, textunit.TextElements)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts[1] = rootOnly(t, parts[1])
+	got, err := mergeCut(t, parts, plan, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sameSections(t, want, got)
+	if diffs := differences(t, want, got); diffs != nil {
+		t.Errorf("merged result differs from the real one:\n  %s", strings.Join(diffs, "\n  "))
+	}
+}
+
+// TestLeadingSectionWithSubsectionsReproducesTheWhole: thirdparty_docler_markdown_2page's section
+// 2 opens with its title on page 1 and runs to the end of page 2, where it holds two untitled
+// paragraphs and then a section of its own (a sectionHeading, a table, a paragraph). Cut at the
+// page break, page 2 opens with an untitled section that holds the two paragraphs and that
+// sub-section. Merged after page 1, the untitled section continues section 2 — its paragraphs and
+// its pointer to the sub-section join section 2's elements, the sub-section renumbered after the
+// sections before it — and the merged sections are the whole document's.
+//
+// The text after the cut sits two text elements earlier in the merged content than in the whole:
+// the merge joins markdown parts with "\n<!-- PageBreak -->\n", and the whole's page-break block
+// is longer (TestMergeReproducesRealDIOutputs). So the whole's sections are compared at the
+// merged offsets, every offset past the block moved by the difference.
+func TestLeadingSectionWithSubsectionsReproducesTheWhole(t *testing.T) {
+	want, whole := loadReal(t, diPath("thirdparty_docler_markdown_2page"))
+	plan := [][]int{{1}, {2}}
+	parts, _, err := realcut.CutDI(whole, plan, textunit.TextElements)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p1, err := realcut.Parse(parts[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, err := realcut.Parse(parts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	secs := realcut.Items(p2.Get("sections"))
+	if len(secs) != 3 || !strings.HasSuffix(string(realcut.Encode(secs[1].Get("elements"))), `"/sections/2"]`) {
+		t.Fatalf("test data: page 2's sections %s, want a root, an untitled section ending in a sub-section, and the sub-section",
+			realcut.Encode(p2.Get("sections")))
+	}
+	got, err := mergeCut(t, parts, plan, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := realcut.Parse(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Page 1's text ends the same in both; page 2's starts where each one's page 2 span does.
+	content, _ := p1.Get("content").Str()
+	keep := textunit.Len(content, textunit.TextElements)
+	from, _ := realcut.Items(realcut.Items(want.Get("pages"))[1].Get("spans"))[0].Get("offset").Int()
+	to, _ := realcut.Items(realcut.Items(g.Get("pages"))[1].Get("spans"))[0].Get("offset").Int()
+	if from == to {
+		t.Fatalf("test data: page 2 starts at %d in both; the comparison needs no moving", from)
+	}
+	moved := realcut.ObjNode()
+	moved.Set("sections", atMergedOffsets(t, want.Get("sections"), keep, from, to-from))
+	sameSections(t, moved, got)
+}
+
+// atMergedOffsets returns a copy of sections with every span offset and end at or past from
+// moved by by, and those at or before keep as they are. A span that starts or ends between the
+// two, inside the whole's page-break block, has no place in the merged content and fails the
+// test.
+func atMergedOffsets(t *testing.T, sections *realcut.Node, keep, from, by int) *realcut.Node {
+	t.Helper()
+	at := func(x int) int {
+		switch {
+		case x <= keep:
+			return x
+		case x >= from:
+			return x + by
+		}
+		t.Fatalf("test data: a section span boundary at %d, inside the page-break block (%d,%d)", x, keep, from)
+		return 0
+	}
+	out := sections.Clone()
+	for _, s := range realcut.Items(out) {
+		for _, sp := range realcut.Items(s.Get("spans")) {
+			o, _ := sp.Get("offset").Int()
+			l, _ := sp.Get("length").Int()
+			sp.Set("offset", realcut.NumNode(at(o)))
+			sp.Set("length", realcut.NumNode(at(o+l)-at(o)))
+		}
+	}
+	return out
 }

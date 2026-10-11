@@ -237,8 +237,8 @@ func (v *diVisitor) pointer(kind jsonx.Kind, raw []byte) ([]byte, bool) {
 	j := i + v.p.ptrBase[which]
 	switch {
 	case which == ptrSections && i > 0 && i <= v.p.secDrop:
-		// Only the root points at a section 1 that was folded away, and the merged root leaves
-		// that pointer out.
+		// Only the root points at the first section folded away, and each folded wrapper at the
+		// next; the merge leaves those pointers out.
 		return v.fail("element pointer %s names a section folded into an earlier part's", raw)
 	case which == ptrSections && i > 0:
 		j = v.p.secBase + i - 1 - v.p.secDrop

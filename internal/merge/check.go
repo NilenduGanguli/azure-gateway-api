@@ -366,8 +366,8 @@ func (m *merger) shift(sepLen int) {
 		}
 		p.secBase = sec
 		if n := p.counts["sections"]; n > 0 {
-			// Every part has its own root, and only the merged root survives; a section 1 that
-			// continues an earlier part's section is folded into it.
+			// Every part has its own root, and only the merged root survives; the leading
+			// sections that continue an earlier part's are folded into them.
 			sec += n - 1 - p.secDrop
 		}
 	}

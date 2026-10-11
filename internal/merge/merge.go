@@ -110,10 +110,10 @@ type part struct {
 	lt     ltStyle      // how the content writes '<' and '>', if it shows
 	heads  map[int]bool // the paragraphs whose role is title or sectionHeading
 
-	// How the part's leading content continues the section open before it (continue.go): its
-	// section 1 folded into that section (secDrop 1), the untitled run its root opens with moved
-	// into it (rootDrop root elements, the pointer to a folded section 1 included), or all of its
-	// root's content moved into it.
+	// How the part's leading content continues the sections open before it (continue.go): its
+	// leading untitled sections folded into them (secDrop sections, from section 1, and rootDrop
+	// 1, the root's pointer to section 1), the untitled run its root opens with moved into the
+	// deepest (rootDrop root elements), or all of its root's content moved into the deepest.
 	secDrop   int
 	rootDrop  int
 	rootMoved bool
