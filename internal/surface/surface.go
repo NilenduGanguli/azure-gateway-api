@@ -98,7 +98,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request, p submitParams) 
 	// through storing a document.
 	if s.deps.Jobs.DiskPressure() {
 		azerr.Unavailable(p.surface, "The gateway is temporarily out of storage. Try again.",
-			s.deps.Config.BusyRetryAfter).WriteTo(w, p.surface)
+			config.RetryAfterBusy).WriteTo(w, p.surface)
 		return
 	}
 
@@ -107,7 +107,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request, p submitParams) 
 		// Every upstream slot is busy. The containers themselves never emit 429 — they do not cap
 		// TPS — so this is the gateway's own backpressure, and it always carries Retry-After
 		// because the JS SDK only retries a 429 when one of the retry-after headers is present.
-		azerr.TooBusy(p.surface, s.deps.Config.BusyRetryAfter).WriteTo(w, p.surface)
+		azerr.TooBusy(p.surface, config.RetryAfterBusy).WriteTo(w, p.surface)
 		return
 	}
 	committed := false
@@ -133,7 +133,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request, p submitParams) 
 		}
 		log.Error("could not store submitted document", "job", id, "error", err)
 		azerr.Unavailable(p.surface, "The submitted document could not be stored.",
-			s.deps.Config.BusyRetryAfter).WriteTo(w, p.surface)
+			config.RetryAfterBusy).WriteTo(w, p.surface)
 		return
 	}
 
@@ -157,7 +157,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request, p submitParams) 
 		_ = s.deps.Store.Blob.RemoveAll(id)
 		log.Error("could not create job", "job", id, "error", err)
 		azerr.Unavailable(p.surface, "The request could not be accepted.",
-			s.deps.Config.BusyRetryAfter).WriteTo(w, p.surface)
+			config.RetryAfterBusy).WriteTo(w, p.surface)
 		return
 	}
 
@@ -165,7 +165,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request, p submitParams) 
 		// The row is committed, so the operation id is valid and the recovery pass will pick it
 		// up. Rather than lie about capacity, the client is told to retry.
 		log.Error("could not enqueue job", "job", id, "error", err)
-		azerr.TooBusy(p.surface, s.deps.Config.BusyRetryAfter).WriteTo(w, p.surface)
+		azerr.TooBusy(p.surface, config.RetryAfterBusy).WriteTo(w, p.surface)
 		return
 	}
 	committed = true
@@ -177,7 +177,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request, p submitParams) 
 	//     and then parse that response as the analyze result.
 	//   - integer-seconds Retry-After: without it azure-core waits its 30s default between polls.
 	w.Header().Set("Operation-Location", p.operationLocation(base, id))
-	httpx.SetRetryAfter(w, s.deps.Config.PollRetryAfter)
+	httpx.SetRetryAfter(w, config.RetryAfterPoll)
 	w.Header().Set("Content-Length", "0")
 	w.WriteHeader(http.StatusAccepted)
 
@@ -242,7 +242,7 @@ func (s *Server) poll(w http.ResponseWriter, r *http.Request, surface azerr.Surf
 
 	default:
 		// notStarted and running both report as running-in-progress with a pacing hint.
-		httpx.SetRetryAfter(w, s.deps.Config.PollRetryAfter)
+		httpx.SetRetryAfter(w, config.RetryAfterPoll)
 		httpx.WriteJSON(w, http.StatusOK, envelope{
 			Status:              string(job.Status),
 			CreatedDateTime:     job.CreatedAt.Format(jobs.TimeFormat),

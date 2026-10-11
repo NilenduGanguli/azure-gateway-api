@@ -17,13 +17,6 @@ import (
 	"github.com/NilenduGanguli/azure-gateway-api/internal/logging"
 )
 
-// HeaderRequestID is the per-response correlation id the Azure front door emits.
-//
-// No SDK requires it — the only references in any Azure SDK tree are .NET adding it to its logged
-// header allowlist — but emitting it costs nothing and makes gateway traffic look and log exactly
-// like container traffic.
-const HeaderRequestID = "apim-request-id"
-
 // HeaderClientRequestID is the correlation id SDKs send and expect echoed in their own logs.
 const HeaderClientRequestID = "x-ms-client-request-id"
 
@@ -65,12 +58,15 @@ func (r *responseRecorder) Write(b []byte) (int, error) {
 // Unwrap exposes the underlying writer so http.ResponseController can reach optional interfaces.
 func (r *responseRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 
-// RequestID assigns each response an apim-request-id and binds a request-scoped logger.
+// RequestID mints a per-request id and binds a request-scoped logger carrying it.
+//
+// The id stays in the gateway's logs and is not sent to the client. apim-request-id is a cloud
+// front-door header that the containers are not known to send (api-surface Q-A7), and the gateway
+// must not be distinguishable from the container it fronts.
 func RequestID(base *slog.Logger) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			rid := ids.New()
-			w.Header().Set(HeaderRequestID, rid)
 
 			log := base.With("requestId", rid)
 			if cid := r.Header.Get(HeaderClientRequestID); cid != "" {
@@ -134,6 +130,26 @@ func Recover(onPanic func(w http.ResponseWriter, r *http.Request, v any)) Middle
 	}
 }
 
+// adminPrefix is the gateway's own surface, which no container serves.
+const adminPrefix = "/_gw/"
+
+// ServerHeader names Kestrel, the containers' web server, on every response outside /_gw/.
+//
+// The containers send it on every response, so a gateway that omits it is distinguishable from the
+// pod it stands in for. It is set before the handler runs so that every exit path carries it,
+// including the error a handler writes early. The admin surface is the gateway's own and does not
+// pretend to be a container.
+func ServerHeader() Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !strings.HasPrefix(r.URL.Path, adminPrefix) {
+				w.Header().Set("Server", "Kestrel")
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // NoCache marks responses uncacheable. Polls change meaning between calls, and a cached
 // in-progress body would leave a client polling a stale status forever.
 func NoCache() Middleware {
@@ -184,99 +200,40 @@ func SetRetryAfter(w http.ResponseWriter, seconds int) {
 //
 // This is security-relevant, not just cosmetic. The value becomes the host a client's SDK polls,
 // so anything that can influence it can redirect a caller's follow-up requests — and with them the
-// operation id — somewhere else. Precedence is therefore: an explicitly configured base wins;
-// otherwise a forwarded host is honoured only when forwarding is trusted, the value is a
-// well-formed bare authority, and it passes any configured allowlist; otherwise the request's own
-// Host header.
+// operation id — somewhere else. The gateway therefore does what the container does: an explicitly
+// configured base wins, and otherwise the request's own Host header is used. Forwarded headers are
+// never consulted; behind an OpenShift Route the Host header is already correct, and
+// PUBLIC_BASE_URL covers every other topology.
 type BaseURLResolver struct {
-	// Configured is PUBLIC_BASE_URL. When set it overrides everything, and it is the only option
-	// that is correct behind a proxy which rewrites Host without setting forwarded headers.
+	// Configured is PUBLIC_BASE_URL. When set it overrides the Host header, and it is the only
+	// option that is correct behind a proxy which rewrites Host.
 	Configured string
-	// TrustForwarded enables X-Forwarded-Proto and X-Forwarded-Host. It defaults off: with it on
-	// and no allowlist, a caller can name its own poll host.
-	TrustForwarded bool
-	// AllowedHosts, when non-empty, is the set of authorities a forwarded header may name.
-	// Comparison is case-insensitive on the host, and a value without a port matches any port.
-	AllowedHosts []string
 }
 
-// Resolve returns the scheme and authority to advertise, without a trailing slash.
+// Resolve returns the scheme and authority to advertise, without a trailing slash, or "" when
+// there is nothing safe to advertise.
 func (b BaseURLResolver) Resolve(r *http.Request) string {
 	if b.Configured != "" {
 		return strings.TrimRight(b.Configured, "/")
+	}
+	if !validAuthority(r.Host) {
+		// A relative Operation-Location makes Python join it onto its own endpoint and produce a
+		// doubled path, so an empty authority is never emitted; the caller treats this as a
+		// configuration error.
+		return ""
 	}
 	scheme := "http"
 	if r.TLS != nil {
 		scheme = "https"
 	}
-	host := r.Host
-
-	if b.TrustForwarded {
-		if v := firstForwarded(r.Header.Get("X-Forwarded-Proto")); v == "http" || v == "https" {
-			scheme = v
-		}
-		if v := firstForwarded(r.Header.Get("X-Forwarded-Host")); validAuthority(v) && b.hostAllowed(v) {
-			host = v
-		}
-	}
-	// The allowlist governs what this gateway may advertise, so it must also constrain the plain
-	// Host header. It did not: an operator who followed the warning's advice and listed the allowed
-	// hosts still had every direct caller's Host header trusted verbatim, and could be made to mint
-	// an Operation-Location pointing anywhere simply by omitting X-Forwarded-Host. An empty list
-	// keeps the previous behaviour.
-	if !b.hostAllowed(host) {
-		return ""
-	}
-	if !validAuthority(host) {
-		// Nothing safe to advertise. A relative Operation-Location makes Python join it onto its
-		// own endpoint and produce a doubled path, so an empty authority is never emitted; the
-		// caller treats this as a configuration error.
-		return ""
-	}
-	return scheme + "://" + host
-}
-
-// hostAllowed applies the optional allowlist. An empty list allows anything that parses, which is
-// why Warnings tells an operator to set PUBLIC_BASE_URL or an allowlist when forwarding is trusted.
-func (b BaseURLResolver) hostAllowed(host string) bool {
-	if len(b.AllowedHosts) == 0 {
-		return true
-	}
-	h, hasPort := hostWithoutPort(host)
-	for _, allowed := range b.AllowedHosts {
-		if strings.EqualFold(allowed, host) {
-			return true
-		}
-		// An allowlist entry with no port matches the same host on any port. A bracketed IPv6
-		// entry is full of colons and is compared whole.
-		bare := !strings.Contains(allowed, ":") || strings.HasPrefix(allowed, "[")
-		if bare && hasPort && strings.EqualFold(allowed, h) {
-			return true
-		}
-	}
-	return false
-}
-
-// hostWithoutPort strips a trailing :port, leaving a bracketed IPv6 literal intact.
-func hostWithoutPort(authority string) (host string, hadPort bool) {
-	if strings.HasPrefix(authority, "[") {
-		if end := strings.LastIndexByte(authority, ']'); end >= 0 {
-			return authority[:end+1], end+1 < len(authority)
-		}
-		return authority, false
-	}
-	h, _, found := cutLast(authority, ':')
-	if !found {
-		return authority, false
-	}
-	return h, true
+	return scheme + "://" + r.Host
 }
 
 // validAuthority reports whether s is a bare host or host:port.
 //
-// A forwarded value carrying a path, query or fragment does more than pick the wrong host: it
-// shifts the path segments of Operation-Location, and Azure.AI.FormRecognizer 4.x locates the
-// model and result ids by counting segments backwards from the end.
+// A Host carrying a path, query or fragment does more than pick the wrong host: it shifts the path
+// segments of Operation-Location, and Azure.AI.FormRecognizer 4.x locates the model and result ids
+// by counting segments backwards from the end.
 func validAuthority(s string) bool {
 	if s == "" || len(s) > 255 {
 		return false
@@ -343,17 +300,6 @@ func cutLast(s string, sep byte) (before, after string, found bool) {
 		return s, "", false
 	}
 	return s[:i], s[i+1:], true
-}
-
-// firstForwarded takes the client-most value from a comma-separated forwarded header.
-func firstForwarded(v string) string {
-	if v == "" {
-		return ""
-	}
-	if i := strings.IndexByte(v, ','); i >= 0 {
-		v = v[:i]
-	}
-	return strings.TrimSpace(v)
 }
 
 // AcceptsGzip reports whether the client explicitly permits gzip.

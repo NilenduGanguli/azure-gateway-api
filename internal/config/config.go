@@ -16,9 +16,28 @@ import (
 	"time"
 )
 
+// RetryAfterPoll is the integer-seconds Retry-After on a 202 and on in-progress polls.
+//
+// It was the POLL_RETRY_AFTER setting. It is never zero: azure-core waits its 30-second default
+// between polls when the header is absent, which would make a fast gateway look thirty times
+// slower than it is.
+const RetryAfterPoll = 1
+
+// RetryAfterBusy is the integer-seconds Retry-After on the gateway's own 429, and on the 503 it
+// answers under disk pressure. It was the BUSY_RETRY_AFTER setting.
+const RetryAfterBusy = 5
+
+// removedSettings are recognised so an old manifest still starts, with a warning naming each.
+//
+// Refusing to start over a setting that no longer does anything would turn a gateway upgrade
+// into an outage for every deployment that has not yet edited its manifest.
+var removedSettings = []string{"ERROR_COMPAT", "TRUST_FORWARDED_HEADERS",
+	"TRUSTED_FORWARDED_HOSTS", "ALLOW_NETWORK_FS", "POLL_RETRY_AFTER", "BUSY_RETRY_AFTER"}
+
 // Upstream describes one Azure container the gateway fronts.
 type Upstream struct {
-	// BaseURL is the container's root, without a trailing slash, e.g. http://layout:5000.
+	// BaseURL is the container's root, without a trailing slash, e.g. http://layout:5000. Empty
+	// disables the surface: a gateway may front only one kind of container.
 	BaseURL string
 	// APIKey is sent as Ocp-Apim-Subscription-Key. Never logged.
 	APIKey string
@@ -28,6 +47,10 @@ type Upstream struct {
 	// Timeout bounds one complete logical analyze, including any fallback polling.
 	Timeout time.Duration
 }
+
+// Enabled reports whether this surface is configured. None of a disabled surface's other
+// settings is validated, and it gets no empty-API-key warning.
+func (u Upstream) Enabled() bool { return u.BaseURL != "" }
 
 // SyncMode controls use of a container's synchronous analyze route.
 type SyncMode string
@@ -46,21 +69,10 @@ type Config struct {
 	Addr string
 
 	// PublicBaseURL overrides the scheme and authority used in Operation-Location. When empty,
-	// it is derived per request from the forwarded headers or Host.
+	// it is derived per request from the Host header, as the container itself does.
 	PublicBaseURL string
-	// TrustForwardedHeaders enables X-Forwarded-Proto/Host when deriving the public base URL.
-	//
-	// It defaults OFF. With it on and no allowlist, any caller can set X-Forwarded-Host and have
-	// the gateway mint an Operation-Location pointing wherever it likes — so that caller's SDK
-	// then sends the operation id somewhere else. Behind an OpenShift Route the request's own Host
-	// header is already correct, and PUBLIC_BASE_URL covers every other topology.
-	TrustForwardedHeaders bool
-	// TrustedForwardedHosts, when non-empty, restricts which authorities a forwarded header may
-	// name. An entry without a port matches that host on any port.
-	TrustedForwardedHosts []string
 
-	DataDir        string
-	AllowNetworkFS bool
+	DataDir string
 
 	DI   Upstream
 	Read Upstream
@@ -86,6 +98,9 @@ type Config struct {
 	// submit is rejected with 429 the moment every slot is busy.
 	QueueDepth int
 
+	// SplitPages is the most pages one part may hold; 0 turns splitting off.
+	SplitPages int
+
 	// ArtifactFetchTimeout bounds the whole result-file phase of one job.
 	//
 	// Artifacts are a bonus, not the result: the analysis is already stored by the time they are
@@ -110,56 +125,39 @@ type Config struct {
 	// otherwise also start failing every large analysis the container legitimately returns.
 	MaxResultBytes int64
 
-	// PollRetryAfter is the integer-seconds Retry-After emitted on the 202 and on in-progress
-	// polls. Never zero: azure-core's default polling interval is 30s when the header is absent,
-	// which would make a fast gateway look thirty times slower than it is.
-	PollRetryAfter int
-
-	// BusyRetryAfter is the integer-seconds Retry-After emitted with a 429.
-	BusyRetryAfter int
-
 	ShutdownGrace time.Duration
-
-	// ErrorCompat selects the error rendering mode: "observed" reproduces what the on-prem
-	// containers actually emit, "documented" follows the swagger and the generated SDK models.
-	// They differ on both surfaces; see internal/azerr.
-	ErrorCompat string
 
 	LogLevel  string
 	LogFormat string
+
+	// removedSet lists the removed settings found in the environment, in removedSettings order,
+	// so Warnings can name each without reading the environment again.
+	removedSet []string
 }
 
 // Load reads configuration from the environment and validates it.
 func Load() (*Config, error) {
 	c := &Config{
-		Addr:                  env("GATEWAY_ADDR", ":8080"),
-		PublicBaseURL:         strings.TrimRight(env("PUBLIC_BASE_URL", ""), "/"),
-		TrustForwardedHeaders: envBool("TRUST_FORWARDED_HEADERS", false),
-		TrustedForwardedHosts: envList("TRUSTED_FORWARDED_HOSTS"),
-		DataDir:               env("DATA_DIR", "/data"),
-		AllowNetworkFS:        envBool("ALLOW_NETWORK_FS", false),
-		DISyncMode:            SyncMode(strings.ToLower(env("DI_SYNC_ANALYZE", string(SyncAuto)))),
-		DIBlindPollBudget:     envInt("DI_BLIND_POLL_BUDGET", 60),
-		ReadBlindPollBudget:   envInt("READ_BLIND_POLL_BUDGET", 60),
-		QueueDepth:            envInt("QUEUE_DEPTH", 0),
-		DiskHighWatermark:     envFloat("DISK_HIGH_WATERMARK", 0.90),
-		MaxRequestBytes:       int64(envInt("MAX_REQUEST_BYTES", 500*1024*1024)),
-		MaxResultBytes:        int64(envInt("MAX_RESULT_BYTES", 512*1024*1024)),
-		PollRetryAfter:        envInt("POLL_RETRY_AFTER", 1),
-		BusyRetryAfter:        envInt("BUSY_RETRY_AFTER", 5),
-		ErrorCompat:           strings.ToLower(env("ERROR_COMPAT", "observed")),
-		LogLevel:              strings.ToLower(env("LOG_LEVEL", "info")),
-		LogFormat:             strings.ToLower(env("LOG_FORMAT", "json")),
+		Addr:          env("GATEWAY_ADDR", ":8080"),
+		PublicBaseURL: strings.TrimRight(env("PUBLIC_BASE_URL", ""), "/"),
+		DataDir:       env("DATA_DIR", "/data"),
+		DISyncMode:    SyncMode(strings.ToLower(env("DI_SYNC_ANALYZE", string(SyncAuto)))),
+		LogLevel:      strings.ToLower(env("LOG_LEVEL", "info")),
+		LogFormat:     strings.ToLower(env("LOG_FORMAT", "json")),
 		DI: Upstream{
-			BaseURL:     strings.TrimRight(env("DI_UPSTREAM_URL", ""), "/"),
-			APIKey:      env("DI_UPSTREAM_API_KEY", ""),
-			MaxInflight: envInt("DI_MAX_INFLIGHT", 4),
+			BaseURL: strings.TrimRight(env("DI_UPSTREAM_URL", ""), "/"),
+			APIKey:  env("DI_UPSTREAM_API_KEY", ""),
 		},
 		Read: Upstream{
-			BaseURL:     strings.TrimRight(env("READ_UPSTREAM_URL", ""), "/"),
-			APIKey:      env("READ_UPSTREAM_API_KEY", ""),
-			MaxInflight: envInt("READ_MAX_INFLIGHT", 4),
+			BaseURL: strings.TrimRight(env("READ_UPSTREAM_URL", ""), "/"),
+			APIKey:  env("READ_UPSTREAM_API_KEY", ""),
 		},
+	}
+	for _, name := range removedSettings {
+		// An empty value counts as unset, as it does for every live setting.
+		if v, ok := os.LookupEnv(name); ok && v != "" {
+			c.removedSet = append(c.removedSet, name)
+		}
 	}
 
 	var errs []error
@@ -169,7 +167,42 @@ func Load() (*Config, error) {
 		}
 	}
 
+	// A number that does not parse is an error, never a quiet fallback to the default. SPLIT_PAGES
+	// is why: 0 is its kill switch, and SPLIT_PAGES=off or a letter O for a zero would otherwise
+	// have left splitting on at 5.
 	var err error
+	if c.QueueDepth, err = envInt("QUEUE_DEPTH", 0); err != nil {
+		collect(err)
+	}
+	if c.SplitPages, err = envInt("SPLIT_PAGES", 5); err != nil {
+		collect(err)
+	}
+	if c.DiskHighWatermark, err = envFloat("DISK_HIGH_WATERMARK", 0.90); err != nil {
+		collect(err)
+	}
+	if c.MaxRequestBytes, err = envInt64("MAX_REQUEST_BYTES", 500*1024*1024); err != nil {
+		collect(err)
+	}
+	if c.MaxResultBytes, err = envInt64("MAX_RESULT_BYTES", 512*1024*1024); err != nil {
+		collect(err)
+	}
+	// A disabled surface's own settings are not validated, so a stale value left in the manifest
+	// of a gateway that fronts only the other container cannot stop it starting.
+	if c.DI.MaxInflight, err = envInt("DI_MAX_INFLIGHT", 4); err != nil && c.DI.Enabled() {
+		collect(err)
+	}
+	if c.Read.MaxInflight, err = envInt("READ_MAX_INFLIGHT", 4); err != nil && c.Read.Enabled() {
+		collect(err)
+	}
+	if c.DIBlindPollBudget, err = envInt("DI_BLIND_POLL_BUDGET", 60); err != nil &&
+		c.DI.Enabled() {
+		collect(err)
+	}
+	if c.ReadBlindPollBudget, err = envInt("READ_BLIND_POLL_BUDGET", 60); err != nil &&
+		c.Read.Enabled() {
+		collect(err)
+	}
+
 	if c.ResultTTL, err = envDuration("RESULT_TTL", 24*time.Hour); err != nil {
 		collect(err)
 	}
@@ -185,18 +218,28 @@ func Load() (*Config, error) {
 	if c.DISyncProbeTimeout, err = envDuration("DI_SYNC_PROBE_TIMEOUT", 60*time.Second); err != nil {
 		collect(err)
 	}
-	if c.DI.Timeout, err = envDuration("DI_UPSTREAM_TIMEOUT", 15*time.Minute); err != nil {
+	// As above, only an enabled surface's own timeout is validated.
+	if c.DI.Timeout, err = envDuration("DI_UPSTREAM_TIMEOUT", 15*time.Minute); err != nil &&
+		c.DI.Enabled() {
 		collect(err)
 	}
-	if c.Read.Timeout, err = envDuration("READ_SYNC_TIMEOUT", 10*time.Minute); err != nil {
+	if c.Read.Timeout, err = envDuration("READ_SYNC_TIMEOUT", 10*time.Minute); err != nil &&
+		c.Read.Enabled() {
 		collect(err)
 	}
 	if c.ShutdownGrace, err = envDuration("SHUTDOWN_GRACE", 30*time.Second); err != nil {
 		collect(err)
 	}
 
-	collect(validateUpstream("DI", c.DI))
-	collect(validateUpstream("READ", c.Read))
+	if !c.DI.Enabled() && !c.Read.Enabled() {
+		collect(errors.New("at least one of DI_UPSTREAM_URL and READ_UPSTREAM_URL must be set"))
+	}
+	if c.DI.Enabled() {
+		collect(validateUpstream("DI", c.DI))
+	}
+	if c.Read.Enabled() {
+		collect(validateUpstream("READ", c.Read))
+	}
 
 	if c.PublicBaseURL != "" {
 		u, perr := url.Parse(c.PublicBaseURL)
@@ -214,11 +257,6 @@ func Load() (*Config, error) {
 	if c.DataDir == "" {
 		collect(errors.New("DATA_DIR must be set"))
 	}
-	switch c.ErrorCompat {
-	case "observed", "documented":
-	default:
-		collect(fmt.Errorf("ERROR_COMPAT must be observed or documented, got %q", c.ErrorCompat))
-	}
 	switch c.DISyncMode {
 	case SyncAuto, SyncForce, SyncOff:
 	default:
@@ -226,6 +264,9 @@ func Load() (*Config, error) {
 	}
 	if c.QueueDepth < 0 {
 		collect(errors.New("QUEUE_DEPTH must not be negative"))
+	}
+	if c.SplitPages < 0 {
+		collect(errors.New("SPLIT_PAGES must not be negative"))
 	}
 	if c.DiskHighWatermark <= 0 || c.DiskHighWatermark > 1 {
 		collect(fmt.Errorf("DISK_HIGH_WATERMARK must be in (0,1], got %v", c.DiskHighWatermark))
@@ -235,12 +276,6 @@ func Load() (*Config, error) {
 	}
 	if c.MaxResultBytes <= 0 {
 		collect(errors.New("MAX_RESULT_BYTES must be positive"))
-	}
-	if c.PollRetryAfter < 1 {
-		collect(errors.New("POLL_RETRY_AFTER must be at least 1 second"))
-	}
-	if c.BusyRetryAfter < 1 {
-		collect(errors.New("BUSY_RETRY_AFTER must be at least 1 second"))
 	}
 	if c.ResultTTL <= 0 {
 		collect(errors.New("RESULT_TTL must be positive"))
@@ -264,10 +299,8 @@ func Load() (*Config, error) {
 	return c, nil
 }
 
+// validateUpstream checks an enabled surface. A disabled one is never passed here.
 func validateUpstream(name string, u Upstream) error {
-	if u.BaseURL == "" {
-		return fmt.Errorf("%s_UPSTREAM_URL must be set", name)
-	}
 	parsed, err := url.Parse(u.BaseURL)
 	if err != nil {
 		return fmt.Errorf("%s_UPSTREAM_URL is not a valid URL: %w", name, err)
@@ -307,26 +340,23 @@ var ErrReadHostContainsVision = errors.New(
 // Warnings returns non-fatal configuration concerns worth logging at startup.
 func (c *Config) Warnings() []string {
 	var out []string
+	for _, name := range c.removedSet {
+		out = append(out, name+" is no longer used")
+	}
 	if u, err := url.Parse(c.Read.BaseURL); err == nil && u.Host != "" {
 		if strings.Contains(strings.ToLower(u.Hostname()), "vision") {
 			out = append(out, ErrReadHostContainsVision.Error())
 		}
 	}
-	if c.DI.APIKey == "" {
+	if c.DI.Enabled() && c.DI.APIKey == "" {
 		out = append(out, "DI_UPSTREAM_API_KEY is empty; upstream calls will be unauthenticated")
 	}
-	if c.Read.APIKey == "" {
+	if c.Read.Enabled() && c.Read.APIKey == "" {
 		out = append(out, "READ_UPSTREAM_API_KEY is empty; upstream calls will be unauthenticated")
 	}
-	if c.PublicBaseURL == "" && c.TrustForwardedHeaders && len(c.TrustedForwardedHosts) == 0 {
-		out = append(out, "TRUST_FORWARDED_HEADERS is on with neither PUBLIC_BASE_URL nor "+
-			"TRUSTED_FORWARDED_HOSTS set: any caller can set X-Forwarded-Host and have its "+
-			"Operation-Location point elsewhere. Set PUBLIC_BASE_URL, or list the allowed hosts")
-	}
-	if c.PublicBaseURL == "" && !c.TrustForwardedHeaders && len(c.TrustedForwardedHosts) == 0 {
-		out = append(out, "PUBLIC_BASE_URL is unset and forwarded headers are not trusted; "+
-			"Operation-Location will be derived from the request Host header, which any caller "+
-			"can set. Set PUBLIC_BASE_URL, or list the allowed hosts in TRUSTED_FORWARDED_HOSTS")
+	if c.PublicBaseURL == "" {
+		out = append(out, "PUBLIC_BASE_URL is unset; Operation-Location will be derived from the "+
+			"request Host header, which any caller can set. Set PUBLIC_BASE_URL")
 	}
 	return out
 }
@@ -339,39 +369,44 @@ func (c *Config) Redacted() map[string]any {
 		}
 		return "***"
 	}
+	// Wega's observer parses diMaxInflight, readMaxInflight and queueDepth as numbers. A disabled
+	// surface has no capacity, so it reports 0 rather than an unused default.
+	inflight := func(u Upstream) int {
+		if !u.Enabled() {
+			return 0
+		}
+		return u.MaxInflight
+	}
 	return map[string]any{
-		"addr":                  c.Addr,
-		"publicBaseUrl":         c.PublicBaseURL,
-		"trustForwardedHeaders": c.TrustForwardedHeaders,
-		"trustedForwardedHosts": c.TrustedForwardedHosts,
-		"dataDir":               c.DataDir,
-		"allowNetworkFs":        c.AllowNetworkFS,
-		"diUpstreamUrl":         SafeURL(c.DI.BaseURL),
-		"diUpstreamApiKey":      redact(c.DI.APIKey),
-		"diMaxInflight":         c.DI.MaxInflight,
-		"diUpstreamTimeout":     c.DI.Timeout.String(),
-		"diSyncAnalyze":         string(c.DISyncMode),
-		"diBlindPollBudget":     c.DIBlindPollBudget,
-		"readBlindPollBudget":   c.ReadBlindPollBudget,
-		"diSyncProbeTimeout":    c.DISyncProbeTimeout.String(),
-		"readUpstreamUrl":       SafeURL(c.Read.BaseURL),
-		"readUpstreamApiKey":    redact(c.Read.APIKey),
-		"readMaxInflight":       c.Read.MaxInflight,
-		"readSyncTimeout":       c.Read.Timeout.String(),
-		"queueDepth":            c.QueueDepth,
-		"resultTtl":             c.ResultTTL.String(),
-		"gcInterval":            c.GCInterval.String(),
-		"diskHighWatermark":     c.DiskHighWatermark,
-		"maxRequestBytes":       c.MaxRequestBytes,
-		"maxResultBytes":        c.MaxResultBytes,
-		"uploadTimeout":         c.UploadTimeout.String(),
-		"artifactFetchTimeout":  c.ArtifactFetchTimeout.String(),
-		"pollRetryAfterSeconds": c.PollRetryAfter,
-		"busyRetryAfterSeconds": c.BusyRetryAfter,
-		"shutdownGrace":         c.ShutdownGrace.String(),
-		"errorCompat":           c.ErrorCompat,
-		"logLevel":              c.LogLevel,
-		"logFormat":             c.LogFormat,
+		"addr":                 c.Addr,
+		"publicBaseUrl":        c.PublicBaseURL,
+		"dataDir":              c.DataDir,
+		"splitPages":           c.SplitPages,
+		"diEnabled":            c.DI.Enabled(),
+		"diUpstreamUrl":        SafeURL(c.DI.BaseURL),
+		"diUpstreamApiKey":     redact(c.DI.APIKey),
+		"diMaxInflight":        inflight(c.DI),
+		"diUpstreamTimeout":    c.DI.Timeout.String(),
+		"diSyncAnalyze":        string(c.DISyncMode),
+		"diBlindPollBudget":    c.DIBlindPollBudget,
+		"readBlindPollBudget":  c.ReadBlindPollBudget,
+		"diSyncProbeTimeout":   c.DISyncProbeTimeout.String(),
+		"readEnabled":          c.Read.Enabled(),
+		"readUpstreamUrl":      SafeURL(c.Read.BaseURL),
+		"readUpstreamApiKey":   redact(c.Read.APIKey),
+		"readMaxInflight":      inflight(c.Read),
+		"readSyncTimeout":      c.Read.Timeout.String(),
+		"queueDepth":           c.QueueDepth,
+		"resultTtl":            c.ResultTTL.String(),
+		"gcInterval":           c.GCInterval.String(),
+		"diskHighWatermark":    c.DiskHighWatermark,
+		"maxRequestBytes":      c.MaxRequestBytes,
+		"maxResultBytes":       c.MaxResultBytes,
+		"uploadTimeout":        c.UploadTimeout.String(),
+		"artifactFetchTimeout": c.ArtifactFetchTimeout.String(),
+		"shutdownGrace":        c.ShutdownGrace.String(),
+		"logLevel":             c.LogLevel,
+		"logFormat":            c.LogFormat,
 	}
 }
 
@@ -400,55 +435,40 @@ func env(key, def string) string {
 	return def
 }
 
-// envList parses a comma-separated list, dropping empty entries.
-func envList(key string) []string {
-	raw, ok := os.LookupEnv(key)
-	if !ok || strings.TrimSpace(raw) == "" {
-		return nil
-	}
-	var out []string
-	for _, part := range strings.Split(raw, ",") {
-		if v := strings.TrimSpace(part); v != "" {
-			out = append(out, v)
-		}
-	}
-	return out
-}
-
-func envInt(key string, def int) int {
+func envInt(key string, def int) (int, error) {
 	v, ok := os.LookupEnv(key)
 	if !ok || v == "" {
-		return def
+		return def, nil
 	}
 	n, err := strconv.Atoi(strings.TrimSpace(v))
 	if err != nil {
-		return def
+		return def, fmt.Errorf("%s is not a valid integer: %w", key, err)
 	}
-	return n
+	return n, nil
 }
 
-func envFloat(key string, def float64) float64 {
+func envInt64(key string, def int64) (int64, error) {
 	v, ok := os.LookupEnv(key)
 	if !ok || v == "" {
-		return def
+		return def, nil
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+	if err != nil {
+		return def, fmt.Errorf("%s is not a valid integer: %w", key, err)
+	}
+	return n, nil
+}
+
+func envFloat(key string, def float64) (float64, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def, nil
 	}
 	f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
 	if err != nil {
-		return def
+		return def, fmt.Errorf("%s is not a valid number: %w", key, err)
 	}
-	return f
-}
-
-func envBool(key string, def bool) bool {
-	v, ok := os.LookupEnv(key)
-	if !ok || v == "" {
-		return def
-	}
-	b, err := strconv.ParseBool(strings.TrimSpace(v))
-	if err != nil {
-		return def
-	}
-	return b
+	return f, nil
 }
 
 func envDuration(key string, def time.Duration) (time.Duration, error) {

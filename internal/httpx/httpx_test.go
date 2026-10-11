@@ -1,62 +1,100 @@
 package httpx
 
 import (
+	"bytes"
+	"crypto/tls"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/NilenduGanguli/azure-gateway-api/internal/logging"
 )
 
-// TestBaseURLResolverPrecedence checks how the gateway decides what to advertise in
-// Operation-Location. Getting this wrong sends clients to poll an address they cannot reach.
-func TestBaseURLResolverPrecedence(t *testing.T) {
+// TestBaseURLResolver checks how the gateway decides what to advertise in Operation-Location.
+// Getting this wrong sends clients to poll an address they cannot reach.
+//
+// It follows the container: PUBLIC_BASE_URL when configured, otherwise the request's own Host.
+// Forwarded headers are never consulted. Honouring them let any caller name its own poll host, so
+// that caller's SDK sent the operation id wherever it liked; PUBLIC_BASE_URL covers every
+// topology where Host is not already right.
+func TestBaseURLResolver(t *testing.T) {
+	forwarded := map[string]string{
+		"X-Forwarded-Proto": "https",
+		"X-Forwarded-Host":  "collector.attacker.net",
+	}
 	cases := []struct {
 		name     string
 		resolver BaseURLResolver
 		host     string
+		tls      bool
 		headers  map[string]string
 		want     string
 	}{
 		{
-			name:     "configured wins over everything",
-			resolver: BaseURLResolver{Configured: "https://gw.example.com/", TrustForwarded: true},
+			name:     "configured wins over the host header",
+			resolver: BaseURLResolver{Configured: "https://gw.example.com/"},
 			host:     "internal:8080",
-			headers:  map[string]string{"X-Forwarded-Host": "attacker.example"},
 			want:     "https://gw.example.com",
 		},
 		{
-			name:     "host header when nothing else is available",
-			resolver: BaseURLResolver{},
-			host:     "gw.internal:8080",
-			want:     "http://gw.internal:8080",
-		},
-		{
-			name:     "forwarded headers honoured when trusted",
-			resolver: BaseURLResolver{TrustForwarded: true},
+			name:     "configured wins over forwarded headers",
+			resolver: BaseURLResolver{Configured: "https://gw.example.com"},
 			host:     "internal:8080",
-			headers:  map[string]string{"X-Forwarded-Proto": "https", "X-Forwarded-Host": "gw.example.com"},
+			headers:  forwarded,
 			want:     "https://gw.example.com",
 		},
 		{
-			name:     "forwarded headers ignored when untrusted",
-			resolver: BaseURLResolver{TrustForwarded: false},
-			host:     "gw.internal:8080",
-			headers:  map[string]string{"X-Forwarded-Proto": "https", "X-Forwarded-Host": "attacker.example"},
-			want:     "http://gw.internal:8080",
+			name: "host header over http",
+			host: "gw.internal:8080",
+			want: "http://gw.internal:8080",
 		},
 		{
-			name:     "client-most value taken from a forwarded chain",
-			resolver: BaseURLResolver{TrustForwarded: true},
-			host:     "internal:8080",
-			headers:  map[string]string{"X-Forwarded-Host": "gw.example.com, hop2.internal"},
-			want:     "http://gw.example.com",
+			name: "host header over tls",
+			host: "gw.internal:8443",
+			tls:  true,
+			want: "https://gw.internal:8443",
+		},
+		{
+			name:    "forwarded headers are ignored",
+			host:    "gw.internal:8080",
+			headers: forwarded,
+			want:    "http://gw.internal:8080",
+		},
+		{
+			name: "an IPv6 literal host",
+			host: "[::1]:8080",
+			want: "http://[::1]:8080",
+		},
+		{
+			// A relative Operation-Location makes Python join it onto its own endpoint and double
+			// the path, so "" is returned and the caller fails loudly instead.
+			name: "no host at all",
+			host: "",
+			want: "",
+		},
+		{
+			// A path here would shift every segment of Operation-Location, and
+			// Azure.AI.FormRecognizer 4.x counts segments backwards from the end.
+			name: "a host carrying a path",
+			host: "gw.example.com/x",
+			want: "",
+		},
+		{
+			name: "a host carrying userinfo",
+			host: "user@gw.example.com",
+			want: "",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := httptest.NewRequest(http.MethodPost, "/documentintelligence/x", nil)
 			r.Host = tc.host
+			if tc.tls {
+				r.TLS = &tls.ConnectionState{}
+			}
 			for k, v := range tc.headers {
 				r.Header.Set(k, v)
 			}
@@ -64,16 +102,6 @@ func TestBaseURLResolverPrecedence(t *testing.T) {
 				t.Errorf("Resolve() = %q, want %q", got, tc.want)
 			}
 		})
-	}
-}
-
-// TestResolveEmptyHostIsReported checks that a request with no usable authority yields "" rather
-// than a relative URL, which Python would join onto its own endpoint and double the path.
-func TestResolveEmptyHostIsReported(t *testing.T) {
-	r := httptest.NewRequest(http.MethodPost, "/x", nil)
-	r.Host = ""
-	if got := (BaseURLResolver{}).Resolve(r); got != "" {
-		t.Errorf("Resolve() = %q, want an empty string so the caller can fail loudly", got)
 	}
 }
 
@@ -129,94 +157,69 @@ func TestAcceptsGzip(t *testing.T) {
 	}
 }
 
-// TestRequestIDIsAlwaysEmitted covers the apim-request-id the Azure front door sets. No SDK
-// requires it, but emitting it makes gateway traffic log identically to container traffic.
-func TestRequestIDIsAlwaysEmitted(t *testing.T) {
-	h := RequestID(discardLogger())(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// TestRequestIDStaysInTheLogs: the containers are not known to send apim-request-id, a cloud
+// front-door header, so the gateway does not either. The id still reaches every log line of the
+// request, which is where an operator correlates it.
+func TestRequestIDStaysInTheLogs(t *testing.T) {
+	var logs bytes.Buffer
+	base := slog.New(slog.NewTextHandler(&logs, nil))
+	h := RequestID(base)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		logging.From(r.Context()).Info("handled")
 		w.WriteHeader(http.StatusOK)
 	}))
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set(HeaderClientRequestID, "client-id-1")
+	h.ServeHTTP(rec, req)
 
-	if v := rec.Header().Get(HeaderRequestID); len(v) != 36 {
-		t.Errorf("%s is %q, want a 36-character id", HeaderRequestID, v)
+	if v, ok := rec.Header()["Apim-Request-Id"]; ok {
+		t.Errorf("apim-request-id is %q; the containers do not send it", v)
+	}
+	if got := rec.Header().Get(HeaderClientRequestID); got != "client-id-1" {
+		t.Errorf("%s echoed as %q, want client-id-1", HeaderClientRequestID, got)
+	}
+	line := logs.String()
+	i := strings.Index(line, "requestId=")
+	if i < 0 {
+		t.Fatalf("the request logger carries no requestId: %s", line)
+	}
+	if id := strings.Fields(line[i+len("requestId="):])[0]; len(id) != 36 {
+		t.Errorf("requestId is %q, want a 36-character id", id)
 	}
 }
 
-// TestForwardedHostCannotBeHijacked is a regression test for a header-injection weakness.
-//
-// With forwarding trusted and no allowlist, a caller could set X-Forwarded-Host and the gateway
-// would mint an Operation-Location pointing there — so that caller's SDK would send the operation
-// id to a host of the attacker's choosing. Trust now defaults off, values must be a bare
-// authority, and an allowlist can pin them.
-func TestForwardedHostCannotBeHijacked(t *testing.T) {
-	req := func(headers map[string]string) *http.Request {
-		r := httptest.NewRequest(http.MethodPost, "/documentintelligence/x", nil)
-		r.Host = "gw.internal:8080"
-		for k, v := range headers {
-			r.Header.Set(k, v)
-		}
-		return r
-	}
-	attacker := map[string]string{
-		"X-Forwarded-Host":  "collector.attacker.net",
-		"X-Forwarded-Proto": "http",
-	}
+// TestServerHeaderMatchesTheContainers: the containers' web server is Kestrel, and it names itself
+// on every response. The gateway's own /_gw/ surface is not a container and does not pretend to be.
+func TestServerHeaderMatchesTheContainers(t *testing.T) {
+	for _, tc := range []struct {
+		path string
+		want string
+	}{
+		{"/vision/v3.2/read/analyze", "Kestrel"},
+		{"/documentintelligence/documentModels/prebuilt-layout:analyze", "Kestrel"},
+		{"/status", "Kestrel"},
+		{"/", "Kestrel"},
+		{"/_gw/health", ""},
+		{"/_gw/config", ""},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			var seen string
+			h := ServerHeader()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// Set before the handler runs, so an error path that writes early still carries it.
+				seen = w.Header().Get("Server")
+				w.WriteHeader(http.StatusNotFound)
+			}))
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
 
-	t.Run("untrusted by default", func(t *testing.T) {
-		got := BaseURLResolver{}.Resolve(req(attacker))
-		if strings.Contains(got, "attacker") {
-			t.Errorf("Resolve() = %q; forwarded headers must not be honoured by default", got)
-		}
-	})
-
-	t.Run("configured base always wins", func(t *testing.T) {
-		r := BaseURLResolver{Configured: "https://gw.example.com", TrustForwarded: true}
-		if got := r.Resolve(req(attacker)); got != "https://gw.example.com" {
-			t.Errorf("Resolve() = %q, want the configured base", got)
-		}
-	})
-
-	t.Run("allowlist rejects an unknown host", func(t *testing.T) {
-		r := BaseURLResolver{TrustForwarded: true, AllowedHosts: []string{"gw.example.com"}}
-		if got := r.Resolve(req(attacker)); strings.Contains(got, "attacker") {
-			t.Errorf("Resolve() = %q; the allowlist did not reject it", got)
-		}
-	})
-
-	t.Run("allowlist accepts a known host, any port", func(t *testing.T) {
-		r := BaseURLResolver{TrustForwarded: true, AllowedHosts: []string{"gw.example.com"}}
-		got := r.Resolve(req(map[string]string{
-			"X-Forwarded-Host": "gw.example.com:8443", "X-Forwarded-Proto": "https",
-		}))
-		if got != "https://gw.example.com:8443" {
-			t.Errorf("Resolve() = %q, want https://gw.example.com:8443", got)
-		}
-	})
-
-	t.Run("malformed authorities are rejected", func(t *testing.T) {
-		// A path or query here would shift every segment of Operation-Location, and
-		// Azure.AI.FormRecognizer 4.x counts segments backwards from the end.
-		for _, bad := range []string{
-			"gw.example.com/x?", "gw.example.com/path", "gw.example.com?q=1",
-			"gw.example.com#frag", "gw.example.com evil", "user@gw.example.com",
-			"gw.example.com:notaport", "", "gw.example.com:",
-		} {
-			r := BaseURLResolver{TrustForwarded: true}
-			got := r.Resolve(req(map[string]string{"X-Forwarded-Host": bad}))
-			if got != "http://gw.internal:8080" {
-				t.Errorf("X-Forwarded-Host %q yielded %q; it should have fallen back to Host", bad, got)
+			if seen != tc.want {
+				t.Errorf("the handler saw Server %q, want %q", seen, tc.want)
 			}
-		}
-	})
-
-	t.Run("only http and https schemes are honoured", func(t *testing.T) {
-		r := BaseURLResolver{TrustForwarded: true}
-		got := r.Resolve(req(map[string]string{"X-Forwarded-Proto": "javascript"}))
-		if !strings.HasPrefix(got, "http://") {
-			t.Errorf("Resolve() = %q, want the scheme to fall back to http", got)
-		}
-	})
+			if got := rec.Header().Get("Server"); got != tc.want {
+				t.Errorf("Server is %q, want %q", got, tc.want)
+			}
+		})
+	}
 }
 
 // TestValidAuthorityAcceptsIPv6Literals is a regression test.
@@ -241,45 +244,5 @@ func TestValidAuthorityAcceptsIPv6Literals(t *testing.T) {
 		if validAuthority(s) {
 			t.Errorf("validAuthority(%q) = true, want false", s)
 		}
-	}
-}
-
-// TestAllowlistConstrainsThePlainHostHeader is a regression test.
-//
-// TRUSTED_FORWARDED_HOSTS is the operator's statement of what this gateway may advertise, and it
-// was applied only to X-Forwarded-Host. A caller reaching the gateway directly and omitting that
-// header had its Host trusted verbatim, so the allowlist an operator set on the warning's advice
-// bought nothing: the attacker just stopped sending the header it guarded.
-func TestAllowlistConstrainsThePlainHostHeader(t *testing.T) {
-	r := BaseURLResolver{TrustForwarded: true, AllowedHosts: []string{"gw.example", "[::1]"}}
-
-	for _, tc := range []struct {
-		name, host, forwarded, want string
-	}{
-		{"allowed host", "gw.example", "", "http://gw.example"},
-		{"allowed host with a port", "gw.example:8080", "", "http://gw.example:8080"},
-		{"allowed IPv6 literal", "[::1]:8080", "", "http://[::1]:8080"},
-		{"attacker Host, no forwarded header", "evil.example", "", ""},
-		{"attacker Host under an allowed forwarded host", "evil.example", "gw.example", "http://gw.example"},
-		{"attacker forwarded host", "gw.example", "evil.example", "http://gw.example"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, "/x", nil)
-			req.Host = tc.host
-			if tc.forwarded != "" {
-				req.Header.Set("X-Forwarded-Host", tc.forwarded)
-			}
-			if got := r.Resolve(req); got != tc.want {
-				t.Errorf("Resolve = %q, want %q", got, tc.want)
-			}
-		})
-	}
-
-	// With no allowlist the previous behaviour is unchanged.
-	open := BaseURLResolver{TrustForwarded: true}
-	req := httptest.NewRequest(http.MethodPost, "/x", nil)
-	req.Host = "anything.example"
-	if got := open.Resolve(req); got != "http://anything.example" {
-		t.Errorf("with no allowlist Resolve = %q, want the request host", got)
 	}
 }

@@ -37,7 +37,7 @@ func (c *countingAnalyzer) Health(context.Context) upstream.Health { return upst
 func newTestManager(t *testing.T, a upstream.Analyzer, now time.Time) (*Manager, *store.Store) {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := store.Open(store.Options{DataDir: dir, AllowNetworkFS: true, ReadPoolSize: 4})
+	st, err := store.Open(store.Options{DataDir: dir, ReadPoolSize: 4})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestArtifactFetchIsBoundedAndYieldsToShutdown(t *testing.T) {
 
 	now := time.Now().UTC()
 	dir := t.TempDir()
-	st, err := store.Open(store.Options{DataDir: dir, AllowNetworkFS: true})
+	st, err := store.Open(store.Options{DataDir: dir})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

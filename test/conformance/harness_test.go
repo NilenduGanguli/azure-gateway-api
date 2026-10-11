@@ -59,20 +59,16 @@ func newHarness(t *testing.T, o harnessOpts) *harness {
 
 	dir := t.TempDir()
 	cfg := &config.Config{
-		Addr:                  "127.0.0.1:0",
-		DataDir:               dir,
-		AllowNetworkFS:        true,
-		TrustForwardedHeaders: false,
-		DISyncMode:            config.SyncAuto,
-		DIBlindPollBudget:     10,
-		QueueDepth:            0,
-		ResultTTL:             time.Hour,
-		GCInterval:            time.Hour,
-		DiskHighWatermark:     0.99,
-		MaxRequestBytes:       16 << 20,
-		PollRetryAfter:        1,
-		BusyRetryAfter:        5,
-		ShutdownGrace:         5 * time.Second,
+		Addr:              "127.0.0.1:0",
+		DataDir:           dir,
+		DISyncMode:        config.SyncAuto,
+		DIBlindPollBudget: 10,
+		QueueDepth:        0,
+		ResultTTL:         time.Hour,
+		GCInterval:        time.Hour,
+		DiskHighWatermark: 0.99,
+		MaxRequestBytes:   16 << 20,
+		ShutdownGrace:     5 * time.Second,
 		DI: config.Upstream{
 			BaseURL: diC.URL(), APIKey: "di-key", MaxInflight: 2, Timeout: 30 * time.Second,
 		},
@@ -85,7 +81,7 @@ func newHarness(t *testing.T, o harnessOpts) *harness {
 	}
 
 	st, err := store.Open(store.Options{
-		DataDir: cfg.DataDir, AllowNetworkFS: true, ReadPoolSize: 4,
+		DataDir: cfg.DataDir, ReadPoolSize: 4,
 	})
 	if err != nil {
 		t.Fatalf("open store: %v", err)

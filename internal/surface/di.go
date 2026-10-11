@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/NilenduGanguli/azure-gateway-api/internal/azerr"
+	"github.com/NilenduGanguli/azure-gateway-api/internal/config"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/ids"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/jobs"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/logging"
@@ -298,7 +299,7 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, surface aze
 
 	release, err := s.deps.Jobs.Admit(surfaceName)
 	if err != nil {
-		azerr.TooBusy(surface, s.deps.Config.BusyRetryAfter).WriteTo(w, surface)
+		azerr.TooBusy(surface, config.RetryAfterBusy).WriteTo(w, surface)
 		return
 	}
 	defer release()
@@ -307,7 +308,7 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, surface aze
 	// MaxInflight, so a synchronous call takes a container slot too.
 	releaseUpstream, err := s.deps.Jobs.AdmitUpstream(surfaceName)
 	if err != nil {
-		azerr.TooBusy(surface, s.deps.Config.BusyRetryAfter).WriteTo(w, surface)
+		azerr.TooBusy(surface, config.RetryAfterBusy).WriteTo(w, surface)
 		return
 	}
 	defer releaseUpstream()
@@ -430,9 +431,7 @@ func (s *Server) relaySync(w http.ResponseWriter, r *http.Request, surface azerr
 			// value, which the SDKs' integer-only parser rejects.
 			if !skipRelayHeader(k) && k != "Content-Length" &&
 				http.CanonicalHeaderKey(k) != "Retry-After" {
-				for _, v := range vs {
-					w.Header().Add(k, v)
-				}
+				relayHeader(w.Header(), k, vs)
 			}
 		}
 		w.Header().Set("Content-Length", "0")
@@ -447,7 +446,7 @@ func (s *Server) relaySync(w http.ResponseWriter, r *http.Request, surface azerr
 		// statuses where retrying is correct.
 		parsed.RetryAfter = 0
 		if retriableStatus(resp.StatusCode) {
-			parsed.RetryAfter = s.deps.Config.BusyRetryAfter
+			parsed.RetryAfter = config.RetryAfterBusy
 		}
 		parsed.WriteTo(w, surface)
 		return
@@ -485,7 +484,7 @@ func (s *Server) proxyGET(w http.ResponseWriter, r *http.Request, surface azerr.
 
 	release, err := s.deps.Jobs.AdmitMetadata(surfaceName)
 	if err != nil {
-		azerr.TooBusy(surface, s.deps.Config.BusyRetryAfter).WriteTo(w, surface)
+		azerr.TooBusy(surface, config.RetryAfterBusy).WriteTo(w, surface)
 		return
 	}
 	defer release()
@@ -524,12 +523,23 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) {
 		if skipRelayHeader(k) {
 			continue
 		}
-		for _, v := range vs {
-			dst.Add(k, v)
-		}
+		relayHeader(dst, k, vs)
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+// relayHeader gives the client the container's own values for one header, replacing any the
+// gateway set first.
+//
+// Middleware writes Server, Cache-Control and the x-ms-client-request-id echo before any handler
+// runs, and a real container sends Server and the echo too. Appending to them sent each header
+// twice, which no pod does, and the spec asks for these routes to be relayed verbatim.
+func relayHeader(dst http.Header, k string, vs []string) {
+	dst.Del(k)
+	for _, v := range vs {
+		dst.Add(k, v)
+	}
 }
 
 func skipRelayHeader(k string) bool {

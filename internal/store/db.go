@@ -100,19 +100,22 @@ const dbName = "gateway.db"
 
 // Options configures Open.
 type Options struct {
-	DataDir        string
-	AllowNetworkFS bool
+	DataDir string
 	// ReadPoolSize bounds concurrent readers. Polls are the hot path and are read-only.
 	ReadPoolSize int
 }
 
+// detectNetworkFS is networkFS, swappable so a test can present a network filesystem.
+var detectNetworkFS = networkFS
+
 // Open prepares the data directory, opens the database, migrates its schema to SchemaVersion, and
 // returns a Store. Store.Migration records what the migration did.
 //
-// It refuses to start on a network filesystem unless explicitly allowed: WAL depends on shared
-// memory and POSIX advisory locks that NFS, CIFS and friends do not provide reliably, and silent
-// corruption is a far worse outcome than a clear startup failure. For the same reason it refuses a
-// database whose schema is newer than this binary's, which an image rollback leaves behind.
+// It always refuses to start on a network filesystem: WAL depends on shared memory and POSIX
+// advisory locks that NFS, CIFS and friends do not provide reliably, and silent corruption is a
+// far worse outcome than a clear startup failure. There is no override. On a platform where
+// detection is unavailable, nothing is refused. For the same reason it refuses a database whose
+// schema is newer than this binary's, which an image rollback leaves behind.
 func Open(opts Options) (*Store, error) {
 	if opts.ReadPoolSize <= 0 {
 		opts.ReadPoolSize = 8
@@ -120,10 +123,10 @@ func Open(opts Options) (*Store, error) {
 	if err := os.MkdirAll(opts.DataDir, 0o750); err != nil {
 		return nil, fmt.Errorf("store: create data dir: %w", err)
 	}
-	if net, name := networkFS(opts.DataDir); net && !opts.AllowNetworkFS {
+	if net, name := detectNetworkFS(opts.DataDir); net {
 		return nil, fmt.Errorf(
 			"store: DATA_DIR %s is on a %s filesystem, where SQLite WAL mode is unsafe; "+
-				"use a block-backed volume (RWO ext4/xfs) or set ALLOW_NETWORK_FS=true to override",
+				"use a block-backed volume (RWO ext4/xfs)",
 			opts.DataDir, name)
 	}
 

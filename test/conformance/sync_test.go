@@ -3,6 +3,9 @@ package conformance
 import (
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -152,6 +155,9 @@ func TestSyncPassthroughNormalisesUpstreamErrors(t *testing.T) {
 
 // TestClientRequestIDIsEchoed checks the correlation header round-trips, which is the first thing
 // anyone debugging a stuck operation reaches for.
+//
+// apim-request-id is a cloud front-door header the containers are not known to send, so the
+// gateway does not send it either; its own request id stays in its logs.
 func TestClientRequestIDIsEchoed(t *testing.T) {
 	h := newHarness(t, harnessOpts{})
 	const cid = "11111111-2222-4333-8444-555555555555"
@@ -162,8 +168,123 @@ func TestClientRequestIDIsEchoed(t *testing.T) {
 	if got := resp.Header.Get("x-ms-client-request-id"); got != cid {
 		t.Errorf("x-ms-client-request-id echoed as %q, want %q", got, cid)
 	}
-	if resp.Header.Get("apim-request-id") == "" {
-		t.Error("apim-request-id is missing")
+	if v := resp.Header.Get("apim-request-id"); v != "" {
+		t.Errorf("apim-request-id is %q; the containers do not send it", v)
+	}
+}
+
+// TestServerHeaderMatchesTheContainers: the containers' web server, Kestrel, names itself on every
+// response, including an error and an unrouted path. A client must not be able to tell the gateway
+// from a pod by that header. The gateway's own /_gw/ surface does not pretend to be a container.
+func TestServerHeaderMatchesTheContainers(t *testing.T) {
+	h := newHarness(t, harnessOpts{})
+
+	for _, tc := range []struct {
+		name string
+		do   func() *http.Response
+		want string
+	}{
+		{"DI submit", func() *http.Response { return h.post(diAnalyze, "%PDF-1.7 fake") }, "Kestrel"},
+		{"Read submit", func() *http.Response { return h.post(readAnalyze, "fake-image") }, "Kestrel"},
+		{"DI unknown result", func() *http.Response {
+			return h.get("/documentintelligence/documentModels/prebuilt-layout/analyzeResults/" +
+				"00000000-0000-4000-8000-000000000000?api-version=" + apiVersion)
+		}, "Kestrel"},
+		{"unrouted path", func() *http.Response { return h.get("/no/such/route") }, "Kestrel"},
+		{"container status", func() *http.Response { return h.get("/status") }, "Kestrel"},
+		{"gateway health", func() *http.Response { return h.get("/_gw/health") }, ""},
+		{"gateway config", func() *http.Response { return h.get("/_gw/config") }, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := tc.do()
+			_ = resp.Body.Close()
+			if got := resp.Header.Get("Server"); got != tc.want {
+				t.Errorf("Server is %q, want %q (status %d)", got, tc.want, resp.StatusCode)
+			}
+		})
+	}
+}
+
+// TestRelayedResponsesCarryOneServerHeader is a regression test.
+//
+// The gateway names Kestrel before any handler runs, and the relay paths appended the container's
+// own headers to it. A real container sends Server: Kestrel too, and HAProxy passes it through, so
+// every relayed response carried the header twice, which no pod does. mockazure is built on
+// httptest and sends no Server header, so here it sits behind a proxy that adds one.
+func TestRelayedResponsesCarryOneServerHeader(t *testing.T) {
+	info := func(h *harness) *http.Response {
+		return h.get("/documentintelligence/info?api-version=" + apiVersion)
+	}
+	for _, tc := range []struct {
+		name       string
+		di         mockazure.Options
+		do         func(*harness) *http.Response
+		wantStatus int
+	}{
+		{"metadata relay", mockazure.Options{}, info, http.StatusOK},
+		{"model relay", mockazure.Options{}, func(h *harness) *http.Response {
+			return h.get("/documentintelligence/documentModels/prebuilt-layout?api-version=" +
+				apiVersion)
+		}, http.StatusOK},
+		{"syncAnalyze relay", mockazure.Options{}, func(h *harness) *http.Response {
+			return h.post(diSync, "%PDF-1.7 fake")
+		}, http.StatusOK},
+		{"bodyless upstream error", mockazure.Options{MetadataMissing: true}, info,
+			http.StatusNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, harnessOpts{di: tc.di, tweak: behindKestrel(t)})
+
+			resp := tc.do(h)
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+
+			if resp.StatusCode != tc.wantStatus {
+				t.Fatalf("status %d, want %d", resp.StatusCode, tc.wantStatus)
+			}
+			if got := resp.Header.Values("Server"); len(got) != 1 || got[0] != "Kestrel" {
+				t.Errorf("Server is %q, want exactly one Kestrel", got)
+			}
+		})
+	}
+}
+
+// behindKestrel puts the DI container behind a proxy that names Kestrel on every response, as the
+// real container does.
+func behindKestrel(t *testing.T) func(*config.Config) {
+	t.Helper()
+	return func(c *config.Config) {
+		target, err := url.Parse(c.DI.BaseURL)
+		if err != nil {
+			t.Fatalf("parse DI URL: %v", err)
+		}
+		proxy := httputil.NewSingleHostReverseProxy(target)
+		proxy.ModifyResponse = func(resp *http.Response) error {
+			resp.Header.Set("Server", "Kestrel")
+			return nil
+		}
+		front := httptest.NewServer(proxy)
+		t.Cleanup(front.Close)
+		c.DI.BaseURL = front.URL
+	}
+}
+
+// TestForwardedHeadersCannotMoveTheOperation: with PUBLIC_BASE_URL unset the gateway advertises
+// the request's own Host, as the container does. Forwarded headers are never honoured, because a
+// caller that could set X-Forwarded-Host would have its SDK send the operation id to a host of its
+// choosing.
+func TestForwardedHeadersCannotMoveTheOperation(t *testing.T) {
+	h := newHarness(t, harnessOpts{})
+
+	resp := h.post(diAnalyze, "%PDF-1.7 fake",
+		"X-Forwarded-Host", "collector.attacker.net", "X-Forwarded-Proto", "https")
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status %d, want 202", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Operation-Location"); !strings.HasPrefix(loc, h.gateway.URL+"/") {
+		t.Errorf("Operation-Location is %q, want it under the request's own host %s",
+			loc, h.gateway.URL)
 	}
 }
 
