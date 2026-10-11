@@ -190,7 +190,7 @@ func TestPrettyPrintedParts(t *testing.T) {
 
 // TestArraysAbsentFromSomeParts: the service may leave out an empty array altogether. A part
 // without it adds no items, pointers in later parts still count the items that do exist, and a
-// member first seen in a later part goes after part 0's members.
+// member first seen in a later part takes its place in that part's order, not the end.
 func TestArraysAbsentFromSomeParts(t *testing.T) {
 	runs := [][]int{{1, 2, 3}, {4, 5, 6}, {7, 8}}
 	var parts []merge.Part
@@ -229,8 +229,50 @@ func TestArraysAbsentFromSomeParts(t *testing.T) {
 		t.Errorf("counts %v", st.Counts)
 	}
 	if order := memberOrder(t, out.Bytes()); order != "apiVersion modelId stringIndexType content "+
-		"pages paragraphs tables sections contentFormat figures" {
+		"pages paragraphs tables figures sections contentFormat" {
 		t.Errorf("member order %q", order)
+	}
+	sameBytes(t, out.Bytes(), whole)
+}
+
+// TestMemberFirstSeenLaterKeepsItsPlace: each part's member order is a subsequence of the whole
+// document's, so the merged order must keep every part's order. A member a later part adds goes
+// right after the member before it in that part, and where an early part's addition and a later
+// part's order disagree, the later part's order wins.
+func TestMemberFirstSeenLaterKeepsItsPlace(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		runs [][]int
+		drop map[int]string // the empty array each part leaves out
+	}{
+		// Pages 1-3 have no figure; page 4 has one.
+		{"part 0 lacks figures", [][]int{{1, 2, 3}, {4, 5, 6}}, map[int]string{0: "figures"}},
+		// Page 3 has a table and no figure, page 4 a figure and no table, page 12 both. Part 1
+		// alone would put figures before tables; part 2 shows the order.
+		{"a later part settles the order", [][]int{{3}, {4}, {12}},
+			map[int]string{0: "figures", 1: "tables"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var parts []merge.Part
+			var all []int
+			for i, pages := range tc.runs {
+				b := docgen.DI(pages, docgen.Local, docgen.Options{})
+				if name, ok := tc.drop[i]; ok {
+					empty := []byte(`,"` + name + `":[]`)
+					if !bytes.Contains(b, empty) {
+						t.Fatalf("test bug: part %d has %s", i, name)
+					}
+					b = bytes.Replace(b, empty, nil, 1)
+				}
+				parts = append(parts, writePart(t, b, pages, false))
+				all = append(all, pages...)
+			}
+			var out bytes.Buffer
+			if _, err := merge.DI(&out, parts, textunit.TextElements); err != nil {
+				t.Fatal(err)
+			}
+			sameBytes(t, out.Bytes(), docgen.DI(all, docgen.Original, docgen.Options{}))
+		})
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand"
 	"strings"
@@ -32,8 +33,12 @@ func TestMembersRangesRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Members: %v", err)
 	}
-	want := []struct{ name, value string }{
-		{"a", `1`}, {"b", `[1,2]`}, {"c", `{"d":"e"}`}, {"s", `"\"q\""`}, {"n", `null`}, {"e", `{}`},
+	want := []struct {
+		name, value string
+		items       int
+	}{
+		{"a", `1`, -1}, {"b", `[1,2]`, 2}, {"c", `{"d":"e"}`, -1}, {"s", `"\"q\""`, -1}, {"n", `null`, -1},
+		{"e", `{}`, -1},
 	}
 	if len(ms) != len(want) {
 		t.Fatalf("got %d members %+v, want %d", len(ms), ms, len(want))
@@ -44,6 +49,9 @@ func TestMembersRangesRoundTrip(t *testing.T) {
 		}
 		if got := readRange(t, ra, ms[i].Start, ms[i].End); got != w.value {
 			t.Errorf("member %q range [%d,%d) = %q, want %q", w.name, ms[i].Start, ms[i].End, got, w.value)
+		}
+		if ms[i].Items != w.items {
+			t.Errorf("member %q has %d items, want %d", w.name, ms[i].Items, w.items)
 		}
 	}
 
@@ -83,6 +91,14 @@ func TestMembersAgreeWithEncodingJSON(t *testing.T) {
 			if dec.InputOffset() != ms[j].End {
 				t.Fatalf("member %q ends at %d, decoder says %d", tok, ms[j].End, dec.InputOffset())
 			}
+			items := -1
+			var arr []json.RawMessage
+			if raw[0] == '[' && json.Unmarshal(raw, &arr) == nil {
+				items = len(arr)
+			}
+			if ms[j].Items != items {
+				t.Fatalf("member %q of %s has %d items, want %d", tok, truncate(doc), ms[j].Items, items)
+			}
 		}
 	}
 }
@@ -107,6 +123,52 @@ func TestMembersRejects(t *testing.T) {
 	}
 	if _, err := Members(strings.NewReader(`{}`), 2, 1); err == nil {
 		t.Error("an inverted range was accepted")
+	}
+}
+
+// TestVisitMembers: the members chosen are walked with their visitor, paths starting at the
+// member's name, and nothing else is shown to it.
+func TestVisitMembers(t *testing.T) {
+	doc := `{"a":[{"n":1}, {"n":"x","m":[true]}],"b":{"n":3},"c":[5],"d":"` +
+		strings.Repeat("y", MaxVisitString) + `","e":[]}`
+	var seen []string
+	visit := func(path []PathElem, kind Kind, raw []byte) ([]byte, bool) {
+		seen = append(seen, pathString(path)+"="+string(raw))
+		return []byte(`"replaced"`), true // nothing is written, so this is ignored
+	}
+	var asked []string
+	ms, err := VisitMembers(strings.NewReader(doc), 0, int64(len(doc)), func(name string) Visitor {
+		asked = append(asked, name)
+		if name == "a" || name == "d" {
+			return visit
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(asked, " "); got != "a b c d e" {
+		t.Errorf("asked for %q, want every member once", got)
+	}
+	if got := strings.Join(seen, " "); got != `a,0,n=1 a,1,n="x" a,1,m,0=true d=` {
+		t.Errorf("visited %s", got)
+	}
+	var items []int
+	for _, m := range ms {
+		items = append(items, m.Items)
+	}
+	if fmt.Sprint(items) != "[2 -1 1 -1 0]" {
+		t.Errorf("items %v, want [2 -1 1 -1 0]", items)
+	}
+	if got := readRange(t, strings.NewReader(doc), ms[0].Start, ms[0].End); got != `[{"n":1}, {"n":"x","m":[true]}]` {
+		t.Errorf("range of a: %q", got)
+	}
+
+	// Errors inside a visited member are reported like any other.
+	bad := `{"a":[{"n":1},]}`
+	if _, err := VisitMembers(strings.NewReader(bad), 0, int64(len(bad)),
+		func(string) Visitor { return visit }); !errors.Is(err, ErrSyntax) {
+		t.Errorf("VisitMembers(%s) err = %v, want ErrSyntax", bad, err)
 	}
 }
 

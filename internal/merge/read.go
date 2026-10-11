@@ -47,7 +47,8 @@ func (v *readVisitor) visit(path []jsonx.PathElem, kind jsonx.Kind, raw []byte) 
 	n, ok := parseIndex(raw)
 	orig, mapped := v.p.mapPage(n)
 	if kind != jsonx.Number || !ok || !mapped {
-		v.err = checkf("part %d: readResults page %s is not one of the part's pages", v.p.k, raw)
+		v.err = checkf("part %d: readResults page %s is not one of the part's pages",
+			v.p.k, shown(kind, raw))
 		return nil, false
 	}
 	if orig == n {

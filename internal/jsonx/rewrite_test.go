@@ -211,6 +211,9 @@ func TestRewriteWritesReplacementsVerbatim(t *testing.T) {
 	}
 }
 
+// TestRewriteCopiesLongStringsUnvisited: a string longer than MaxVisitString is streamed through
+// intact, and the visitor only hears of it afterwards, as a LongString with no bytes, so that it
+// can refuse one where it needs to see the value. Its replacement is ignored.
 func TestRewriteCopiesLongStringsUnvisited(t *testing.T) {
 	long := strings.Repeat("x", 10<<10)
 	// Escapes near and across the limit must not confuse where the string ends.
@@ -218,17 +221,25 @@ func TestRewriteCopiesLongStringsUnvisited(t *testing.T) {
 	in := `{"a":"` + long + `","b":"short","c":"` + escaped + `","d":[1]}`
 	var visited []string
 	got := rewrite(t, in, nil, func(path []PathElem, kind Kind, raw []byte) ([]byte, bool) {
-		visited = append(visited, pathString(path))
-		if kind == String {
+		switch kind {
+		case LongString:
+			if raw != nil {
+				t.Errorf("%s: LongString with %d bytes", pathString(path), len(raw))
+			}
+			visited = append(visited, pathString(path)+"(long)")
+			return []byte(`"IGNORED"`), true
+		case String:
+			visited = append(visited, pathString(path))
 			return []byte(`"SHORT"`), true
 		}
+		visited = append(visited, pathString(path))
 		return nil, false
 	})
 	if want := strings.Replace(in, `"short"`, `"SHORT"`, 1); got != want {
 		t.Errorf("long strings were not copied intact")
 	}
-	if fmt.Sprint(visited) != "[b d,0]" {
-		t.Errorf("visited %v, want only b and d,0", visited)
+	if fmt.Sprint(visited) != "[a(long) b c(long) d,0]" {
+		t.Errorf("visited %v, want a and c as long strings, b and d,0 as themselves", visited)
 	}
 
 	// The limit is on the raw string, quotes included: exactly MaxVisitString bytes is visited.
@@ -237,8 +248,12 @@ func TestRewriteCopiesLongStringsUnvisited(t *testing.T) {
 		visited bool
 	}{{MaxVisitString - 1, true}, {MaxVisitString, true}, {MaxVisitString + 1, false}} {
 		s := `"` + strings.Repeat("y", tc.size-2) + `"`
-		var saw bool
-		if got := rewrite(t, s, nil, func(_ []PathElem, _ Kind, raw []byte) ([]byte, bool) {
+		var saw, long bool
+		if got := rewrite(t, s, nil, func(_ []PathElem, kind Kind, raw []byte) ([]byte, bool) {
+			if kind == LongString {
+				long = true
+				return nil, false
+			}
 			saw = true
 			if string(raw) != s {
 				t.Errorf("size %d: visitor got %d bytes", tc.size, len(raw))
@@ -247,8 +262,8 @@ func TestRewriteCopiesLongStringsUnvisited(t *testing.T) {
 		}); got != s {
 			t.Errorf("size %d: output changed", tc.size)
 		}
-		if saw != tc.visited {
-			t.Errorf("raw size %d: visited=%v, want %v", tc.size, saw, tc.visited)
+		if saw != tc.visited || long == tc.visited {
+			t.Errorf("raw size %d: visited=%v long=%v, want visited=%v", tc.size, saw, long, tc.visited)
 		}
 	}
 }
@@ -558,15 +573,27 @@ func TestRewriteMemoryIsBounded(t *testing.T) {
 	t.Logf("rewrote %d MB, allocated %d KB", len(doc)>>20, allocated>>10)
 }
 
-func BenchmarkRewrite(b *testing.B) {
-	doc := synthDocument(10 << 20)
+// BenchmarkRewrite100MB rewrites a 100 MB document, and fails if a rewrite allocates 64 MiB or
+// more. TestRewriteMemoryIsBounded holds every test run to a tighter bound on 10 MB.
+func BenchmarkRewrite100MB(b *testing.B) {
+	doc := synthDocument(100 << 20)
 	s := &shiftOffsets{buf: make([]byte, 0, 32)}
+	visit := s.visit
+	out := &countingWriter{}
 	b.SetBytes(int64(len(doc)))
 	b.ReportAllocs()
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := Rewrite(io.Discard, bytes.NewReader(doc), nil, s.visit); err != nil {
+		if err := Rewrite(out, bytes.NewReader(doc), nil, visit); err != nil {
 			b.Fatal(err)
 		}
+	}
+	b.StopTimer()
+	runtime.ReadMemStats(&after)
+	if perOp := (after.TotalAlloc - before.TotalAlloc) / uint64(b.N); perOp >= 64<<20 {
+		b.Fatalf("rewriting %d MB allocated %d MB", len(doc)>>20, perOp>>20)
 	}
 }

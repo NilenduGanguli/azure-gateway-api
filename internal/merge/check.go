@@ -58,9 +58,20 @@ func validPages(k int, pages []int) error {
 	return nil
 }
 
+// measurePart reads a part's shape in one walk: its members, the item count of each array and
+// the page numbers of its page array. Its content is then read again to be measured as text.
 func (m *merger) measurePart(p *part, f, f0 io.ReaderAt) error {
-	members, err := jsonx.Members(f, p.Start, p.End)
+	pages := &pageCollector{k: p.k, array: m.prof.pageArray, key: m.prof.pageKey}
+	members, err := jsonx.VisitMembers(f, p.Start, p.End, func(name string) jsonx.Visitor {
+		if name == m.prof.pageArray {
+			return pages.visit
+		}
+		return nil
+	})
 	if err != nil {
+		if pages.bad != nil {
+			return pages.bad
+		}
 		return jsonErr(p.k, "read the result", err)
 	}
 	p.members = members
@@ -72,17 +83,9 @@ func (m *merger) measurePart(p *part, f, f0 io.ReaderAt) error {
 				return checkf("part %d: member %q appears twice", p.k, mb.Name)
 			}
 		}
-		first := m.cmpA[:1]
-		if err := readAt(f, first, mb.Start); err != nil {
-			return fmt.Errorf("merge: part %d: read %s: %w", p.k, mb.Name, err)
-		}
-		p.isArray[i] = first[0] == '['
-		if p.isArray[i] && mb.Name != m.prof.pageArray {
-			n, err := jsonx.CountItems(f, mb.Start, mb.End)
-			if err != nil {
-				return jsonErr(p.k, "count "+mb.Name, err)
-			}
-			p.counts[mb.Name] = n
+		p.isArray[i] = mb.Items >= 0
+		if p.isArray[i] {
+			p.counts[mb.Name] = mb.Items
 		}
 	}
 
@@ -90,10 +93,14 @@ func (m *merger) measurePart(p *part, f, f0 io.ReaderAt) error {
 	if !ok || !p.isArray[i] {
 		return checkf("part %d has no %s array", p.k, m.prof.pageArray)
 	}
-	if p.pages, err = collectPages(p.k, f, pm, m.prof.pageArray, m.prof.pageKey); err != nil {
-		return err
+	if pages.bad != nil {
+		return pages.bad
 	}
-	p.counts[m.prof.pageArray] = len(p.pages)
+	if len(pages.pages) != pm.Items {
+		return checkf("part %d: %s[%d] has no %s",
+			p.k, m.prof.pageArray, len(pages.pages), m.prof.pageKey)
+	}
+	p.pages = pages.pages
 
 	if m.prof.di {
 		if err := m.measureContent(p, f); err != nil {
@@ -106,48 +113,32 @@ func (m *merger) measurePart(p *part, f, f0 io.ReaderAt) error {
 	return nil
 }
 
-// collectPages reads the page number of every item of a part's page array, in order.
-//
-// Every item must carry exactly one, so the page count is the item count; an item with no
-// scalars at all escapes this and is caught when the items are copied and counted.
-func collectPages(k int, f io.ReaderAt, mb jsonx.Member, array, key string) ([]int, error) {
-	var pages []int
-	items := 0
-	var bad error
-	visit := func(path []jsonx.PathElem, kind jsonx.Kind, raw []byte) ([]byte, bool) {
-		if len(path) < 2 || !path[1].IsIndex {
-			return nil, false
-		}
-		i := path[1].Index
-		items = max(items, i+1)
-		if len(path) != 3 || !isKey(path[2], key) || bad != nil {
-			return nil, false
-		}
-		v, ok := parseIndex(raw)
-		switch {
-		case kind != jsonx.Number || !ok || v < 1:
-			bad = checkf("part %d: %s[%d].%s is %s, not a page number", k, array, i, key, raw)
-		case i != len(pages):
-			bad = checkf("part %d: %s[%d] has a second %s, or %s[%d] has none",
-				k, array, i, key, array, len(pages))
-		default:
-			pages = append(pages, v)
-		}
+// pageCollector reads the page number of every item of a part's page array, in order, as the
+// array is walked. Every item must carry exactly one.
+type pageCollector struct {
+	k          int
+	array, key string
+	pages      []int
+	bad        error // the first check failure
+}
+
+func (c *pageCollector) visit(path []jsonx.PathElem, kind jsonx.Kind, raw []byte) ([]byte, bool) {
+	if c.bad != nil || len(path) != 3 || !path[1].IsIndex || !isKey(path[2], c.key) {
 		return nil, false
 	}
-	r := io.NewSectionReader(f, mb.Start, mb.End-mb.Start)
-	if err := jsonx.Rewrite(io.Discard, r, []jsonx.PathElem{{Key: array}}, visit); err != nil {
-		if bad == nil {
-			bad = jsonErr(k, array, err)
-		}
+	i := path[1].Index
+	v, ok := parseIndex(raw)
+	switch {
+	case kind != jsonx.Number || !ok || v < 1:
+		c.bad = checkf("part %d: %s[%d].%s is %s, not a page number",
+			c.k, c.array, i, c.key, shown(kind, raw))
+	case i != len(c.pages):
+		c.bad = checkf("part %d: %s[%d] has a second %s, or %s[%d] has none",
+			c.k, c.array, i, c.key, c.array, len(c.pages))
+	default:
+		c.pages = append(c.pages, v)
 	}
-	if bad != nil {
-		return nil, bad
-	}
-	if items != len(pages) {
-		return nil, checkf("part %d: %s[%d] has no %s", k, array, len(pages), key)
-	}
-	return pages, nil
+	return nil, false
 }
 
 // measureContent decodes a part's content to measure it in the unit. Parts are a few pages, so
@@ -238,20 +229,25 @@ func (m *merger) sameBytes(fa io.ReaderAt, a jsonx.Member, fb io.ReaderAt, b jso
 	return true, nil
 }
 
-// plan fixes the merged member order — part 0's, then names first seen in later parts — and
+// plan fixes the merged member order, one that keeps every part's own order (mergeOrder), and
 // checks that a member is an array in every part or in none.
 func (m *merger) plan() error {
-	for _, p := range m.parts {
+	lists := make([][]string, len(m.parts))
+	for k, p := range m.parts {
+		lists[k] = make([]string, len(p.members))
 		for i, mb := range p.members {
-			arr, seen := m.array[mb.Name]
-			if !seen {
-				m.order = append(m.order, mb.Name)
-				m.array[mb.Name] = p.isArray[i]
-			} else if arr != p.isArray[i] {
+			lists[k][i] = mb.Name
+			if arr, seen := m.array[mb.Name]; seen && arr != p.isArray[i] {
 				return checkf("member %q is an array in one part and not in another", mb.Name)
 			}
+			m.array[mb.Name] = p.isArray[i]
 		}
 	}
+	order, ok := mergeOrder(lists)
+	if !ok {
+		return checkf("the parts give their members in conflicting orders")
+	}
+	m.order = order
 	return nil
 }
 

@@ -13,9 +13,14 @@
 // scalars. Memory is a few buffers per pass whatever the size of the result; nothing but each
 // part's content, its root section and the member names is ever decoded.
 //
+// Members are written in an order that keeps every part's own: a part's order is the whole
+// document's with what the part lacks (an empty array, say) left out, so a member first seen in a
+// later part goes right after the member before it in that part, not at the end.
+//
 // Before writing anything the merge checks that the parts can be merged exactly: same API
-// version, model, unit and content format; non-array members identical; the pages returned
-// covering the planned pages once each, in order. References that can only be judged in place —
+// version, model, unit and content format; non-array members identical; member orders that do
+// not contradict each other; the pages returned covering the planned pages once each, in order;
+// sections in every part with content, or in none. References that can only be judged in place —
 // a pointer past its part's items, a region on a page outside its part, an offset that is not an
 // integer — are checked as they are copied. A failure wraps ErrCheck, and the caller discards the
 // output and analyses the whole document instead, so a split never produces a result the service
@@ -41,6 +46,11 @@ import (
 var ErrCheck = errors.New("merge: safety check failed")
 
 // Part is one part's analyzeResult on disk.
+//
+// The merge checks that each part's result returns exactly its Pages, in order, and that every
+// part starts after the one before ends. Gaps between parts are legal, since a pages= selection
+// can skip pages, so the merge cannot tell a part that is missing altogether: the caller must
+// pass parts whose Pages, concatenated, are exactly the pages it selected.
 type Part struct {
 	Path       string
 	Start, End int64 // byte range of the bare AnalyzeResult object
@@ -204,7 +214,7 @@ func (c *countWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// write streams the merged object: members in part 0's order, then any first seen later.
+// write streams the merged object, its members in the order plan fixed.
 func (m *merger) write(w io.Writer) error {
 	cw := &countWriter{w: w}
 	bw := bufio.NewWriterSize(cw, 64<<10)

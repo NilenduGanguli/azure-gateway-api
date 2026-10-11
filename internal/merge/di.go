@@ -166,6 +166,15 @@ func (v *diVisitor) fail(format string, args ...any) ([]byte, bool) {
 	return nil, false
 }
 
+// shown is a scalar as a check failure quotes it. A string too long to be visited has no bytes
+// to show.
+func shown(kind jsonx.Kind, raw []byte) string {
+	if kind == jsonx.LongString {
+		return fmt.Sprintf("<a string of more than %d bytes>", jsonx.MaxVisitString)
+	}
+	return string(raw)
+}
+
 // number writes x as the replacement, or keeps the original when it is unchanged.
 func (v *diVisitor) number(x, was int) ([]byte, bool) {
 	if x == was {
@@ -178,7 +187,7 @@ func (v *diVisitor) number(x, was int) ([]byte, bool) {
 func (v *diVisitor) offset(kind jsonx.Kind, raw []byte) ([]byte, bool) {
 	off, ok := parseIndex(raw)
 	if kind != jsonx.Number || !ok {
-		return v.fail("span offset %s is not a non-negative integer", raw)
+		return v.fail("span offset %s is not a non-negative integer", shown(kind, raw))
 	}
 	return v.number(off+v.p.char, off)
 }
@@ -186,7 +195,7 @@ func (v *diVisitor) offset(kind jsonx.Kind, raw []byte) ([]byte, bool) {
 func (v *diVisitor) page(kind jsonx.Kind, raw []byte) ([]byte, bool) {
 	n, ok := parseIndex(raw)
 	if kind != jsonx.Number || !ok {
-		return v.fail("pageNumber %s is not a page number", raw)
+		return v.fail("pageNumber %s is not a page number", shown(kind, raw))
 	}
 	orig, ok := v.p.mapPage(n)
 	if !ok {
@@ -198,7 +207,7 @@ func (v *diVisitor) page(kind jsonx.Kind, raw []byte) ([]byte, bool) {
 // pointer renumbers "/<member>/<index>".
 func (v *diVisitor) pointer(kind jsonx.Kind, raw []byte) ([]byte, bool) {
 	if kind != jsonx.String {
-		return v.fail("element pointer %s is not a string", raw)
+		return v.fail("element pointer %s is not a /member/index pointer", shown(kind, raw))
 	}
 	body := raw[1 : len(raw)-1]
 	slash := bytes.LastIndexByte(body, '/')
@@ -239,7 +248,7 @@ func (v *diVisitor) pointer(kind jsonx.Kind, raw []byte) ([]byte, bool) {
 // figureID maps the page in "<page>.<n>" and keeps <n> as it is.
 func (v *diVisitor) figureID(kind jsonx.Kind, raw []byte) ([]byte, bool) {
 	if kind != jsonx.String {
-		return v.fail("figure id %s is not a string", raw)
+		return v.fail(`figure id %s is not "<page>.<n>"`, shown(kind, raw))
 	}
 	body := raw[1 : len(raw)-1]
 	dot := bytes.IndexByte(body, '.')

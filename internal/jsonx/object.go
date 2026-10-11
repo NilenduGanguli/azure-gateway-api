@@ -9,15 +9,28 @@ import (
 type Member struct {
 	Name       string
 	Start, End int64
+	Items      int // the number of items if the value is an array, or -1
 }
 
 // Members lists the top-level members of the object occupying ra[start:end], in order.
 //
 // Name is the decoded member name. [Start, End) is the value's exact byte range in ra, without the
 // whitespace around it, ready for io.NewSectionReader. Every value is walked and validated but
-// nothing is retained, so a 500 MB member costs a scan. Whitespace may surround the object, but
-// anything else in the range is an error.
+// nothing is retained, so a 500 MB member costs a scan, and an array's items are counted on the
+// way. Whitespace may surround the object, but anything else in the range is an error.
 func Members(ra io.ReaderAt, start, end int64) ([]Member, error) {
+	return VisitMembers(ra, start, end, nil)
+}
+
+// VisitMembers is Members, showing the scalars of chosen members to a visitor during the same
+// walk, so that a caller can measure an object in one pass.
+//
+// visitFor is asked once per member, by name, as the walk reaches it; a nil visitFor or a nil
+// Visitor walks the member unvisited. A visitor sees paths that start with the member's name, as
+// if the object had been passed to Rewrite. Nothing is written, so its replacements are ignored.
+func VisitMembers(
+	ra io.ReaderAt, start, end int64, visitFor func(name string) Visitor,
+) ([]Member, error) {
 	if start < 0 || end < start {
 		return nil, fmt.Errorf("jsonx: invalid range [%d,%d)", start, end)
 	}
@@ -59,14 +72,28 @@ func Members(ra io.ReaderAt, start, end int64) ([]Member, error) {
 			return nil, w.syntax("expected ':' after a member name, found %q", c)
 		}
 		w.pos++
-		if _, err := w.skipSpace(); err != nil {
+		if c, err = w.skipSpace(); err != nil {
 			return nil, err
 		}
 		valueStart := w.offset()
-		if err := w.value(); err != nil {
+		w.visit = nil
+		if visitFor != nil {
+			w.visit = visitFor(name)
+		}
+		w.path = append(w.path[:0], PathElem{Key: name})
+		items := -1
+		if c == '[' {
+			items, err = w.array(0)
+		} else {
+			err = w.value()
+		}
+		w.visit = nil
+		w.path = w.path[:0]
+		if err != nil {
 			return nil, err
 		}
-		members = append(members, Member{Name: name, Start: valueStart, End: w.offset()})
+		members = append(members,
+			Member{Name: name, Start: valueStart, End: w.offset(), Items: items})
 
 		if c, err = w.skipSpace(); err != nil {
 			return nil, err

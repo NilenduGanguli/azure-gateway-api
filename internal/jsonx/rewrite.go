@@ -31,11 +31,17 @@ const (
 	Number
 	Bool
 	Null
+	// LongString is a string longer than MaxVisitString. It is reported after it has been
+	// copied, with raw nil, and the visitor's return is ignored.
+	LongString
 )
 
 // Visitor sees every scalar. It returns replacement raw JSON bytes and true to replace, or
 // false to copy the original bytes. Strings are passed raw, with quotes and escapes intact.
-// Strings longer than MaxVisitString are copied without a visit.
+//
+// Strings longer than MaxVisitString are copied without a visit: once such a string has gone
+// through, the visitor is told of it as a LongString with raw nil, and whatever it returns is
+// ignored. A visitor that must see every value at some path can refuse one there.
 //
 // path and raw are only valid during the call: both are reused for the next scalar, so the
 // visitor must neither keep nor modify them. The replacement is written before the next call,
@@ -44,7 +50,8 @@ const (
 type Visitor func(path []PathElem, kind Kind, raw []byte) ([]byte, bool)
 
 // MaxVisitString is the longest string, in raw bytes with its quotes, that is passed to a
-// Visitor. Longer strings are streamed through, so a 100 MB content string costs one buffer.
+// Visitor. Longer strings are streamed through, so a 100 MB content string costs one buffer, and
+// reported as a LongString.
 // Numbers longer than this are rejected as ErrSyntax: none is a real offset, and a visitor that
 // must see every offset cannot be handed a number it would not see.
 const MaxVisitString = 4096
@@ -454,8 +461,8 @@ func (w *walker) readName(decode bool) (string, error) {
 }
 
 // stringValue consumes a string value. With a visitor it is held back, visited and written,
-// unless it outgrows MaxVisitString, in which case it spills: what was held is written and the
-// rest is copied through.
+// unless it outgrows MaxVisitString, in which case it spills: what was held is written, the rest
+// is copied through, and the visitor is told of it as a LongString.
 func (w *walker) stringValue() error {
 	if w.visit == nil {
 		w.keep = keepNone
@@ -469,7 +476,8 @@ func (w *walker) stringValue() error {
 		return err
 	}
 	if w.spilled {
-		return nil
+		w.visit(w.path[:len(w.path):len(w.path)], LongString, nil)
+		return w.err
 	}
 	return w.visitScalar(String)
 }
@@ -639,9 +647,18 @@ func (w *walker) visitScalar(kind Kind) error {
 	return w.err
 }
 
-// items consumes an array, writing its items comma-separated without the brackets or the
-// whitespace around the items. Output is off on entry and between items.
+// items consumes an array that is the whole input, writing its items comma-separated without the
+// brackets or the whitespace around the items. Output is off on entry and between items.
 func (w *walker) items(base int) (int, error) {
+	n, err := w.array(base)
+	if err != nil {
+		return n, err
+	}
+	return n, w.finish()
+}
+
+// array consumes one array as items does, and stops after its closing bracket.
+func (w *walker) array(base int) (int, error) {
 	c, err := w.skipSpace()
 	if err != nil {
 		return 0, err
@@ -655,7 +672,7 @@ func (w *walker) items(base int) (int, error) {
 	}
 	if c == ']' {
 		w.pos++
-		return 0, w.finish()
+		return 0, nil
 	}
 	w.path = append(w.path, PathElem{Index: base, IsIndex: true})
 	n := 0
@@ -687,7 +704,7 @@ func (w *walker) items(base int) (int, error) {
 		w.path[len(w.path)-1].Index++
 	}
 	w.path = w.path[:len(w.path)-1]
-	return n, w.finish()
+	return n, nil
 }
 
 var comma = []byte{','}

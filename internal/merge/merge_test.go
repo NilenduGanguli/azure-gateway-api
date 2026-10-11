@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -49,6 +50,7 @@ func TestDIChecks(t *testing.T) {
 		name  string
 		parts func(t *testing.T) []merge.Part
 		unit  textunit.Unit
+		want  string // in the error, so that a case cannot pass by failing another check first
 	}{
 		{"mismatched stringIndexType", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
@@ -57,10 +59,10 @@ func TestDIChecks(t *testing.T) {
 				}
 				return b
 			})
-		}, textunit.TextElements},
+		}, textunit.TextElements, "part 1: stringIndexType differs"},
 		{"stringIndexType is not the requested unit", func(t *testing.T) []merge.Part {
 			return diParts(t, two, nil)
-		}, textunit.UnicodeCodePoint},
+		}, textunit.UnicodeCodePoint, "not the requested unicodeCodePoint"},
 		{"apiVersion differs", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
 				if i == 1 {
@@ -68,7 +70,7 @@ func TestDIChecks(t *testing.T) {
 				}
 				return b
 			})
-		}, 0},
+		}, 0, "part 1: apiVersion differs"},
 		{"contentFormat differs", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
 				if i == 1 {
@@ -76,22 +78,22 @@ func TestDIChecks(t *testing.T) {
 				}
 				return b
 			})
-		}, 0},
+		}, 0, "part 1: contentFormat differs"},
 		{"unknown contentFormat", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(_ int, b []byte) []byte {
 				return replace(t, b, `"contentFormat":"text"`, `"contentFormat":"html"`)
 			})
-		}, 0},
+		}, 0, "contentFormat \"html\" has no known page separator"},
 		{"missing page", func(t *testing.T) []merge.Part {
 			parts := diParts(t, [][]int{{1, 2}, {4, 5, 6}}, nil)
 			parts[0].Pages = []int{1, 2, 3}
 			return parts
-		}, 0},
+		}, 0, "part 0: the result has 2 pages, but 3 were planned"},
 		{"extra page", func(t *testing.T) []merge.Part {
 			parts := diParts(t, [][]int{{1, 2, 3}, {4, 5, 6}}, nil)
 			parts[0].Pages = []int{1, 2}
 			return parts
-		}, 0},
+		}, 0, "part 0: the result has 3 pages, but 2 were planned"},
 		{"page duplicated within a part", func(t *testing.T) []merge.Part {
 			// Original numbering: a Local result numbers by position and would hide the repeat.
 			return diParts(t, two, func(i int, b []byte) []byte {
@@ -100,13 +102,13 @@ func TestDIChecks(t *testing.T) {
 				}
 				return b
 			})
-		}, 0},
+		}, 0, "part 0: result page 3 (numbered 2) is not planned page 3"},
 		{"page duplicated across parts", func(t *testing.T) []merge.Part {
 			return diParts(t, [][]int{{1, 2, 3}, {3, 4, 5}}, nil)
-		}, 0},
+		}, 0, "part 1 starts at page 3, not after page 3"},
 		{"parts out of order", func(t *testing.T) []merge.Part {
 			return diParts(t, [][]int{{4, 5, 6}, {1, 2, 3}}, nil)
-		}, 0},
+		}, 0, "part 1 starts at page 1, not after page 6"},
 		{"pages returned out of order", func(t *testing.T) []merge.Part {
 			parts := diParts(t, two, func(i int, b []byte) []byte {
 				if i == 1 {
@@ -115,12 +117,12 @@ func TestDIChecks(t *testing.T) {
 				return b
 			})
 			return parts
-		}, 0},
+		}, 0, "result page 1 (numbered 5) is not planned page 4"},
 		{"planned pages not ascending", func(t *testing.T) []merge.Part {
 			parts := diParts(t, two, nil)
 			parts[1].Pages = []int{4, 6, 5}
 			return parts
-		}, 0},
+		}, 0, "planned pages [4 6 5] are not ascending"},
 		{"returned pages neither local nor original", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
 				if i == 1 {
@@ -128,12 +130,12 @@ func TestDIChecks(t *testing.T) {
 				}
 				return b
 			})
-		}, 0},
+		}, 0, "result page 1 (numbered 7) is not planned page 4"},
 		{"unknown object member differs", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
 				return replace(t, b, `"contentFormat":"text"}`, fmt.Sprintf(`"contentFormat":"text","x":{"a":%d}}`, i))
 			})
-		}, 0},
+		}, 0, "part 1: member \"x\" differs"},
 		{"unknown member only in a later part", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
 				if i == 1 {
@@ -141,7 +143,7 @@ func TestDIChecks(t *testing.T) {
 				}
 				return b
 			})
-		}, 0},
+		}, 0, "part 1: member \"x\" differs"},
 		{"array in one part, object in another", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
 				v := `[]`
@@ -150,7 +152,7 @@ func TestDIChecks(t *testing.T) {
 				}
 				return replace(t, b, `"contentFormat":"text"}`, `"contentFormat":"text","x":`+v+`}`)
 			})
-		}, 0},
+		}, 0, "part 1: member \"x\" differs"},
 		{"pointer past the part's paragraphs", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
 				if i == 1 {
@@ -158,7 +160,7 @@ func TestDIChecks(t *testing.T) {
 				}
 				return b
 			})
-		}, 0},
+		}, 0, "element pointer \"/paragraphs/99\" is past the part's 12 paragraphs"},
 		{"pointer the merge cannot renumber", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
 				if i == 1 {
@@ -166,7 +168,7 @@ func TestDIChecks(t *testing.T) {
 				}
 				return b
 			})
-		}, 0},
+		}, 0, "element pointer \"/pages/0/words/1\" is not one the merge can renumber"},
 		{"figure id without a page", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
 				if i == 1 {
@@ -174,7 +176,7 @@ func TestDIChecks(t *testing.T) {
 				}
 				return b
 			})
-		}, 0},
+		}, 0, "part 1: figure id \"fig-1\" is not \"<page>.<n>\""},
 		{"bounding region on a page outside the part", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
 				if i == 1 {
@@ -182,7 +184,7 @@ func TestDIChecks(t *testing.T) {
 				}
 				return b
 			})
-		}, 0},
+		}, 0, "part 1: pageNumber 4 is not one of the part's pages"},
 		{"span offset that is not an integer", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
 				if i == 1 {
@@ -190,7 +192,7 @@ func TestDIChecks(t *testing.T) {
 				}
 				return b
 			})
-		}, 0},
+		}, 0, "part 1: span offset 0.0 is not a non-negative integer"},
 		{"page without a pageNumber", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
 				if i == 1 {
@@ -198,7 +200,7 @@ func TestDIChecks(t *testing.T) {
 				}
 				return b
 			})
-		}, 0},
+		}, 0, "part 1: pages[1] has a second pageNumber, or pages[0] has none"},
 		{"malformed part", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
 				if i == 1 {
@@ -206,7 +208,7 @@ func TestDIChecks(t *testing.T) {
 				}
 				return b
 			})
-		}, 0},
+		}, 0, "part 1: read the result: jsonx: malformed JSON: unexpected end of input"},
 		{"part is not an object", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
 				if i == 1 {
@@ -214,7 +216,7 @@ func TestDIChecks(t *testing.T) {
 				}
 				return b
 			})
-		}, 0},
+		}, 0, "part 1: read the result: jsonx: top-level value is not an object"},
 		{"content that is not a string", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
 				if i == 1 {
@@ -222,7 +224,7 @@ func TestDIChecks(t *testing.T) {
 				}
 				return b
 			})
-		}, 0},
+		}, 0, "part 1: content is not a string"},
 		{"content ending in CR, which would join the separator", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
 				if i == 0 {
@@ -230,7 +232,7 @@ func TestDIChecks(t *testing.T) {
 				}
 				return b
 			})
-		}, textunit.TextElements},
+		}, textunit.TextElements, "part 0: content ends with CR"},
 		{"later part has sections, first has none", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
 				if i == 0 {
@@ -238,8 +240,75 @@ func TestDIChecks(t *testing.T) {
 				}
 				return b
 			})
-		}, 0},
-		{"no parts", func(t *testing.T) []merge.Part { return nil }, 0},
+		}, 0, "part 0 has no sections but part 1 does"},
+		// Strings longer than jsonx.MaxVisitString are not shown to the merge's visitor; where it
+		// must see a value, one is refused rather than copied unrenumbered.
+		{"element pointer too long to visit", func(t *testing.T) []merge.Part {
+			return diParts(t, two, func(i int, b []byte) []byte {
+				if i == 1 {
+					return replace(t, b, `"/paragraphs/0"`, `"/paragraphs/`+strings.Repeat("0", 5000)+`"`)
+				}
+				return b
+			})
+		}, 0, "part 1: element pointer <a string of more than 4096 bytes> is not a /member/index pointer"},
+		{"figure id too long to visit", func(t *testing.T) []merge.Part {
+			return diParts(t, two, func(i int, b []byte) []byte {
+				if i == 1 {
+					return replace(t, b, `"id":"1.1"`, `"id":"1.`+strings.Repeat("1", 5000)+`"`)
+				}
+				return b
+			})
+		}, 0, `part 1: figure id <a string of more than 4096 bytes> is not "<page>.<n>"`},
+		{"span offset that is a long string", func(t *testing.T) []merge.Part {
+			return diParts(t, two, func(i int, b []byte) []byte {
+				if i == 1 {
+					return replace(t, b, `"span":{"offset":0,`, `"span":{"offset":"`+strings.Repeat("0", 5000)+`",`)
+				}
+				return b
+			})
+		}, 0, "part 1: span offset <a string of more than 4096 bytes> is not a non-negative integer"},
+		{"member that appears twice", func(t *testing.T) []merge.Part {
+			return diParts(t, two, func(i int, b []byte) []byte {
+				if i == 1 {
+					return replace(t, b, `"contentFormat":"text"}`, `"contentFormat":"text","tables":[]}`)
+				}
+				return b
+			})
+		}, 0, `part 1: member "tables" appears twice`},
+		{"members in conflicting orders", func(t *testing.T) []merge.Part {
+			return diParts(t, two, func(i int, b []byte) []byte {
+				v := `"x":[],"y":[]`
+				if i == 1 {
+					v = `"y":[],"x":[]`
+				}
+				return replace(t, b, `"contentFormat":"text"}`, `"contentFormat":"text",`+v+`}`)
+			})
+		}, 0, "the parts give their members in conflicting orders"},
+		{"root sections with members in conflicting orders", func(t *testing.T) []merge.Part {
+			return diParts(t, two, func(i int, b []byte) []byte {
+				if i == 1 {
+					return rootSpansLast(t, b)
+				}
+				return b
+			})
+		}, 0, "the parts' root sections give their members in conflicting orders"},
+		{"a middle part with content has no sections", func(t *testing.T) []merge.Part {
+			return diParts(t, [][]int{{1, 2}, {3, 4}, {5, 6}}, func(i int, b []byte) []byte {
+				if i == 1 {
+					return withoutSections(t, b)
+				}
+				return b
+			})
+		}, 0, "part 1 has content but no sections, while part 0 has them"},
+		{"the last part has content but no sections", func(t *testing.T) []merge.Part {
+			return diParts(t, two, func(i int, b []byte) []byte {
+				if i == 1 {
+					return withoutSections(t, b)
+				}
+				return b
+			})
+		}, 0, "part 1 has content but no sections, while part 0 has them"},
+		{"no parts", func(t *testing.T) []merge.Part { return nil }, 0, "no parts"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -248,7 +317,9 @@ func TestDIChecks(t *testing.T) {
 			if !errors.Is(err, merge.ErrCheck) {
 				t.Fatalf("err = %v, want ErrCheck", err)
 			}
-			t.Log(err)
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err = %v, want it to say %q", err, tc.want)
+			}
 		})
 	}
 }
@@ -262,6 +333,16 @@ func withoutSections(t *testing.T, b []byte) []byte {
 		t.Fatal("test bug: no sections member")
 	}
 	return append(append([]byte(nil), b[:i]...), b[j:]...)
+}
+
+// rootSpansLast moves the root section's spans after its elements in a docgen result.
+func rootSpansLast(t *testing.T, b []byte) []byte {
+	t.Helper()
+	re := regexp.MustCompile(`"sections":\[\{("spans":\[[^\]]*\]),("elements":\[[^\]]*\])\}`)
+	if !re.Match(b) {
+		t.Fatal("test bug: no root section with spans then elements")
+	}
+	return re.ReplaceAll(b, []byte(`"sections":[{$2,$1}`))
 }
 
 func TestIOErrorsAreNotCheckFailures(t *testing.T) {
@@ -297,38 +378,54 @@ func TestReadChecks(t *testing.T) {
 		return parts
 	}
 	two := [][]int{{1, 2, 3}, {4, 5, 6}}
-	for name, parts := range map[string]func(t *testing.T) []merge.Part{
-		"version differs": func(t *testing.T) []merge.Part {
+	for _, tc := range []struct {
+		name  string
+		parts func(t *testing.T) []merge.Part
+		want  string
+	}{
+		{"version differs", func(t *testing.T) []merge.Part {
 			return read(t, two, func(i int, b []byte) []byte {
 				if i == 1 {
 					return replace(t, b, `"version":"3.2.0"`, `"version":"3.2.1"`)
 				}
 				return b
 			})
-		},
-		"modelVersion differs": func(t *testing.T) []merge.Part {
+		}, "part 1: version differs from part 0's"},
+		{"modelVersion differs", func(t *testing.T) []merge.Part {
 			return read(t, two, func(i int, b []byte) []byte {
 				if i == 1 {
 					return replace(t, b, `"2022-04-30"`, `"2021-04-12"`)
 				}
 				return b
 			})
-		},
-		"missing page": func(t *testing.T) []merge.Part {
+		}, "part 1: modelVersion differs from part 0's"},
+		{"missing page", func(t *testing.T) []merge.Part {
 			p := read(t, [][]int{{1, 2}, {4, 5, 6}}, nil)
 			p[0].Pages = []int{1, 2, 3}
 			return p
-		},
-		"duplicated page": func(t *testing.T) []merge.Part {
+		}, "part 0: the result has 2 pages, but 3 were planned"},
+		{"duplicated page", func(t *testing.T) []merge.Part {
 			return read(t, [][]int{{1, 2, 3}, {3, 4}}, nil)
-		},
-		"out of order": func(t *testing.T) []merge.Part {
+		}, "part 1 starts at page 3, not after page 3"},
+		{"out of order", func(t *testing.T) []merge.Part {
 			return read(t, [][]int{{4, 5, 6}, {1, 2, 3}}, nil)
-		},
+		}, "part 1 starts at page 1, not after page 6"},
+		{"page that is not a number", func(t *testing.T) []merge.Part {
+			return read(t, two, func(i int, b []byte) []byte {
+				if i == 1 {
+					return replace(t, b, `{"page":1,`, `{"page":"1",`)
+				}
+				return b
+			})
+		}, `part 1: readResults[0].page is "1", not a page number`},
 	} {
-		t.Run(name, func(t *testing.T) {
-			if _, err := merge.Read(io.Discard, parts(t)); !errors.Is(err, merge.ErrCheck) {
-				t.Errorf("err = %v, want ErrCheck", err)
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := merge.Read(io.Discard, tc.parts(t))
+			if !errors.Is(err, merge.ErrCheck) {
+				t.Fatalf("err = %v, want ErrCheck", err)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err = %v, want it to say %q", err, tc.want)
 			}
 		})
 	}
@@ -413,7 +510,7 @@ func TestMarkdownSeparator(t *testing.T) {
 
 // TestUnknownArraysAreConcatenatedAndShifted covers a member the merge has no rule for: it is an
 // array, so its items are concatenated in part order, and the structural rules still apply inside
-// them. A member that first appears in a later part goes after part 0's members.
+// them. A member that first appears in a later part keeps its place in that part's order.
 func TestUnknownArraysAreConcatenatedAndShifted(t *testing.T) {
 	runs := [][]int{{1, 2, 3}, {4, 5}, {6, 7, 8}}
 	parts := diParts(t, runs, func(i int, b []byte) []byte {
@@ -473,10 +570,10 @@ func TestUnknownArraysAreConcatenatedAndShifted(t *testing.T) {
 	if r.Content != w.Content {
 		t.Errorf("content differs from the whole document's")
 	}
-	// warnings first appears in part 0, after contentFormat; styles only in part 2, so it is
-	// appended after everything part 0 has.
+	// warnings first appears in part 0, after contentFormat; styles only in part 2, where it is
+	// the first member, so it goes first.
 	order := memberOrder(t, out.Bytes())
-	if want := "apiVersion modelId stringIndexType content pages paragraphs tables figures sections contentFormat warnings styles"; order != want {
+	if want := "styles apiVersion modelId stringIndexType content pages paragraphs tables figures sections contentFormat warnings"; order != want {
 		t.Errorf("member order %q, want %q", order, want)
 	}
 }
@@ -515,23 +612,29 @@ func TestEqualUnknownObjectMemberIsKept(t *testing.T) {
 	}
 }
 
-// TestPartWithoutSectionsContributesNothing: a part whose result has no sections adds no sections
-// and no root elements, and the others still renumber around it.
+// TestPartWithoutSectionsContributesNothing: a part with no content, a run of blank pages, has
+// nothing a section could hold. Its result has no sections, it adds no sections and no root
+// elements, and the others still renumber around it.
 func TestPartWithoutSectionsContributesNothing(t *testing.T) {
-	runs := [][]int{{1, 2}, {3, 4}, {5, 6}}
-	parts := diParts(t, runs, func(i int, b []byte) []byte {
-		if i == 1 {
-			return withoutSections(t, b)
-		}
-		return b
-	})
+	blank := []byte(`{"apiVersion":"2024-11-30","modelId":"prebuilt-layout","stringIndexType":"textElements",` +
+		`"content":"","pages":[{"pageNumber":1,"angle":0,"width":8.5,"height":11,"unit":"inch",` +
+		`"words":[],"lines":[],"spans":[{"offset":0,"length":0}]}],"contentFormat":"text"}`)
+	parts := []merge.Part{
+		writePart(t, docgen.DI([]int{1, 2}, docgen.Local, docgen.Options{}), []int{1, 2}, false),
+		writePart(t, blank, []int{3}, false),
+		writePart(t, docgen.DI([]int{4, 5}, docgen.Local, docgen.Options{}), []int{4, 5}, false),
+	}
 	var out bytes.Buffer
 	st, err := merge.DI(&out, parts, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var r struct {
-		Content    string
+		Content string
+		Pages   []struct {
+			PageNumber int
+			Spans      []struct{ Offset, Length int }
+		}
 		Paragraphs []struct{ Content string }
 		Sections   []struct {
 			Spans    []struct{ Offset, Length int }
@@ -540,6 +643,15 @@ func TestPartWithoutSectionsContributesNothing(t *testing.T) {
 	}
 	if err := json.Unmarshal(out.Bytes(), &r); err != nil {
 		t.Fatal(err)
+	}
+	// The blank page's empty content sits between two separators, and its span after the first.
+	blankAt := strings.Index(r.Content, "\n\nHeading P4")
+	if blankAt < 0 || !strings.HasSuffix(r.Content[:blankAt], "Line 2.2 plain") {
+		t.Fatalf("content %q has no blank page between pages 2 and 4", r.Content)
+	}
+	want := textunit.Len(r.Content[:blankAt+1], textunit.TextElements)
+	if p := r.Pages[2]; p.PageNumber != 3 || p.Spans[0].Offset != want || p.Spans[0].Length != 0 {
+		t.Errorf("blank page %+v, want page 3 at offset %d", p, want)
 	}
 	if len(r.Sections) != 5 || st.Counts["sections"] != 5 {
 		t.Fatalf("%d sections (stats %d), want a root and four pages'", len(r.Sections), st.Counts["sections"])
@@ -551,13 +663,39 @@ func TestPartWithoutSectionsContributesNothing(t *testing.T) {
 		sp[0].Length != textunit.Len(r.Content, textunit.TextElements) {
 		t.Errorf("root spans %+v", sp)
 	}
-	// Section 3 is page 5's: its first element must be page 5's heading.
+	// Section 3 is page 4's: its first element must be page 4's heading.
 	var idx int
 	if _, err := fmt.Sscanf(r.Sections[3].Elements[0], "/paragraphs/%d", &idx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Paragraphs[idx].Content != "Heading P5" {
-		t.Errorf("section 3 starts with %q, want page 5's heading", r.Paragraphs[idx].Content)
+	if r.Paragraphs[idx].Content != "Heading P4" {
+		t.Errorf("section 3 starts with %q, want page 4's heading", r.Paragraphs[idx].Content)
+	}
+}
+
+// TestRootMembersKeepEveryPartsOrder: the merged root section's members follow the same rule as
+// the result's: a member only a later part's root has keeps its place in that root's order.
+func TestRootMembersKeepEveryPartsOrder(t *testing.T) {
+	noSpans := regexp.MustCompile(`"sections":\[\{"spans":\[[^\]]*\],`)
+	parts := diParts(t, [][]int{{1, 2, 3}, {4, 5, 6}}, func(i int, b []byte) []byte {
+		if i == 0 {
+			if !noSpans.Match(b) {
+				t.Fatal("test bug: no root spans")
+			}
+			return noSpans.ReplaceAll(b, []byte(`"sections":[{`))
+		}
+		return b
+	})
+	var out bytes.Buffer
+	if _, err := merge.DI(&out, parts, 0); err != nil {
+		t.Fatal(err)
+	}
+	var r struct{ Sections []json.RawMessage }
+	if err := json.Unmarshal(out.Bytes(), &r); err != nil {
+		t.Fatal(err)
+	}
+	if order := memberOrder(t, r.Sections[0]); order != "spans elements" {
+		t.Errorf("root section members %q, want %q", order, "spans elements")
 	}
 }
 

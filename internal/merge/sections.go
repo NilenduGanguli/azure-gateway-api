@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -19,8 +20,10 @@ import (
 // the last root's end — and the parts' other sections follow it in part order, renumbered so that
 // part k's section i ≥ 1 becomes secBase[k] + i − 1.
 //
-// A part without sections contributes none. If part 0 has none while a later part does, the
-// whole document's root could not be told from the parts, so that is a check failure.
+// A part without sections contributes none, which is only right when it has no content either.
+// If part 0 has none while a later part does, the whole document's root could not be told from
+// the parts; if a later part has content but no sections while part 0 has them, its paragraphs
+// would be in no section and the root's span would not cover them. Both are check failures.
 
 // root is a part's root section: its members in order, with their raw values.
 type root struct {
@@ -43,17 +46,30 @@ func (r *root) get(key string) (json.RawMessage, bool) {
 // decoding it costs little, unlike the arrays around it.
 func readRoot(k int, f io.ReaderAt, mb jsonx.Member) (*root, error) {
 	dec := json.NewDecoder(io.NewSectionReader(f, mb.Start, mb.End-mb.Start))
-	if tok, err := dec.Token(); err != nil || tok != json.Delim('[') {
-		return nil, checkf("part %d: sections is not an array", k)
+	delim := func(want json.Delim, what string) error {
+		tok, err := dec.Token()
+		if err != nil {
+			return decodeErr(k, "sections", err)
+		}
+		if tok != want {
+			return checkf("part %d: %s", k, what)
+		}
+		return nil
 	}
-	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
-		return nil, checkf("part %d: the root section is not an object", k)
+	if err := delim('[', "sections is not an array"); err != nil {
+		return nil, err
+	}
+	if err := delim('{', "the root section is not an object"); err != nil {
+		return nil, err
 	}
 	r := &root{rest: -1}
 	for dec.More() {
 		tok, err := dec.Token()
+		if err != nil {
+			return nil, decodeErr(k, "root section", err)
+		}
 		key, ok := tok.(string)
-		if err != nil || !ok {
+		if !ok {
 			return nil, checkf("part %d: malformed root section", k)
 		}
 		if _, dup := r.get(key); dup {
@@ -61,39 +77,76 @@ func readRoot(k int, f io.ReaderAt, mb jsonx.Member) (*root, error) {
 		}
 		var v json.RawMessage
 		if err := dec.Decode(&v); err != nil {
-			return nil, checkf("part %d: root section member %q: %v", k, key, err)
+			return nil, decodeErr(k, fmt.Sprintf("root section member %q", key), err)
 		}
 		r.keys = append(r.keys, key)
 		r.values = append(r.values, v)
 	}
-	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
-		return nil, checkf("part %d: malformed root section", k)
+	if err := delim('}', "malformed root section"); err != nil {
+		return nil, err
 	}
-	// More skips the whitespace after the root, leaving the decoder's offset on the comma that
-	// introduces section 1, if there is one.
-	if dec.More() {
-		comma := []byte{0}
-		at := mb.Start + dec.InputOffset()
-		if err := readAt(f, comma, at); err != nil {
-			return nil, fmt.Errorf("merge: part %d: read sections: %w", k, err)
-		}
-		if comma[0] != ',' {
-			return nil, checkf("part %d: no comma after the root section", k)
-		}
+	// The decoder's offset is just past the root. What follows, after any whitespace, is the
+	// comma that introduces section 1 or the array's closing bracket. It is read directly rather
+	// than through the decoder, which cannot report a read failure while peeking ahead.
+	c, at, err := nextByte(k, f, mb.Start+dec.InputOffset(), mb.End)
+	if err != nil {
+		return nil, err
+	}
+	switch c {
+	case ',':
 		r.rest = at + 1
+	case ']':
+	default:
+		return nil, checkf("part %d: no comma after the root section", k)
 	}
 	return r, nil
 }
 
-// checkSections refuses parts whose roots cannot make the document's root: part 0 without
-// sections while a later part has them.
+// decodeErr classifies an error from encoding/json as jsonErr does one from jsonx: input that is
+// not well-formed JSON is a check failure, a failure to read it is not.
+func decodeErr(k int, what string, err error) error {
+	var syntax *json.SyntaxError
+	var typ *json.UnmarshalTypeError
+	if errors.As(err, &syntax) || errors.As(err, &typ) || errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) {
+		return fmt.Errorf("%w: part %d: %s: %w", ErrCheck, k, what, err)
+	}
+	return fmt.Errorf("merge: part %d: read %s: %w", k, what, err)
+}
+
+// nextByte returns the first byte in f[off:end] that is not JSON whitespace, and its offset.
+func nextByte(k int, f io.ReaderAt, off, end int64) (byte, int64, error) {
+	var buf [64]byte
+	for off < end {
+		b := buf[:min(int64(len(buf)), end-off)]
+		if err := readAt(f, b, off); err != nil {
+			return 0, 0, fmt.Errorf("merge: part %d: read sections: %w", k, err)
+		}
+		for i, c := range b {
+			if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
+				return c, off + int64(i), nil
+			}
+		}
+		off += int64(len(b))
+	}
+	return 0, 0, checkf("part %d: sections ends after the root section", k)
+}
+
+// checkSections refuses parts whose sections cannot make the document's: part 0 without sections
+// while a later part has them, or a later part with content but no sections while part 0 has
+// them. A part with no content has nothing a section could hold, and may have none.
 func (m *merger) checkSections() error {
-	if m.parts[0].counts["sections"] > 0 {
+	if m.parts[0].counts["sections"] == 0 {
+		for _, p := range m.parts[1:] {
+			if p.counts["sections"] > 0 {
+				return checkf("part 0 has no sections but part %d does", p.k)
+			}
+		}
 		return nil
 	}
 	for _, p := range m.parts[1:] {
-		if p.counts["sections"] > 0 {
-			return checkf("part 0 has no sections but part %d does", p.k)
+		if p.counts["sections"] == 0 && p.length > 0 {
+			return checkf("part %d has content but no sections, while part 0 has them", p.k)
 		}
 	}
 	return nil
@@ -162,17 +215,17 @@ func (m *merger) writeSections(bw *bufio.Writer) error {
 	return nil
 }
 
-// writeRoot writes the merged root: members in part 0's root order, then any first seen in a later
-// root; elements from every root in order; one span over all of them; anything else from the
-// first root that has it.
+// writeRoot writes the merged root: members in an order that keeps every root's own, as the
+// result's members are ordered (mergeOrder); elements from every root in order; one span over all
+// of them; anything else from the first root that has it.
 func (m *merger) writeRoot(bw *bufio.Writer, with []*part, roots []*root) error {
-	var keys []string
-	for _, r := range roots {
-		for _, k := range r.keys {
-			if !containsString(keys, k) {
-				keys = append(keys, k)
-			}
-		}
+	lists := make([][]string, len(roots))
+	for j, r := range roots {
+		lists[j] = r.keys
+	}
+	keys, ok := mergeOrder(lists)
+	if !ok {
+		return checkf("the parts' root sections give their members in conflicting orders")
 	}
 	bw.WriteByte('{')
 	for i, key := range keys {
@@ -279,13 +332,4 @@ func writeRootSpans(bw *bufio.Writer, with []*part, roots []*root) error {
 	bw.WriteString(strconv.FormatInt(end-start, 10))
 	bw.WriteString(`}]`)
 	return nil
-}
-
-func containsString(list []string, s string) bool {
-	for _, v := range list {
-		if v == s {
-			return true
-		}
-	}
-	return false
 }
