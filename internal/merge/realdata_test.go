@@ -457,3 +457,107 @@ func TestMergeRefusesWhatTheServiceCountsDifferently(t *testing.T) {
 		t.Fatalf("err = %v, want the unit self-check to refuse the part", err)
 	}
 }
+
+// unwrapLeadingSection gives a real result the other shape its leading untitled content could
+// take: the content of its untitled leaf section 1 straight in the root, before the sections that
+// follow, and section 1 gone (every later section renumbered one down). No real output has that
+// shape — java_layout and js_layout_selection_marks, the two that open with untitled content
+// before a heading, wrap it in section 1 — but it is the content a part continuing a section
+// opens with all the same, so the merge must treat both shapes alike.
+func unwrapLeadingSection(t *testing.T, b []byte) []byte {
+	t.Helper()
+	r, err := realcut.Parse(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secs := realcut.Items(r.Get("sections"))
+	if len(secs) < 2 {
+		t.Fatalf("test data: %d sections, want a root and a section 1", len(secs))
+	}
+	rootElems := realcut.Items(secs[0].Get("elements"))
+	if s, _ := rootElems[0].Str(); s != "/sections/1" || len(rootElems) < 2 {
+		t.Fatalf("test data: root elements start %q, want /sections/1 and more after it", s)
+	}
+	lead := realcut.Items(secs[1].Get("elements"))
+	for _, e := range lead {
+		if s, _ := e.Str(); strings.HasPrefix(s, "/sections/") {
+			t.Fatalf("test data: section 1 holds %s: not a leaf", s)
+		}
+	}
+	secs[0].Set("elements", realcut.ArrNode(append(append([]*realcut.Node{}, lead...), rootElems[1:]...)...))
+	kept := append([]*realcut.Node{secs[0]}, secs[2:]...)
+	for _, s := range kept {
+		for i, e := range realcut.Items(s.Get("elements")) {
+			str, _ := e.Str()
+			if n, ok := strings.CutPrefix(str, "/sections/"); ok {
+				var j int
+				if _, err := fmt.Sscan(n, &j); err != nil || j < 2 {
+					t.Fatalf("test data: pointer %s", str)
+				}
+				s.Get("elements").Vals[i] = realcut.StrNode(fmt.Sprintf("/sections/%d", j-1))
+			}
+		}
+	}
+	r.Set("sections", realcut.ArrNode(kept...))
+	return realcut.Encode(r)
+}
+
+// TestContinuationBeforeASectionInTheRoot: py_layout_figures ends inside its section 5.
+// java_layout and js_layout_selection_marks open with untitled content — a paragraph; a figure and
+// a paragraph — and then a section with a title. Following py_layout_figures, that content has no
+// heading of its own and continues section 5, whether the part wraps it in an untitled section 1
+// (as the service does) or holds it in its root before its first section: merged, the two shapes
+// give the same result byte for byte, the content in section 5 and nothing but sections in the
+// root after py_layout_figures's.
+func TestContinuationBeforeASectionInTheRoot(t *testing.T) {
+	for _, name := range []string{"java_layout", "js_layout_selection_marks"} {
+		t.Run(name, func(t *testing.T) {
+			parts, plan := realParts(t, []string{"py_layout_stylefont", "py_layout_figures", name})
+			wrapped, err := mergeCut(t, parts, plan, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parts[2] = unwrapLeadingSection(t, parts[2])
+			unwrapped, err := mergeCut(t, parts, plan, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(unwrapped, wrapped) {
+				want, err := realcut.Parse(wrapped)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if diffs := differences(t, want, unwrapped); diffs != nil {
+					t.Errorf("leading content in the root merges differently from the same content "+
+						"in section 1:\n  %s", strings.Join(diffs, "\n  "))
+				} else {
+					t.Errorf("merged results differ in their bytes")
+				}
+			}
+			// Both are the fold: py_layout_figures's section 5 gains the content, and the merged
+			// root holds nothing after its first section but sections.
+			got, err := realcut.Parse(unwrapped)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fig, err := realcut.Parse(parts[1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			secs := realcut.Items(got.Get("sections"))
+			own := len(realcut.Items(realcut.Items(fig.Get("sections"))[5].Get("elements")))
+			if n := len(realcut.Items(secs[5].Get("elements"))); n <= own {
+				t.Errorf("section 5 has %d elements, want more than py_layout_figures's %d", n, own)
+			}
+			seen := false
+			for _, e := range realcut.Items(secs[0].Get("elements")) {
+				s, _ := e.Str()
+				if section := strings.HasPrefix(s, "/sections/"); seen && !section {
+					t.Errorf("merged root holds %s after a section", s)
+				} else if section {
+					seen = true
+				}
+			}
+		})
+	}
+}

@@ -416,9 +416,9 @@ func (m *merger) writeRootElements(bw *bufio.Writer) error {
 		if !ok || p.rootMoved {
 			continue
 		}
-		if p.secDrop > 0 {
+		if p.rootDrop > 0 {
 			var err error
-			if v, err = withoutFirst(p.k, v); err != nil {
+			if _, v, err = splitArray(p.k, v, p.rootDrop); err != nil {
 				return err
 			}
 		}

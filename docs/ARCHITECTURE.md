@@ -619,8 +619,36 @@ other, so that no order keeps them all, are an `ErrCheck`.
 | `pages[].pageNumber`, and `pageNumber` in every `boundingRegions[]` element | mapped to the original page |
 | strings in any `elements` array matching `/(paragraphs\|tables\|figures\|sections\|keyValuePairs)/N` | index plus the earlier parts' element count for that member |
 | `figures[].id` (`"<page>.<n>"`) | the page mapped to the original; `<n>` kept |
-| `sections` | **one root**, as Azure produces: its `elements` are every part's root elements in order, shifted; its `spans` every root's own spans, shifted, a part's first span joined to the previous part's last **only where nothing but the page separator lies between them** (the earlier root ends where its part does and this one starts where its part does), so the root never covers the page furniture and blank pages the service leaves out of it; other members from the first root that has them. Non-root sections follow in part order, part *k*'s section *i* ≥ 1 becoming `1 + Σ_{j<k}(sections_j − 1 − drop_j) + (i − 1 − drop_k)`. **A section continues across a cut**: a part whose leading content has no heading (its root's first element an untitled leaf section 1, or a root-only part whose first element is not a `title` or `sectionHeading` paragraph) is folded into the deepest last section the earlier parts left open — its elements appended, its spans appended and joined across the separator — and section 1 is dropped (`drop_k = 1`) or the root contributes nothing. A part with no sections is allowed only when it has no content, whichever part it is |
+| `sections` | **one root**, as Azure produces: its `elements` are every part's root elements in order, shifted; its `spans` every root's own spans, shifted, a part's first span joined to the previous part's last **only where nothing but the page separator lies between them** (the earlier root ends where its part does and this one starts where its part does), so the root never covers the page furniture and blank pages the service leaves out of it; other members from the first root that has them. Non-root sections follow in part order, part *k*'s section *i* ≥ 1 becoming `1 + Σ_{j<k}(sections_j − 1 − drop_j) + (i − 1 − drop_k)`. **A section continues across a cut** (below): a part whose leading content has no heading is folded into the deepest last section the earlier parts left open, and leaves its own part — `drop_k = 1` when it was section 1. A part with no sections is allowed only when it has no content, whichever part it is |
 | other arrays (`paragraphs`, `tables`, `figures`, `styles`, `warnings`, unknown arrays) | concatenated in part order with the rules above applied structurally |
+
+**A section that continues across a cut.** A section runs from its heading to the next heading at
+its level or above, so a cut inside one leaves the next part opening with content that has no
+heading; the service, seeing that part alone, gives it a section of its own, where for the whole
+document it would have kept it in the section left open (`py_layout_multipage_table_span_pdf`: a
+heading on page 1 and a table running onto page 2 are one section with one span). The merge folds
+such leading content into the deepest last section of the earlier parts' tree — its elements
+appended, its spans appended and joined across the separator. A heading is a `title` or
+`sectionHeading` paragraph. The leading content is one of:
+
+- **an untitled section 1**: the root opens with section 1, whose first element is not a heading
+  and which holds elements only. Section 1 and the root's pointer to it are dropped
+  (`drop_k = 1`). This is the shape the service gives untitled content before a heading
+  (`java_layout`, `js_layout_selection_marks`);
+- **an untitled run in the root**: the root opens with elements that are neither sections nor
+  headings, and a section follows them. The run, up to the first section or heading paragraph,
+  leaves the root; its spans are the root's clipped to where the run's own elements start and end
+  (their spans, read from the part), as every real section's spans are its elements' extent — so a
+  run over a blank page keeps two spans. A heading paragraph ends the run and stays in the root
+  with what follows it, since the service keeps a title in the root itself (`py_layout_figures`).
+  No real output has this shape, but it is the same content as the first, and the two merge
+  identically;
+- **a root-only part**: the part has no section but its root, and the root's first element is not
+  a heading. Everything the root holds is folded, and the root contributes no elements.
+
+Anything else — leading content with a heading, no section left open because the earlier parts
+hold their content in the root directly, an open section without spans or elements to extend — is
+left as the parts give it. A root element pointer that names no item of its part is an `ErrCheck`.
 
 **Read rules.** `version` and `modelVersion` must agree and come from the first part;
 `readResults[]` are concatenated with `page` mapped to the original. Read results carry no spans or

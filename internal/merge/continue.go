@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -20,18 +21,28 @@ import (
 // a continuation, and it is folded into the section open at the end of the parts before it — the
 // deepest last section of their tree.
 //
-// A continuation comes in one of two shapes:
+// A continuation comes in one of three shapes:
 //
 //   - the part's root starts with section 1, a section of elements only (no sections inside it)
 //     whose first element is not a heading paragraph: section 1 is the continuation, and it
 //     disappears into the open section;
+//   - the part's root starts with elements that are neither sections nor heading paragraphs and
+//     goes on to a section: that run, up to the first section or heading, is the continuation,
+//     and it moves into the open section. Its spans are the root's, clipped to where the run's
+//     own elements start and end, as every real section's spans are its elements' extent;
 //   - the part has no section but its root, and the root's first element is not a heading
 //     paragraph: everything the root holds is the continuation, as a part with no heading at all
 //     is, and the root contributes no elements or spans of its own.
 //
 // py_layout_multipage_table_span_pdf is the evidence: its second section, a heading on page 1 and
 // a table that continues onto page 2, is one section with one span over both pages, while each
-// page analysed alone would end or start a section at the page break.
+// page analysed alone would end or start a section at the page break. The first two shapes are
+// one: the service wraps untitled content that opens a document before a heading in a section 1
+// of its own (java_layout, js_layout_selection_marks), and no real root holds an untitled element
+// before a section, nor any element after one; were a part to come back unwrapped, leaving the
+// run in the root would give the merged root content after a section, which no real root has.
+// A heading paragraph ends the run: the service keeps a title in the root itself
+// (py_layout_figures's root opens with its title), so it stays there with what follows it.
 //
 // A heading is a paragraph whose role is title or sectionHeading. Anything else — a part whose
 // leading content has a heading, a leading section with sections inside it, no section left open
@@ -199,7 +210,7 @@ func (m *merger) planContinuations() error {
 		if next != nil && next.i == 1 && p.secDrop == 1 {
 			continue // the part ends in its continuation, which went into the open section
 		}
-		if next != nil || len(rootElems) > p.secDrop {
+		if next != nil || len(rootElems) > p.rootDrop {
 			open = next
 		}
 	}
@@ -207,7 +218,8 @@ func (m *merger) planContinuations() error {
 }
 
 // leadingContinuation returns part p's continuation, or nil if its leading content is not one.
-// It marks the part accordingly: section 1 dropped, or its root's content moved.
+// It marks the part accordingly: section 1 dropped with the root's pointer to it, the root's
+// leading run dropped, or all of its root's content moved.
 func (m *merger) leadingContinuation(p *part, r *root, secs []json.RawMessage, rootElems []string) (*continuation, error) {
 	if len(secs) == 1 {
 		// No section but the root: the root's content continues the open section, unless it
@@ -221,7 +233,11 @@ func (m *merger) leadingContinuation(p *part, r *root, secs []json.RawMessage, r
 		p.rootMoved = true
 		return &continuation{p: p, elements: v, spans: r.spans}, nil
 	}
-	if i, ok := sectionIndex(rootElems[0]); !ok || i != 1 {
+	i, ok := sectionIndex(rootElems[0])
+	if !ok {
+		return m.leadingRun(p, r, rootElems)
+	}
+	if i != 1 {
 		return nil, nil
 	}
 	s1, err := readObject(p.k, secs[1], "section 1")
@@ -252,8 +268,109 @@ func (m *merger) leadingContinuation(p *part, r *root, secs []json.RawMessage, r
 	if err := m.spansWithin(p, spans, "section 1"); err != nil {
 		return nil, err
 	}
-	p.secDrop = 1
+	p.secDrop, p.rootDrop = 1, 1
 	return &continuation{p: p, elements: ev, spans: spans}, nil
+}
+
+// leadingRun returns the continuation a root opens with when its first element is neither a
+// section nor a heading, and a section follows: the elements before the first section or
+// heading. Nothing it can place — no section after the run, no span over it — is a continuation.
+func (m *merger) leadingRun(p *part, r *root, rootElems []string) (*continuation, error) {
+	isSection := func(e string) bool { _, ok := sectionIndex(e); return ok }
+	n := 0
+	for n < len(rootElems) && !isSection(rootElems[n]) && !p.isHeading(rootElems[n]) {
+		n++
+	}
+	if !slices.ContainsFunc(rootElems[n:], isSection) {
+		return nil, nil
+	}
+	lo, hi, err := m.extent(p, rootElems[:n])
+	if err != nil || lo < 0 {
+		return nil, err
+	}
+	var spans []span
+	for _, s := range r.spans {
+		if a, b := max(s.offset, lo), min(s.offset+s.length, hi); a < b {
+			spans = append(spans, span{a, b - a})
+		}
+	}
+	if len(spans) == 0 {
+		return nil, nil
+	}
+	v, _ := r.get("elements")
+	run, _, err := splitArray(p.k, v, n)
+	if err != nil {
+		return nil, err
+	}
+	p.rootDrop = n
+	return &continuation{p: p, elements: run, spans: spans}, nil
+}
+
+// extent is where the items that leaf pointers ptrs name start and end in part p's content, by
+// their own spans, or -1, -1 when they have none.
+func (m *merger) extent(p *part, ptrs []string) (lo, hi int, err error) {
+	want := map[string][]int{}
+	for _, ptr := range ptrs {
+		name, i, ok := leafPointer(ptr)
+		if !ok || i >= p.counts[name] {
+			return 0, 0, checkf("part %d: root element pointer %q names no item of the part", p.k, ptr)
+		}
+		want[name] = append(want[name], i)
+	}
+	lo, hi = -1, -1
+	for name, idx := range want {
+		mb, _, _ := p.member(name)
+		last := slices.Max(idx)
+		err := withFile(p, func(f *os.File) error {
+			dec := json.NewDecoder(io.NewSectionReader(f, mb.Start, mb.End-mb.Start))
+			if tok, err := dec.Token(); err != nil || tok != json.Delim('[') {
+				return checkf("part %d: %s is not an array", p.k, name)
+			}
+			for i := 0; i <= last; i++ {
+				var raw json.RawMessage
+				if err := dec.Decode(&raw); err != nil {
+					return decodeErr(p.k, name, err)
+				}
+				if !slices.Contains(idx, i) {
+					continue
+				}
+				o, err := readObject(p.k, raw, name+"["+strconv.Itoa(i)+"]")
+				if err != nil {
+					return err
+				}
+				sv, ok := o.get("spans")
+				if !ok {
+					continue
+				}
+				spans, err := readSpans(p.k, sv)
+				if err != nil {
+					return err
+				}
+				for _, s := range spans {
+					if lo < 0 || s.offset < lo {
+						lo = s.offset
+					}
+					hi = max(hi, s.offset+s.length)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+	return lo, hi, nil
+}
+
+// leafPointer parses "/paragraphs/N", "/tables/N", "/figures/N" or "/keyValuePairs/N".
+func leafPointer(ptr string) (string, int, bool) {
+	for _, name := range pointerMembers {
+		if n, ok := strings.CutPrefix(ptr, "/"+name+"/"); ok && name != "sections" {
+			i, ok := parseIndex([]byte(n))
+			return name, i, ok
+		}
+	}
+	return "", 0, false
 }
 
 // lastOpenSection follows part p's tree from its root through each last element that is a
@@ -401,21 +518,22 @@ func (m *merger) writeElements(bw *bufio.Writer, lists []continuation, prefix []
 	return nil
 }
 
-// withoutFirst is a JSON array without its first item.
-func withoutFirst(k int, raw json.RawMessage) (json.RawMessage, error) {
+// splitArray splits a JSON array into its first n items and the rest.
+func splitArray(k int, raw json.RawMessage, n int) (head, tail json.RawMessage, err error) {
 	var items []json.RawMessage
 	if err := json.Unmarshal(raw, &items); err != nil {
-		return nil, checkf("part %d: root section elements are not an array", k)
+		return nil, nil, checkf("part %d: root section elements are not an array", k)
 	}
-	if len(items) == 0 {
-		return raw, nil
-	}
-	out := []byte{'['}
-	for i, it := range items[1:] {
-		if i > 0 {
-			out = append(out, ',')
+	join := func(items []json.RawMessage) json.RawMessage {
+		out := []byte{'['}
+		for i, it := range items {
+			if i > 0 {
+				out = append(out, ',')
+			}
+			out = append(out, it...)
 		}
-		out = append(out, it...)
+		return append(out, ']')
 	}
-	return append(out, ']'), nil
+	n = min(n, len(items))
+	return join(items[:n]), join(items[n:]), nil
 }
