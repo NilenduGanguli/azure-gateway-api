@@ -49,6 +49,11 @@ gateway probe
 | a timeout | the route exists and hangs (or the pods are starved) | Give the pods their resources (§8) and re-probe with a longer `PROBE_TIMEOUT`. If it still hangs, this build cannot run behind the gateway. |
 | 404, 405, 501, or `500 UnhandledEndpointException` | the build does not serve the route | Use a build that does. The gateway would fail every job with *"The … container does not serve the synchronous analyze route."* |
 
+**Exit status:** `0` when every configured surface is ready, `1` when any is not (or none is
+configured), `2` for a usage error such as an unknown argument. `scripts/probe-containers.sh`
+exits `1` when a surface is not ready and `3` when nothing answered at all. Script the gate on the
+status, not on the text.
+
 It also reports, for each parameter the gateway rejects until proven (`features`, `queryFields`,
 `outputContentFormat=markdown`), whether the container's `:syncAnalyze` result equals its
 `:analyze` result with that parameter set: `honoured` or `ignored`. A parameter shown `honoured`
@@ -410,7 +415,7 @@ Parsing rules, before the tables:
 | `QUEUE_DEPTH` | `0` | Accepted jobs allowed to wait on the PVC, per surface, on top of `*_MAX_INFLIGHT`. `0` means a submit is refused with `429` the moment every worker is busy. Size for bursts, e.g. `200`. |
 | `SPLIT_PAGES` | `5` | The most pages one part may hold. A PDF with more pages to analyse is split into balanced parts of `ceil(SPLIT_PAGES/2)`–`SPLIT_PAGES` pages. `0` turns splitting off: every document goes whole. Must be ≥ 0. |
 | `MAX_REQUEST_BYTES` | `524288000` (500 MiB) | Ceiling on an **upload**. Exceeding it yields `400` with `InvalidRequest`/`InvalidContentLength` on DI, `InvalidImageSize` on Read — not `413`, which is unmodelled on both surfaces. |
-| `MAX_RESULT_BYTES` | `536870912` (512 MiB) | Ceiling on a **result**: each part's, each whole document's, and the merged one. Separate from the upload cap because they bound opposite directions. |
+| `MAX_RESULT_BYTES` | `536870912` (512 MiB) | Ceiling on a **result**: each part's, each whole document's, and the merged one. A merged result over it fails the job with the same error the document gets whole. Separate from the upload cap because they bound opposite directions. |
 
 ### Timeouts
 
@@ -467,7 +472,7 @@ value does not depend on the deployment.
 | Attempts per whole document | `5` | at most 2 of them in the once-only class (attempt timeout, 500, 504): a slow analysis is retried once, not five times |
 | Backoff between attempts | 50–100% of `min(60s, 2s × 2^(n−1))` | a parseable integer `Retry-After` from HAProxy or the pod replaces it, capped at 60s |
 | Part attempt timeout | `60s` | a 3–5 page part normally takes about 2 s; a hung pod costs a minute, not fifteen |
-| Attempts per part size | `3` | then the part is halved, down to single pages |
+| Attempts per part size | `3` | then the part is halved, down to single pages; a single page that still fails is re-checked against the original under the whole-document rules (`pages=<page>`, the whole timeout, 5 attempts), and only that answer can fail the job |
 | Hedge delay | `clamp(4 × median, 5s, 30s)` | the median of the surface's last 200 successful parts; `30s` until there are 20 samples. One hedge per part attempt, idle slots only |
 | Job deadline | `60m` | the containers' own maximum task time; covers all attempts, parts and backoffs |
 | Concurrent splits | `2` | shared by both surfaces; bounds parsing memory |
@@ -535,7 +540,7 @@ shape at the container's own status. See
 | `gateway_job_parts` | histogram | `surface` | Parts per split job. |
 | `gateway_merge_seconds` | histogram | `surface` | Merge duration. |
 | `gateway_parts_total` | counter | `surface`, `outcome` | `succeeded`, `retried`, `halved`, `hedged`, `hedge_won`, `rechecked`. |
-| `gateway_split_fallback_total` | counter | `surface`, `reason` | Documents that qualified for splitting but went whole: `unparseable`, `encrypted`, `budget`, `panic`, `pages_param`, `merge_check`. |
+| `gateway_split_fallback_total` | counter | `surface`, `reason` | Documents that qualified for splitting but went whole: `unparseable`, `encrypted`, `budget`, `panic`, `pages_param` (a `pages` the gateway cannot use, or given more than once under any spelling), `string_index_type` (a `stringIndexType` the merge cannot count in, or given more than once), `merge_check`. |
 
 Histogram buckets are 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120 and 300. There is still no request-latency
 histogram; per-request timing is in the access log's `durationMs`, per-job timing in `upstreamMs`.
@@ -933,10 +938,13 @@ All of these must pass on the real deployment, in this order, before production 
    comparisons; the same for Read — and writes one JSON file per case: the request (method, path
    template, query, `Content-Type`), the status, every response header except `Date`, and the
    body, with GUIDs masked as `<guid>` and timestamps as `<datetime:…>` keeping their format.
-   Commit the files under `test/conformance/testdata/golden/<surface>/<image-tag>/`; the parity
-   test replays every case against the gateway and compares status, header names and shapes, and
-   body keys, order and types. Only the operator's network reaches the containers, so the operator
-   records them.
+   The probed base URL is masked as `<base>`. It writes `<dir>/<surface>/<case>.json`, plus
+   `<dir>/<surface>-comparisons.json` holding the sync-equals-async verdict and the per-parameter
+   `honoured`/`ignored` verdicts — evidence for a person, not a case to replay. It exits non-zero
+   when any case got no answer. Commit each `<dir>/<surface>/` folder as
+   `test/conformance/testdata/golden/<surface>/<image-tag>/`; the parity test replays every case
+   against the gateway and compares status, header names and shapes, and body keys, order and
+   types. Only the operator's network reaches the containers, so the operator records them.
 3. **Split results match whole results.** `gateway probe --compare-split <folder>` on a
    representative corpus — **at least 30 PDFs** across your document types. For each PDF it
    analyses the document whole through the container's `:syncAnalyze`, then split, through the

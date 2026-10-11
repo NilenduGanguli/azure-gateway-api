@@ -450,15 +450,24 @@ flowchart TD
     C -->|"no (images, TIFF, Office, urlSource)"| W
     C -->|yes| D["Splitter.Open<br/>(waits for one of 2 slots,<br/>60s budget from then)"]
     D -->|"encrypted / unparseable /<br/>budget / panic"| F1["fallback reason counted"] --> W
-    D --> E{"client pages= parses and<br/>names only existing pages?"}
+    D --> E{"client pages= (any spelling, one value)<br/>parses and names only existing pages?"}
     E -->|no| F2["fallback pages_param"] --> W
     E -->|yes| G{"pages to analyse<br/>> SPLIT_PAGES?"}
     G -->|no| W
-    G -->|yes| S["split: Plan, WritePart each part,<br/>Close, run parts, merge"]
+    G -->|yes| H{"DI: stringIndexType (any spelling)<br/>absent, or one supported value?"}
+    H -->|no| F4["fallback string_index_type"] --> W
+    H -->|yes| S["split: Plan, WritePart each part,<br/>Close, run parts, merge"]
     S -->|"merge.ErrCheck"| F3["fallback merge_check"] --> W
+    S -->|"merged result over MAX_RESULT_BYTES"| X["job fails: too large,<br/>as it would whole"]
     S --> O["Output: work/id/merged.json"]
     W --> O2["Output: the whole result"]
 ```
+
+The containers bind query parameters as ASP.NET does, by name and ignoring case, so the engine
+reads `pages` and `stringIndexType` under any spelling (`Pages=`, `StringIndexType=`). A
+selection given more than once, under one spelling or several, is the `pages_param` fallback: which
+value the container would take is not the gateway's to guess. `stringIndexType` is checked before any
+part is cut, because the merge counts offsets in it.
 
 A document that goes whole is sent **exactly as the client sent it**, original body and query,
 `pages` included. So a client `pages=` naming pages that do not exist reaches Azure, which answers
@@ -510,7 +519,7 @@ and `gateway_upstream_exhausted_total` counts it.
 
 All parts of a job run concurrently; a part that fails the job cancels the rest through a shared
 context. Each part attempt is one `:syncAnalyze` with the part PDF as the body
-(`application/pdf`) and the client's forwarded parameters **minus `pages`**.
+(`application/pdf`) and the client's forwarded parameters **minus `pages`** under every spelling.
 
 | Situation | Rule |
 |---|---|
@@ -518,7 +527,7 @@ context. Each part attempt is one `:syncAnalyze` with the part PDF as the body
 | Hedge | an attempt still running after `clamp(4 × median, 5s, 30s)` gets **one** duplicate, if `TryAcquireIdle` succeeds. The median is of the surface's last 200 successful part durations; with fewer than 20 samples the delay is 30s. The first success wins and the other call is cancelled and its file deleted. A hedge belongs to its attempt: the attempt succeeds if either call does, and counts as one failure only if both fail |
 | Retriable outcome (rows 5–8) | up to **3 attempts** per part at its current size (`PartAttempts`), with the backoff of §4.2 |
 | Still failing after 3 | **halve** the part: the first half is `ceil(n/2)` pages, re-cut from the part's own PDF, and each half gets 3 fresh attempts: 5 → 3+2 → 2+1 / 1+1 → single pages |
-| A single page exhausts its attempts | the job fails with that attempt's error, as the whole document would have |
+| A single page exhausts its attempts | **re-check against the original**, as for a terminal outcome below. The part timeout is far shorter than the whole document's and also covers time queued in HAProxy while pods scale up, so a page that keeps timing out is not yet Azure failing the document. The job fails only if the re-check fails, with the re-check's error |
 | Terminal outcome (rows 3, 9, 10) | **re-check against the original**: send the *original* file with `pages=<this part's original pages>` under the whole-document rules (timeout, up to 5 attempts, at most 2 in the `RetryOnce` class), so a transient 503 during a re-check does not fail the job. If that succeeds, its result is used — a splitting artefact can never fail a good document. If it fails terminally too, the job fails with **that** error, Azure's own answer about the original |
 | Route not served (row 4) | the job fails at once: a deployment fault |
 | Cancelled (row 1) | every part attempt is cancelled; the job stays `running` for recovery |
@@ -613,8 +622,11 @@ cross-references, so the Read merge is exact by construction.
 
 **Output.** For a job, the merged `analyzeResult` goes into the gateway's normal envelope. For a
 client `:syncAnalyze`, it uses the shape the container's sync route returned for the parts — bare
-or wrapped (part 0's `Bare`). The result is checked against `MAX_RESULT_BYTES` and moved into the
-blob store with the existing atomic write.
+or wrapped (part 0's `Bare`). The merge writes through a writer capped at `MAX_RESULT_BYTES`
+(`Client.MaxResultBytes`) and stops at the ceiling; the job then fails with the same terminal
+"result is larger than this gateway accepts" error the document gets sent whole, not through the
+`merge_check` fallback. A merged result within the ceiling is moved into the blob store with the
+existing atomic write.
 
 **What the merge does not claim.** Everything Azure decides page by page is reproduced exactly.
 Document-wide judgements — which heading is `title`, section nesting that continues across a split
@@ -629,11 +641,13 @@ it shows (splitting design §6; OPERATIONS §10).
 `gateway_part_seconds`, `gateway_job_parts`, `gateway_merge_seconds`,
 `gateway_parts_total{outcome}` (`succeeded`, `retried`, `halved`, `hedged`, `hedge_won`,
 `rechecked`), `gateway_split_fallback_total{reason}` (`unparseable`, `encrypted`, `budget`,
-`panic`, `pages_param`, `merge_check`), `gateway_upstream_retries_total{reason}` and
+`panic`, `pages_param`, `string_index_type`, `merge_check`), `gateway_upstream_retries_total{reason}` and
 `gateway_upstream_exhausted_total`. Every engine log line carries `job`, `surface` and, for parts,
 `pages` (e.g. `12-15`) and `attempt`; each failed attempt logs one `Warn` line with `attempt`,
 `reason`, `status` and `backoffMs`; a job's final line adds `attempts`, `parts`, `halvings`,
-`hedges` and `fallback`.
+`hedges` and `fallback`. A failed run still returns an `Output` with those counts and no result, and
+`jobs` records them on the failed row (`upstream_attempts`, `upstream_parts`, `upstream_ms`, and
+`upstream_status` from the latest failed call), so a failure says how hard the gateway tried.
 
 ---
 

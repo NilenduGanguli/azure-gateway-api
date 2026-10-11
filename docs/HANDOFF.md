@@ -189,8 +189,8 @@ The gateway has **22 settings**. The README has the full table with purposes; th
 
 | Command | Purpose |
 |---|---|
-| `PROBE_DOCUMENT=<pdf> gateway probe` | The readiness verdict per configured surface: `:syncAnalyze` **200** = ready; timeout, 404, 405, 501 or `UnhandledEndpointException` = this build cannot run behind the gateway. Also reports each unproven parameter as `honoured` or `ignored`. `PROBE_TIMEOUT` (default `10m`) bounds each call |
-| `gateway probe --record <dir>` | Writes the golden responses for the parity test, to commit under `test/conformance/testdata/golden/<surface>/<image-tag>/` |
+| `PROBE_DOCUMENT=<pdf> gateway probe` | The readiness verdict per configured surface: `:syncAnalyze` **200** = ready; timeout, 404, 405, 501 or `UnhandledEndpointException` = this build cannot run behind the gateway. Also reports each unproven parameter as `honoured` or `ignored`. `PROBE_TIMEOUT` (default `10m`) bounds each call. Exits `0` only when every configured surface is ready, `1` otherwise, `2` on a usage error |
+| `gateway probe --record <dir>` | Writes the golden responses for the parity test (`<dir>/<surface>/<case>.json`, to commit as `test/conformance/testdata/golden/<surface>/<image-tag>/`) and `<dir>/<surface>-comparisons.json` (sync-equals-async and per-parameter verdicts) |
 | `gateway probe --compare-split <dir>` | Whole versus split for every PDF in `<dir>`; writes `compare-report.json`; exits non-zero on any page-level difference |
 
 **The work folder is on the PVC**, at `${DATA_DIR}/work/`: one folder per running job (`<id>/`:
@@ -683,6 +683,7 @@ the history had to be rewound. **Stage explicit paths when agents can write to t
 | Which document-level judgements differ between whole and split analyses? | Each one needs a merge rule or an explicit acceptance | `gateway probe --compare-split` on 30+ representative PDFs |
 | Does the .NET runtime in the container count graphemes like uniseg? | A disagreement makes the merge refuse (and analyse whole) for affected scripts | Watch `gateway_split_fallback_total{reason="merge_check"}` on Devanagari-heavy documents |
 | Do other environments' containers agree on error shapes and headers? | The gateway reproduces one deployment's behaviour | Golden recordings per environment and image tag |
+| Does a real container send `Cache-Control`? | The gateway's NoCache middleware adds `Cache-Control: no-store` to every answer; the parity test compares header names, so a container without it fails the first real recording on every gateway-answered case | The first `gateway probe --record` against the real containers, replayed by `parity_test.go` |
 
 ---
 

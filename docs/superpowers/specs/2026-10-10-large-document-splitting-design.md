@@ -180,7 +180,7 @@ the client's forwarded parameters (the sync-only parameter policy), minus `pages
 | **Hedge** | An attempt still running after `clamp(4 × median, 5s, 30s)` gets **one** duplicate, if `TryAcquireIdle` succeeds. The median is of the surface's last 200 successful part durations; with fewer than 20 samples the delay is 30s. The first success wins; the other is cancelled and its file deleted. A hedge belongs to its attempt: the attempt succeeds if either call succeeds, and counts as one failed attempt only if both fail. |
 | **Retriable outcome** (sync-only §1 rows 5–8: timeouts, 5xx, connection errors, 202) | Up to **3 attempts** per part at its current size, with the sync-only backoff. |
 | **Still failing after 3 attempts** | **Halve the part.** The first half is `ceil(n/2)` pages, cut again from the part's own PDF. Each half gets 3 fresh attempts, so the sequence is 5 → 3 + 2 → 2 + 1 / 1 + 1 → single pages. |
-| **A single page exhausts its attempts** | The job fails with that attempt's error, as the whole document would have. |
+| **A single page exhausts its attempts** | **Re-check it against the original**, exactly as for a terminal outcome: the original with `pages=<page>` under the whole-document rules. The job fails only if the re-check fails, with its error. *(Amended 2026-10-11: failing the job here contradicted the Goal, because the 60 s part timeout also covers time queued in HAProxy while pods scale up, so a page the whole document would have completed could fail it.)* |
 | **Terminal outcome** (rows 3, 9, 10: analysis `failed`, other 4xx, unusable 200) | **Re-check against the original.** Send the *original* file with `pages=<this part's original pages>`. If that succeeds, use its result; a splitting artefact can never fail a good document. If it fails terminally too, the job fails with **that** error, Azure's own answer about the original. |
 | **Route not served** (row 4) | The job fails immediately (a deployment fault). |
 | **Shutdown** (row 1) | Every part attempt is cancelled. The job stays `running`, and recovery re-runs it from the stored input. |
@@ -262,7 +262,8 @@ and region must fall inside its own part; anything else means the merge would be
 - The merged `analyzeResult` goes into the gateway's normal envelope for an `:analyze` job.
 - For a client `:syncAnalyze` it uses the same shape the container's sync route returned for the
   parts: bare result, or wrapper.
-- It is checked against `MAX_RESULT_BYTES` and moved into the blob store with the existing atomic
+- It is checked against `MAX_RESULT_BYTES` as it is written (a result over the ceiling fails the job
+  with the same terminal error the document gets whole) and moved into the blob store with the existing atomic
   write.
 
 ### 6. Measure, then fix

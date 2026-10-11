@@ -216,7 +216,7 @@ deserialiser. Break one and the failure is remote, opaque and blamed on the wron
 | `params_test.go` | Each rejected parameter (`output=pdf`, `output=figures`, `outputContentFormat=markdown`, `features=…`, `queryFields`) on `:analyze` and `:syncAnalyze` → 400 `InvalidArgument` naming it, **with no job row and no blob afterwards**; `outputContentFormat=text` and an empty `features` → accepted. |
 | `split_test.go` | Against the paged fake with `splitPages 5`: a 40-page PDF through `:analyze` equals the envelope around `docgen.DI(1..40)`; the same through `:syncAnalyze`; Read 40 pages; `pages=10-25`; a page that hangs on its first call (hedge or retry); bad content only when split (re-check, success); an unparseable PDF (whole); `splitPages 0` (one call); 50 submits against `Capacity(4)` with `MaxInflight 16` (all succeed); `/_gw/jobs` showing `upstreamParts`. |
 | `single_surface_test.go` | A DI-only gateway serves DI and answers every Read route with the bodyless 404; Read-only the reverse; `/_gw/health` lists one upstream; `/_gw/config` reports the disabled surface's inflight as 0. |
-| `parity_test.go` | Replays every golden case under `testdata/golden/<surface>/<tag>/` against a harness whose fakes serve the recorded bodies, comparing status, header names and shapes, and body keys, order and types, under the probe's masks. Skips with a message when no goldens exist for a real tag; `testdata/golden/fake/` holds one set generated from the paged fake, so the replay path itself is always exercised. |
+| `parity_test.go` | Replays every golden case under `testdata/golden/<surface>/<tag>/` (an operator's real recording) or `testdata/golden/<tag>/<surface>/` (as `--record` writes one) against a harness whose fakes serve the recorded bodies, comparing status, header names and shapes, and body keys, order and types, under the probe's masks (`<guid>`, `<datetime:…>`, `<base>`). Cases replay in the order `--record` made the analyze round trip, then by name; each sends the body its `request.document` names. `testdata/golden/fake/` holds the set recorded from the paged fake, so the record-and-replay path is always exercised; it carries a profile of what the paged fake does not model (`Cache-Control`, which the gateway adds; the `api-version` in `Operation-Location`; four validation cases), each with its reason. Real recordings are compared in full. |
 | `admin_test.go` | The metric families after a split job, with `# HELP`/`# TYPE` and monotonic histogram buckets; health and config shapes. |
 | `fidelity_test.go` | Wire-shape rules an SDK depends on — the examples below. |
 | `behaviour_test.go`, `sync_test.go` | Lifecycle, retries from the stored input, recovery, admission, TTL. The async-upstream, degraded-202 poll-out and artifact-capture cases were deleted with that code. |
@@ -426,9 +426,12 @@ against the fakes, so the code path is proven before anyone needs it:
 - **`gateway probe --record <dir>`** runs the fixed case list and writes
   `<dir>/<surface>/<case>.json`: the request (method, path template, query, `Content-Type`), the
   response status, every header except `Date`, and the body — parsed JSON where possible — with
-  GUIDs masked as `<guid>` and timestamps as `<datetime:<layout>>`. One set recorded from the paged
-  fake is committed under `test/conformance/testdata/golden/fake/`, and `parity_test.go` replays it,
-  so the replay is exercised before real goldens exist.
+  GUIDs masked as `<guid>`, timestamps as `<datetime:<layout>>` and the probed base URL as `<base>`,
+  plus `<dir>/<surface>-comparisons.json`. One set recorded from the paged fake is committed under
+  `test/conformance/testdata/golden/fake/`, and `parity_test.go` replays it, so the replay is
+  exercised before real goldens exist. `TestRecordMatchesTheCommittedGoldenSet` keeps that set
+  equal to what `--record` writes; after a deliberate change to the case list or the fake,
+  regenerate it with `PROBE_UPDATE_GOLDEN=1 go test ./internal/probe -run TestRecord`.
 - **`gateway probe --compare-split <dir>`** analyses each `*.pdf` whole (`Client.Do`, timeout
   `PROBE_TIMEOUT`) and split (a probe-local engine with a scheduler of 4 and a splitter of 2), then
   diffs them structurally into `path pattern → count, up to 3 examples`, with indices written
