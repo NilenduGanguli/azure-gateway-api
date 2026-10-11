@@ -1,7 +1,11 @@
 # Large-document splitting and merging — design
 
 **Date:** 2026-10-10
-**Status:** approved in conversation, spec awaiting review
+**Status:** implemented on branch `feat/sync-only-upstream` (plan
+`docs/superpowers/plans/2026-10-10-sync-only-and-splitting.md`). Sections 2, 3 and 5 below were
+revised to record what the implementation does where it is more precise than, or deliberately
+deviates from, the approved text; each revision says why. `docs/ARCHITECTURE.md` §4 is the
+operator-facing description.
 **Builds on:** [sync-only upstream design](2026-10-10-sync-only-upstream-design.md). Its upstream
 call, outcome classes, parameter policy, settings and migrations are assumed throughout.
 
@@ -102,6 +106,28 @@ own error.
   Any of these failures sends the document whole. The reason is counted (§8).
 - **Where the parts go.** Part files are written into the job's work folder on the PVC,
   `${DATA_DIR}/work/<jobId>/`, and the parsed context is released as soon as the parts exist.
+- **Implementation deviations** (all in `internal/pdfsplit`):
+  - **Stateless pdfcpu configuration.** Production parses with
+    `model.NewStatelessConfiguration()` (relaxed validation), not `NewDefaultConfiguration()`. The
+    default configuration creates `pdfcpu/config.yml` under the user's config directory on first
+    use and panics when it cannot; the gateway runs as non-root on a read-only root filesystem, so
+    every split would have fallen back to whole.
+  - **`ErrPanic`.** A recovered pdfcpu panic is `ErrPanic`, which wraps `ErrUnparseable`. Callers
+    check `ErrPanic` first so the fallback reason is counted as `panic`. Any error that is not one
+    of the sentinels (`ErrEncrypted`, `ErrUnparseable`, `ErrBudget`, `ErrPanic`) is an
+    infrastructure failure, such as a full disk, and fails the job as an internal error rather than
+    silently sending the document whole.
+  - **The budget starts when the slot is held.** The 60-second budget covers parsing and every cut
+    of one document, measured from when one of the 2 concurrency slots is acquired. It bounds the
+    work on the document, not the queue in front of it, which the caller's context already bounds.
+  - **Owner-only encryption goes whole.** A PDF with any encryption, including one that opens
+    without a password, is `ErrEncrypted`: this design splits only unencrypted documents, and sent
+    whole, its encryption is handled by Azure as it always was.
+  - **Named destinations are dropped from parts.** pdfcpu carries named destinations into a part by
+    patching and pruning the model's `/Dests` tree in place, which gave later parts destinations
+    pointing at pages they do not hold. Parts carry none; Azure's layout result does not use them.
+  - A `Document` must be closed before any `Recut` on the same `Splitter`, and `WritePart` / `Recut`
+    may leave partial output on error, so the engine always writes them to temp files.
 
 ### 3. The engine (`internal/engine`) and scheduling (`internal/sched`)
 
@@ -120,9 +146,21 @@ A whole document goes through the same scheduler as a single "part" with the lon
 - **One scheduler per surface**, holding `*_MAX_INFLIGHT` slots. Every call to Azure takes a
   slot: whole documents, parts and hedges alike. It replaces today's `AdmitUpstream` 100 ms
   busy-wait with a proper wait queue.
-- **Fair sharing.** Waiting calls are grouped by job, and a freed slot goes to the **next job in
-  round-robin order** that has a call waiting. A 2-page job never waits behind a 2,000-page one,
-  and a single large job alone gets every slot.
+- **Fair sharing: classic round-robin rotation.** Waiting calls are grouped by job. The ring holds
+  the jobs that have a call waiting, in turn order, and `ring[0]` is served next. A job that is
+  served and still has calls waiting goes to the **back** of the ring; a job whose first call starts
+  waiting also joins at the **back**. Within a job, calls are served first come, first served.
+  Every waiting job is therefore served once per round, however many calls it has queued and
+  however often other jobs come and go. *Why this exact rule:* a "next index after the last served
+  job" pointer, or inserting newcomers anywhere ahead of the back, lets jobs that keep leaving and
+  rejoining the ring be served again before a job with a standing backlog, which can starve it. A
+  2-page job never waits behind a 2,000-page one, and a single large job alone gets every slot,
+  because turns go only to jobs that are waiting.
+- **Hand-over inside one critical section.** A release picks the next waiter and grants it the slot
+  under the scheduler's mutex, so a slot is never free while a call waits for it: a newcomer or a
+  hedge cannot take a slot meant for a waiter, and a waiter that gives up finds itself either still
+  queued or already granted (and then releases what it got). `Acquire` returns a nil `release` when
+  it returns an error.
 - **Hedges use idle capacity only.** `TryAcquireIdle` succeeds only when a slot is free *and* no
   call is waiting.
 - **Workers.** Workers per surface stay at `*_MAX_INFLIGHT` (active jobs), and admission
@@ -172,8 +210,36 @@ instead (one call, long timeout) and counts the fallback (§8):
 - It runs in one pass to measure (content length, element counts, member order) and one pass to
   write.
 
-**Document Intelligence rules.** The `analyzeResult` members are written in the order of the first
-part's `analyzeResult`, with members seen only in later parts appended.
+**Document Intelligence rules.**
+
+**Member order** (revised). The `analyzeResult` members are written in an **order-preserving merge
+of all the parts' member orders**. A part's member order is a subsequence of the order the service
+writes for the whole document — a part leaves out what it does not have, an empty array for
+instance — so the merged order must keep every part's order as a subsequence. Where the parts
+leave the order open, the parts are taken in turn, and a name first seen in part *k* goes
+immediately after the name before it in part *k* (or first, if it is part *k*'s first). That order
+stands unless a later part orders two names the other way round; then the names are sorted with a
+**stable topological sort** by every part's order, taking the earliest name whenever there is a
+choice. Parts whose orders **contradict** each other, so that no order keeps them all, are an
+`ErrCheck` (the document goes whole). *Why:* the approved rule — part 0's order with later-only
+members appended — put a member that part 0 lacked after members that follow it in the whole
+document's order, so the merge of a document whose first part had, say, no tables did not reproduce
+the whole document's member order.
+
+**Strict root spans and the per-part unit self-check** (added). The merged root section's span is
+written by the merge, not copied, so every part's root `spans` are decoded strictly (an array of
+objects with canonical non-negative integer `offset` and `length`) and must lie within that part's
+content; a part with content must have a root span; and a part without sections is allowed only
+when it has no content (a later part with content but no sections, or a part 0 without sections
+while a later part has them, is an `ErrCheck`). A root that is one span from offset 0 is also the
+service's own measure of that part's content length, and it must equal the gateway's
+`textunit.Len` in the request's unit, else `ErrCheck`. *Why:* the service and the gateway may
+segment text with different Unicode versions (uniseg implements 15.0; a .NET runtime may implement
+15.1, whose rule GB9c joins Devanagari conjuncts into one grapheme cluster). Where they disagree,
+every offset shifted past that part would be wrong, so the merge refuses and the document is
+analysed whole rather than merged with offsets that are off. Likewise every offset, page number
+and pointer index the merge rewrites must be a canonical non-negative integer, and every pointer
+and region must fall inside its own part; anything else means the merge would be guessing.
 
 | What | Rule |
 |---|---|

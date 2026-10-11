@@ -22,12 +22,18 @@ Two Azure AI containers run inside an OpenShift cluster, outside Azure. Their sy
 fine, but their asynchronous ones break under autoscaling because the result store is
 container-local and the only supported fix — shared Azure Blob + Queue — does not exist outside
 Azure. This gateway is byte-compatible with both containers, owns the asynchronous lifecycle on a
-PVC, and calls the containers synchronously wherever they allow it, so clients change nothing and
-operation ids survive pod churn.
+PVC, and calls the containers only synchronously — retrying from the stored input, and splitting
+large PDFs across the autoscaled pods — so clients change nothing and operation ids survive pod
+churn.
 
 ---
 
 ## Current state
+
+> **The figures in this section predate branch `feat/sync-only-upstream`.** That branch adds the
+> sync-only upstream, splitting, migrations and about a dozen packages; its final gate (plan T17:
+> `go test -race ./...`, `make cover`, `scripts/e2e-local.sh`, `make image`) re-measures every row
+> and replaces this table. Until then, read the rows as the state of `main` at `0f9c794`.
 
 Verified, not remembered — re-run the commands if you doubt any of it.
 
@@ -93,16 +99,28 @@ submit ordering, `synchronous=FULL`, the lease and claim machinery, and the whol
 
 ## What is done
 
-- Both client surfaces, wire-compatible, including the legacy `/formrecognizer` family.
-- Synchronous passthrough that resolves a degraded 202 instead of relaying it.
-- Durable job store: SQLite (WAL, `synchronous=FULL`, single writer) plus atomic blob storage.
-- Crash recovery, TTL expiry, disk-pressure eviction, orphan reclamation.
-- Admission control with 429, separate upstream and metadata concurrency lanes.
-- Upstream decision tree with capability latching and affinity polling.
-- Byte-range result composition so a 500 MB result never lands on the heap.
-- Faithful container fakes, including their failure modes.
-- A standalone `sh` probe for interrogating real containers.
-- 32 defects found by adversarial review, all fixed with regression tests.
+- Both client surfaces, wire-compatible, including the legacy `/formrecognizer` family; either
+  surface can be served alone.
+- **Sync-only upstream**: every analysis is one `:syncAnalyze` attempt through HAProxy on a fresh
+  connection, classified into an outcome and retried from the stored input (5 attempts per whole
+  document, backoff with jitter, `Retry-After` honoured). No container operation id is ever stored,
+  followed or relayed; the async fallback, the capability latch and affinity polling are deleted.
+- **Large-document splitting**: PDFs over `SPLIT_PAGES` pages are cut into 3–5 page parts,
+  analysed in parallel under a fair round-robin scheduler, with per-part timeouts, hedges, halving
+  and re-checks against the original, then merged page-exactly in one streaming pass. Any doubt
+  sends the document whole.
+- The client `:syncAnalyze` route runs through the same engine, so sync clients get retries and
+  splitting too.
+- The parameter policy on DI analyze routes; `Server: Kestrel`; no `apim-request-id`; the container
+  GET relays (`operations`, `/`, `swagger`, `records/usage-logs`).
+- Durable job store: SQLite (WAL, `synchronous=FULL`, single writer) plus atomic blob storage,
+  with **versioned schema migrations** (backup, atomic apply, refusal of a newer schema).
+- Crash recovery, TTL expiry, disk-pressure eviction, orphan and work-folder reclamation.
+- Settings down from 32 to 22; removed settings warn instead of failing.
+- `gateway probe` with `PROBE_DOCUMENT`, `--record` and `--compare-split`; `cmd/fakeazure` and
+  `scripts/e2e-local.sh` for live runs on a laptop.
+- Faithful container fakes, including HAProxy's failure modes, and a paged fake for splitting.
+- 32 defects found by the original adversarial review, all fixed with regression tests.
 
 ---
 
@@ -110,30 +128,80 @@ submit ordering, `synchronous=FULL`, the lease and claim machinery, and the whol
 
 Ranked by how much it should worry you.
 
-**1. It has never run against real containers end to end.** Everything is proven against fakes. The
-fakes model observed behaviour, but a fake is still a fake. This is the single largest unknown.
+**1. It has never run against real containers end to end.** Everything is proven against fakes,
+including the merge. This is the single largest unknown.
 
-**2. `make sdk-test` has never been executed.** It drives a running gateway with the real Azure
-SDKs and is the only check that proves an unmodified client cannot tell the difference. It needs a
-running gateway plus a Python venv. **Treat this as the acceptance test.** Note its assertions were
-written before the error shapes changed — verify it still asserts the right shapes before trusting
-a pass. See [`TESTING.md`](TESTING.md).
+**2. No golden responses exist from the real containers.** `gateway probe --record` must be run by
+the operator, whose network reaches the containers, and the files committed; until then the parity
+test replays only a set generated from the paged fake (go-live gate 2).
 
-**3. Coverage is 67.7%, below the 80% bar.** `internal/admin` has no direct unit tests and is
-covered only incidentally through the conformance suite; `internal/probe` is at zero. `cmd/gateway`
-is outside the profile entirely (`-coverpkg=./internal/...`), so it is neither a contributor nor a
-shortfall.
+**3. `--compare-split` has not been run on a real corpus.** Page-level content is merged exactly by
+construction, but Azure's document-level judgements across a split point are unmeasured. The gate
+is at least 30 representative PDFs, zero page-level differences, and every document-level pattern
+either given a merge rule with a regression test or accepted by the user (go-live gate 3).
 
-**4. The error-shape decision rests on one probe run against one deployment.** If other
-environments run different image builds they may not agree. `ERROR_COMPAT=documented` is the
-escape hatch. Re-probe per environment.
+**4. The parameters `features`, `queryFields` and `outputContentFormat=markdown` are rejected** until
+a probe proves the DI sync route honours them. Wega's vision asks for `markdown` and
+`ocrHighResolution` on its third attempt; see [Known gaps](#known-gaps-for-wega).
 
-**5. `:analyzeBatch`, custom models and classifiers are unimplemented**, deliberately — batch is
-Azure-Blob-bound and unusable air-gapped. If a client needs them this is new work, not a bug.
+**5. The error-shape decision rests on one probe run against one deployment.** There is no longer
+an escape hatch (`ERROR_COMPAT` is removed); the golden recordings per image tag are the check.
 
-**6. No Kubernetes manifests ship in the repo**, by request. [`OPERATIONS.md`](OPERATIONS.md)
-contains a working set to copy. Wega's manifests for this gateway live in the orchestrator
-repository; see [Wega: build and deploy facts](#wega-build-and-deploy-facts).
+**6. `:analyzeBatch`, custom models and classifiers are unimplemented**, deliberately — batch is
+Azure-Blob-bound and unusable air-gapped.
+
+**7. No Kubernetes manifests ship in the repo**, by request. [`OPERATIONS.md`](OPERATIONS.md)
+contains a working set to copy.
+
+---
+
+## Settings, probe and work folder
+
+The gateway has **22 settings**. The README has the full table with purposes; the defaults are in
+`internal/config/config.go`.
+
+| Setting | Default | | Setting | Default |
+|---|---|---|---|---|
+| `DI_UPSTREAM_URL` | — (optional) | | `PUBLIC_BASE_URL` | — (recommended) |
+| `READ_UPSTREAM_URL` | — (optional) | | `RESULT_TTL` | `24h` |
+| `DI_UPSTREAM_API_KEY` | — | | `GC_INTERVAL` | `5m` |
+| `READ_UPSTREAM_API_KEY` | — | | `DISK_HIGH_WATERMARK` | `0.90` |
+| `DI_MAX_INFLIGHT` | `4` (size 16) | | `MAX_REQUEST_BYTES` | 500 MiB |
+| `READ_MAX_INFLIGHT` | `4` (size 16) | | `MAX_RESULT_BYTES` | 512 MiB |
+| `DI_UPSTREAM_TIMEOUT` | `15m` per attempt | | `UPLOAD_TIMEOUT` | `10m` |
+| `READ_SYNC_TIMEOUT` | `10m` per attempt | | `SHUTDOWN_GRACE` | `30s` |
+| `SPLIT_PAGES` | `5` (`0` = off) | | `DATA_DIR` | `/data` |
+| `QUEUE_DEPTH` | `0` (size for bursts) | | `GATEWAY_ADDR` | `:8080` |
+| `LOG_LEVEL` | `info` | | `LOG_FORMAT` | `json` |
+
+- At least one upstream URL must be set; an empty one disables that surface, whose own settings are
+  then neither validated nor warned about.
+- A number or duration that does not parse is fatal, never silently defaulted.
+- **Removed settings warn, they do not fail.** `DI_SYNC_ANALYZE`, `DI_SYNC_PROBE_TIMEOUT`,
+  `DI_BLIND_POLL_BUDGET`, `READ_BLIND_POLL_BUDGET`, `ARTIFACT_FETCH_TIMEOUT`, `ERROR_COMPAT`,
+  `TRUST_FORWARDED_HEADERS`, `TRUSTED_FORWARDED_HOSTS`, `ALLOW_NETWORK_FS`, `POLL_RETRY_AFTER` and
+  `BUSY_RETRY_AFTER` are recognised, ignored, and named in a `<NAME> is no longer used` warning in
+  the startup log and `/_gw/health` `warnings[]`. Wega's current `gateway.env` sets two of them
+  (`DI_SYNC_ANALYZE`, `ERROR_COMPAT`) and keeps starting.
+
+**Probe usage.** Run it wherever the Azure Routes are reachable — `oc exec deploy/azure-gateway-api
+-- /usr/local/bin/gateway probe` uses the pod's own settings:
+
+| Command | Purpose |
+|---|---|
+| `PROBE_DOCUMENT=<pdf> gateway probe` | The readiness verdict per configured surface: `:syncAnalyze` **200** = ready; timeout, 404, 405, 501 or `UnhandledEndpointException` = this build cannot run behind the gateway. Also reports each unproven parameter as `honoured` or `ignored`. `PROBE_TIMEOUT` (default `10m`) bounds each call |
+| `gateway probe --record <dir>` | Writes the golden responses for the parity test, to commit under `test/conformance/testdata/golden/<surface>/<image-tag>/` |
+| `gateway probe --compare-split <dir>` | Whole versus split for every PDF in `<dir>`; writes `compare-report.json`; exits non-zero on any page-level difference |
+
+**The work folder is on the PVC**, at `${DATA_DIR}/work/`: one folder per running job (`<id>/`:
+part PDFs, part results, the merged result) and per client `:syncAnalyze` in flight (`sync-<id>/`).
+It lives next to `blobs/` so nothing is copied across filesystems and nothing is written outside
+`DATA_DIR` (the root filesystem stays read-only). Folders are deleted when their job ends; the
+sweeper removes any a crash left behind once they are an hour old. Size the PVC for it: a running
+split job holds roughly twice its input plus its result there, briefly.
+
+**The schema backup is on the PVC too**: `${DATA_DIR}/gateway.db.v<N>.bak`, written before each
+migration. See [Rollback](#rollback).
 
 ---
 
@@ -148,6 +216,12 @@ checked on their `main` branches: `document-vision-service` `5f93223` and
 handoff for every Wega repository is `docs/deploy/SYSTEM-HANDOFF.md` in
 `document-embedding-orchestrator`, with the machine-readable `docs/deploy/system.yaml` beside it.
 This section covers only what is true of the gateway.
+
+> **This release changes several facts below** — settings, the calls made to the upstreams,
+> health fields, the schema and the rollback. The rows marked for this release were updated on
+> 2026-10-11 against branch `feat/sync-only-upstream`; the orchestrator, vision and DES facts were
+> not re-checked then. The Wega side of the change is listed under
+> [Known gaps](#known-gaps-for-wega).
 
 **Update rule: update this file in the same change as anything that alters build or deploy
 facts.** Some facts here are also relied on by the orchestrator's `ocr-cell` component or by the
@@ -171,27 +245,30 @@ two upstreams are mocks.
 | Labels | The Deployment, its pods, the Service, the PVC and the ServiceAccount carry `app.kubernetes.io/name: azure-gateway-api` and `app.kubernetes.io/part-of: wega`. The Service, the PodMonitor and both gateway NetworkPolicies select the name label. So do the mocks' ingress policy, the orchestrator's `wega-control-egress` and vision's egress policy. The pods carry no `wega.io/deployment` label, so the namespace's `wega-scrape` policy does not cover them; the gateway's own ingress policy admits the scrape instead. |
 | Fleet entry | `gw-01`, with `base_url` `http://azure-gateway-api.wega-<env>.svc.cluster.local:8080`, and `max_inflight: 4` and `queue_depth: 2` on both `di` and `read`. The file is the orchestrator's `deploy/openshift/overlays/<env>/gateway-fleet.json`, published as ConfigMap `wega-gateway-fleet`. Vision's overlays carry the same file byte for byte: all four environments match from `document-vision-service` `4e9d40e`, and `WEGA_ORCHESTRATOR_REPO=<orchestrator checkout> make test-parity` in vision checks it. A fleet change therefore lands in both repositories. |
 | Upstreams in dev and perf | The DES Azure mocks, from the orchestrator component `infra-mocks` (`azure-mocks.yaml`). Layout is Deployment and ClusterIP Service `azure-di-mock`; Read is `azure-read-mock`. Each Service listens on port `5000`, named `http`, which is also the container port. The images are `wega-azure-di-mock` and `wega-azure-read-mock`, built from `document-enrichment-services` (`mock_azure_di/`, `mock_azure_ocr/`). Each mock runs `replicas: 1` with `Recreate`. Its startup and readiness probes are `GET /status`, and its liveness probe is `GET /health`. The pods are labelled `app.kubernetes.io/name: azure-di-mock` or `azure-read-mock`, plus `wega.io/mock: "true"`. Their ingress policy, `wega-azure-mocks-ingress`, admits only pods labelled `app.kubernetes.io/name: azure-gateway-api`, on TCP 5000. |
-| Real upstreams | The Azure Document Intelligence Layout and Read containers. Probe them before the first deploy (`make probe`; see [OPERATIONS §1](OPERATIONS.md#1-before-you-deploy-probe-the-containers)), and set `DI_SYNC_ANALYZE` from the verdict. |
-| Staging and prod | No `ocr-cell`. The orchestrator's committed staging and prod fleets list several cells, `gw-NN` at `http://azure-gateway-api-NN.gateway-<env>.svc.cluster.local:8080`. These are real gateways against real Azure, deployed outside the Wega overlays: open input `I-GATEWAY-CELLS` in the system handoff. Vision's staging and prod egress reaches them; see the network items [below](#probes-network-and-security-context-in-ocr-cell). `ocr-cell` is the template for one cell, with three changes. The Secret below must exist. The ingress policy admits callers from the cell's own namespace only, so it must admit `wega.io/deployment` `vision` and `orch-control` from namespace `wega-<env>`. The egress policy admits only the two mocks, so it must name the real upstreams instead, and must allow DNS unless a policy in `gateway-<env>` already does, as `wega-allow-dns` does in `wega-<env>`. Each of these fleet entries gives `di` 8/4 and `read` 4/2; see [Known gaps](#known-gaps-for-wega-as-of-2026-10-04). |
+| Real upstreams | The Azure Document Intelligence Layout and Read deployments, autoscaled to at most 8 pods each, reached through their HAProxy Routes with the annotations of [OPERATIONS §3](OPERATIONS.md#3-the-haproxy-route-in-front-of-the-azure-pods). Probe them before the first deploy (`gateway probe` with `PROBE_DOCUMENT`; see [OPERATIONS §1](OPERATIONS.md#1-before-you-deploy-probe-the-containers)): `:syncAnalyze` must answer 200, because there is no fallback. |
+| Staging and prod | No `ocr-cell`. The orchestrator's committed staging and prod fleets list several cells, `gw-NN` at `http://azure-gateway-api-NN.gateway-<env>.svc.cluster.local:8080`. These are real gateways against real Azure, deployed outside the Wega overlays: open input `I-GATEWAY-CELLS` in the system handoff. Vision's staging and prod egress reaches them; see the network items [below](#probes-network-and-security-context-in-ocr-cell). `ocr-cell` is the template for one cell, with three changes. The Secret below must exist. The ingress policy admits callers from the cell's own namespace only, so it must admit `wega.io/deployment` `vision` and `orch-control` from namespace `wega-<env>`. The egress policy admits only the two mocks, so it must name the real upstreams instead, and must allow DNS unless a policy in `gateway-<env>` already does, as `wega-allow-dns` does in `wega-<env>`. Each of these fleet entries gives `di` 8/4 and `read` 4/2; see [Known gaps](#known-gaps-for-wega). |
 | Callers | `wega-vision`, whose pods are labelled `wega.io/deployment: vision`, submits and polls on both surfaces, and reads `/_gw/health`, `/_gw/jobs/{id}` and `/_gw/version`. The orchestrator observer runs in `wega-orch-control`, labelled `wega.io/deployment: orch-control`, and reads `/_gw/health` and `/_gw/config`. User-workload monitoring scrapes `/_gw/metrics` through PodMonitor `azure-gateway-api` every 30 s. The ingress policy admits nobody else. |
 
 ### Configuration Wega sets
 
 The values live in ConfigMap `azure-gateway-api`. `ocr-cell` generates it from `gateway.env`, and
 the container reads it with `envFrom`. Each overlay's `patch-gateway.yaml` adds
-`PUBLIC_BASE_URL`. This table gives the value Wega sets in dev and perf, and the rule each value
-must satisfy. The full catalogue is in [OPERATIONS §4](OPERATIONS.md#4-configuration-recipes).
+`PUBLIC_BASE_URL`. This table gives the value Wega sets in dev and perf (orchestrator `44016ec`),
+and the rule each value must satisfy against this release. The full catalogue is in
+[OPERATIONS §4](OPERATIONS.md#4-configuration).
 
 | Variable | dev and perf (`ocr-cell`) | Against real containers | Why |
 |---|---|---|---|
-| `DI_UPSTREAM_URL` | `http://azure-di-mock:5000` | The Layout container's Service URL | Required; startup fails without it. 5000 is the `infra-mocks` Service port, and the mock's container port too. The gateway's egress policy admits TCP 5000 to the two mocks and nothing else. |
-| `READ_UPSTREAM_URL` | `http://azure-read-mock:5000` | The Read container's Service URL | Required. The hostname must not contain `vision` ([why](OPERATIONS.md#the-vision-substring-bug-in-the-read-container)). |
-| `DI_SYNC_ANALYZE` | `off` | From the probe verdict | With `off`, the gateway never tries `:syncAnalyze`. `/_gw/health` reports `syncAnalyze: unavailable` for Layout from boot, and DI jobs run as `:analyze` plus polling and show `upstreamMode: async-fallback`. `gateway.env` keeps `off` as a choice, not a necessity: the DES Layout mock on DES `main` (`bf57bbb`) serves `:syncAnalyze`, a route it gained in `d1b8ec4`, so `auto` would work against it too. `off` costs only the fast path. Changing it is an `ocr-cell` change, and this row changes with it. |
-| `DI_MAX_INFLIGHT` | `4`, which is `gw-01` `di.max_inflight` | Same rule | Every 300 s the orchestrator observer reads `/_gw/config`. When `diMaxInflight` differs from the fleet value, it raises `WegaGatewayFleetDrift`. |
-| `QUEUE_DEPTH` | `2`, which is `gw-01` `di.queue_depth` | Same rule | Also drift-checked, as `queueDepth`. The gateway has one `QUEUE_DEPTH` for both surfaces, so the fleet's `read.queue_depth` must equal its `di.queue_depth`. |
-| `READ_MAX_INFLIGHT` | `4`, which is `gw-01` `read.max_inflight` | Same rule | The observer does not drift-check it. Keep it equal anyway, so that the fleet file stays a true description of the gateway. |
-| `PUBLIC_BASE_URL` | `http://azure-gateway-api.wega-<env>.svc.cluster.local:8080`, the fleet `base_url`, from `overlays/<env>/patch-gateway.yaml` | Same rule | Give scheme and authority only; the gateway rejects a path. Vision takes only the operation id from `Operation-Location` and rebuilds every poll URL from the fleet `base_url`, so this is not load-bearing for Wega. Setting it silences the `PUBLIC_BASE_URL is unset` warning and fixes the advertised authority. |
-| `DATA_DIR` | `/data`, set explicitly, and also the image default | Same | Must be the PVC mount. |
+| `DI_UPSTREAM_URL` | `http://azure-di-mock:5000` | The HAProxy Route in front of the Layout pods | Optional since this release, but Wega uses both surfaces. 5000 is the `infra-mocks` Service port. |
+| `READ_UPSTREAM_URL` | `http://azure-read-mock:5000` | The Route in front of the Read pods | The hostname must not contain `vision` ([why](OPERATIONS.md#the-vision-substring-bug-in-the-read-container)). |
+| `DI_SYNC_ANALYZE` | `off` | **Remove** | Removed setting: the gateway starts and warns `DI_SYNC_ANALYZE is no longer used`. Every DI job now calls `:syncAnalyze`, so the Layout mock **must** serve it; the DES Layout mock on DES `main` (`bf57bbb`) does, since `d1b8ec4`. |
+| `ERROR_COMPAT` | `observed` | **Remove** | Removed setting; warns. The observed shapes are now the only ones. |
+| `DI_MAX_INFLIGHT` | `4`, which is `gw-01` `di.max_inflight` | max Azure pods × per-pod concurrency, e.g. `16` | Now bounds every Azure call, parts and hedges included. Every 300 s the orchestrator observer reads `/_gw/config`; when `diMaxInflight` differs from the fleet value, it raises `WegaGatewayFleetDrift`. Change the fleet file and the ConfigMap together. |
+| `QUEUE_DEPTH` | `2`, which is `gw-01` `di.queue_depth` | sized for bursts, e.g. `200` | Also drift-checked, as `queueDepth`. One `QUEUE_DEPTH` for both surfaces. |
+| `READ_MAX_INFLIGHT` | `4`, which is `gw-01` `read.max_inflight` | as `DI_MAX_INFLIGHT`; `0` in the fleet for a DI-only gateway | The observer does not drift-check it. A disabled surface reports `0` on `/_gw/config`. |
+| `SPLIT_PAGES` | unset, so `5` | `5` | New. `0` turns splitting off. Vision's own split-and-merge stays as it is; a vision slice over 5 pages is split again by the gateway, and both merges are page-exact. |
+| `PUBLIC_BASE_URL` | the fleet `base_url`, from `overlays/<env>/patch-gateway.yaml` | Same rule | Scheme and authority only. Vision rebuilds every poll URL from the fleet `base_url`, so this is not load-bearing for Wega. |
+| `DATA_DIR` | `/data` | Same | Must be the PVC mount: the database, its migration backup, the blobs and the work folders. |
 | `SHUTDOWN_GRACE` | `30s`, under `terminationGracePeriodSeconds: 60` | Less than `terminationGracePeriodSeconds` | The default is `30s`. |
 
 The orchestrator's `tests/parity/test_deploy_components.py` fails when `DI_MAX_INFLIGHT`,
@@ -201,10 +278,9 @@ table.
 
 `gateway.env` also sets `GATEWAY_ADDR=:8080`, `DI_UPSTREAM_TIMEOUT=15m`,
 `READ_SYNC_TIMEOUT=10m`, `RESULT_TTL=24h`, `GC_INTERVAL=5m`, `DISK_HIGH_WATERMARK=0.90`,
-`ERROR_COMPAT=observed`, `LOG_LEVEL=info` and `LOG_FORMAT=json`. Each equals the gateway's own
-default in `internal/config/config.go`. Changing one of those defaults therefore does not change
-Wega, because the ConfigMap still sets the old value. Every variable not named in this section
-keeps its default.
+`LOG_LEVEL=info` and `LOG_FORMAT=json`. Each equals the gateway's own default. Note that
+`DI_UPSTREAM_TIMEOUT` and `READ_SYNC_TIMEOUT` now bound **one attempt** at a whole document, not a
+job.
 
 **Secret (name only).** The Secret is `azure-gateway-api`, with keys `DI_UPSTREAM_API_KEY` and
 `READ_UPSTREAM_API_KEY`. The container reads each key into the variable of the same name through
@@ -229,13 +305,13 @@ the keys are the Azure resource's billing keys.
 | `GET /_gw/metrics` | Prometheus text format | PodMonitor `azure-gateway-api`, every 30 s |
 | `GET /status`, at the root | Container-shaped `apiStatus`, `Valid` or `Invalid`, always at HTTP `200` | Nothing in Wega. It cannot fail, so it is useless as a probe. |
 
-**How `upstreams[].ok` is decided.** `/_gw/health` lists two upstreams: `document-intelligence`
-for Layout and `computer-vision-read` for Read. On every request, for each upstream, the gateway
+**How `upstreams[].ok` is decided.** `/_gw/health` lists one upstream per configured surface:
+`document-intelligence` for Layout and `computer-vision-read` for Read. On every request, for each upstream, the gateway
 sends `GET <upstream URL>/status` with that upstream's API key and a 5 s timeout; the whole
 handler has 6 s. `ok` is true exactly when that call returns HTTP `200`. The body only feeds
 `detail`, which copies `apiStatus` and `apiStatusMessage` when they are present. Neither field
-affects `ok`, so `apiStatus: Invalid` at HTTP `200` still counts as ok. The logic is
-`checkStatus` in [`internal/upstream/client.go`](../internal/upstream/client.go).
+affects `ok`, so `apiStatus: Invalid` at HTTP `200` still counts as ok. The logic is `Client.Health` in [`internal/upstream`](../internal/upstream). There is no
+`syncAnalyze` field any more.
 
 **Why this matters to Wega.** An upstream reads `ok: false` when its `/status` answers 404, times
 out, or cannot be reached. After two consecutive `ok: false` reads, vision opens that surface's
@@ -247,35 +323,34 @@ reached `main` with merge `d28de8d`; a mock image built from an older `main` ser
 `/health`. `infra-mocks` makes `/status` the startup and readiness probe of both mocks, so a mock
 image without it never becomes Ready.
 
-The same response carries `capacity.di` and `capacity.read`, each with `inFlight`, `limit`,
-`queued` and `upstreamInUse`. `limit` is `MAX_INFLIGHT + QUEUE_DEPTH`; the observer uses it as
-that surface's admission slots.
+The same response carries `capacity.di` and `capacity.read` for the configured surfaces, each with
+`inFlight`, `limit`, `queued`, `upstreamInUse`, `upstreamWaiting` and `upstreamLimit`. `limit` is
+`MAX_INFLIGHT + QUEUE_DEPTH`; the observer uses it as that surface's admission slots. The
+`upstream*` keys describe the scheduler: Azure calls in progress, calls waiting for a slot, and
+`MAX_INFLIGHT`.
 
 ### What an upstream must serve
 
 These are the calls the gateway makes, so this is the contract the DES mocks must meet in dev and
-perf.
+perf. Since this release the gateway makes **no** `:analyze` call and **no** poll.
 
 | Call | When | Required answer |
 |---|---|---|
-| `GET /status` | On every `/_gw/health` request and every root `/status` request | `200`, within 5 s |
-| `POST /documentintelligence/documentModels/{modelId}:analyze?api-version=…` | Every Layout job, with `DI_SYNC_ANALYZE=off` | `202`, with an `Operation-Location` whose last path segment is the result id |
-| `GET /documentintelligence/documentModels/{modelId}/analyzeResults/{id}?api-version=…` | Polling, until terminal | `200` with `status`, plus `analyzeResult` once `succeeded` |
-| `POST /vision/v3.2/read/syncAnalyze` | First, on every Read job | `200` with the result. A `404` or `405` makes the gateway fall back for that job. |
-| `POST /vision/v3.2/read/analyze` | The fallback | `202`, with an `Operation-Location` whose last path segment is the operation id |
-| `GET /vision/v3.2/read/analyzeResults/{id}` | Polling, until terminal | `200` with `status`, plus `analyzeResult` once `succeeded` |
+| `GET /status` | On every `/_gw/health` request and every root `/status` request, for each configured surface | `200`, within 5 s |
+| `POST /documentintelligence/documentModels/{modelId}:syncAnalyze?api-version=…` (or `/formrecognizer/…`) | Every DI job and client `:syncAnalyze`: once for a whole document, or once per part, hedge and re-check | `200` with the operation envelope or a bare `AnalyzeResult`. A part is a standalone PDF of 3–5 pages; a re-check is the original with `pages=`. A bodyless `404`, `405`, `501` or `500 UnhandledEndpointException` fails every job as a deployment fault |
+| `POST /vision/v3.2/read/syncAnalyze` | Every Read job, likewise | `200` with the result |
+| `GET {fam}/info`, `/documentModels`, `/documentModels/{id}`, `{fam}/operations`, `/operations/{id}`, `/`, `/swagger…`, `/records/usage-logs…` | Only when a client calls the same route on the gateway | Anything: relayed as the container answers |
 
-The Read fallback has no latch. Against a mock without `syncAnalyze`, every Read job uploads its
-document twice, once to the `404` and once to `analyze`, and shows `upstreamMode: async-fallback`.
-That costs time, not correctness. The DES Read mock on DES `main` serves `syncAnalyze`, so Read
-jobs against it run `sync`. Keep each mock at one replica, as `infra-mocks` does, because their
-job stores are per process. A poll that reaches the other replica gets a 404, and 60 of those in
-a row (the default blind-poll budget) fail the job.
+A `503`, `502`, `504`, `500`, `408`, `429`, a `202`, a reset or a timeout is retried, so a mock
+that fails occasionally costs time, not correctness. Mocks may run more than one replica now: the
+gateway never polls, so nothing needs to land on the replica that answered first.
 
 ### Probes, network and security context in `ocr-cell`
 
 - Probes, all on port `http` (8080):
-  - startup on `/_gw/live`, every 2 s, failure threshold 30, so the gateway has 60 s to start;
+  - startup on `/_gw/live`, every 2 s, failure threshold 30, so the gateway has 60 s to start —
+    including the schema migration and boot recovery, which run before the listener opens (see
+    [Known gaps](#known-gaps-for-wega), item 7);
   - readiness on `/_gw/ready`, every 10 s, timeout 5 s, failure threshold 3;
   - liveness on `/_gw/live`, every 10 s, timeout 3 s, failure threshold 3.
 
@@ -332,15 +407,15 @@ a row (the default blind-poll budget) fail the job.
 | Entrypoint | `/usr/local/bin/gateway`, with default command `serve`; the other commands are `probe` and `version` | `Dockerfile:50-51` |
 | Volume | `VOLUME /data` | `Dockerfile:42` |
 | Image env | `DATA_DIR=/data`, `GATEWAY_ADDR=:8080`, `LOG_FORMAT=json` | `Dockerfile:43-45` |
-| Required env | `DI_UPSTREAM_URL` and `READ_UPSTREAM_URL`, each `http` or `https` with a host. With an invalid configuration, startup exits and lists every problem | `internal/config/config.go:198-199,267-288` |
-| Other env | Everything else, all optional with defaults; see the [README](../README.md#configuration) | `internal/config/config.go:133-196` |
-| Secret | `azure-gateway-api`, with keys `DI_UPSTREAM_API_KEY` and `READ_UPSTREAM_API_KEY`, read from the environment only | `internal/config/config.go:155,160` |
+| Required env | At least one of `DI_UPSTREAM_URL` and `READ_UPSTREAM_URL`, each `http` or `https` with a host. With an invalid configuration, startup exits and lists every problem | `internal/config/config.go` (`Load`) |
+| Other env | Everything else, all optional with defaults — 22 settings in all; see the [README](../README.md#configuration). Removed settings warn | `internal/config/config.go` |
+| Secret | `azure-gateway-api`, with keys `DI_UPSTREAM_API_KEY` and `READ_UPSTREAM_API_KEY`, read from the environment only | `internal/config/config.go` |
 | Probes | Liveness `/_gw/live`, readiness `/_gw/ready`, startup `/_gw/live` | `internal/admin/admin.go:48-61` |
 | Metrics | `GET /_gw/metrics`, in Prometheus text format, unauthenticated | `internal/admin/admin.go:56` |
 | Make targets | `help`, `build`, `test`, `test-short`, `cover`, `lint`, `check`, `image`, `probe`, `probe-go`, `run`, `sdk-test`, `clean`. There is no push target and no manifest target | `Makefile` |
 | Pre-build gate | `make check`: gofmt, `go vet`, staticcheck when installed, and `go test -race ./...` | `Makefile:31-42` |
-| Toolchain | Go 1.26 (`go 1.26.0`), with one direct dependency: `modernc.org/sqlite` v1.58.0, which is pure Go | `go.mod` |
-| Image size | About 5.7 MB | `make image`, 2026-09-09 |
+| Toolchain | Go 1.26 (`go 1.26.0`), with three direct dependencies, all pure Go: `modernc.org/sqlite` v1.58.0, `github.com/pdfcpu/pdfcpu` v0.16.1 and `github.com/rivo/uniseg` v0.4.7 | `go.mod` |
+| Image size | About 5.7 MB before pdfcpu and uniseg were added; re-measure at the branch's final gate | `make image`, 2026-09-09 |
 | Manifests | None here. For Wega, the orchestrator's `deploy/openshift/components/ocr-cell/` | orchestrator `44016ec` |
 | Image in Wega | `gateway.yaml` names the bare image `azure-gateway-api`. Each overlay's `images:` maps it to `image-registry.openshift-image-registry.svc:5000/wega-<env>/azure-gateway-api` by digest, with a zero digest committed as the placeholder | orchestrator `deploy/openshift/overlays/{dev,perf}/kustomization.yaml` |
 | Verified at | Code `0f9c794` and orchestrator manifests `44016ec`, on 2026-10-04 | — |
@@ -416,55 +491,71 @@ oc -n wega-<env> exec deploy/wega-orch-control -- python -c \
 
    With `Recreate`, the old gateway pod stops before the new one starts, so a short gap is
    expected.
-2. `/_gw/ready` answers `{"status":"ready"}`.
-3. `/_gw/health` shows `status: ok`, and `ok: true` on both upstreams. In dev and perf:
-   - `document-intelligence` shows `syncAnalyze: unavailable`.
-   - `computer-vision-read` shows `syncAnalyze: available`, which is always reported for Read
-     and never probed.
-   - `warnings` holds at most the two empty-key lines.
-4. `/_gw/config` shows `diMaxInflight`, `readMaxInflight` and `queueDepth` equal to the `gw-01`
-   fleet entry. In dev and perf it also shows `diSyncAnalyze: off`, `diUpstreamUrl`
-   `http://azure-di-mock:5000` and `readUpstreamUrl` `http://azure-read-mock:5000`.
-5. Send one document through Wega end to end, as the system handoff describes. Then
-   `/_gw/jobs?limit=5` shows `status: succeeded`. Against the DES mocks, DI jobs show
-   `upstreamMode: async-fallback`, because of `DI_SYNC_ANALYZE=off`. Read jobs show `sync`,
-   because the Read mock serves `syncAnalyze`.
+2. The gateway log has `job store schema migrated` (first start of this release, `from` 1, `to` 2,
+   with the `backup` path) or `job store schema is current`.
+3. `/_gw/ready` answers `{"status":"ready"}`.
+4. `/_gw/health` shows `status: ok`, and `ok: true` on each configured upstream. There is no
+   `syncAnalyze` field any more. `warnings` holds at most the two empty-key lines and one
+   `… is no longer used` line per removed setting the ConfigMap still sets.
+5. `/_gw/config` shows `diMaxInflight`, `readMaxInflight` and `queueDepth` equal to the `gw-01`
+   fleet entry, `splitPages`, and `diEnabled`/`readEnabled` both `true`.
+6. Send one document through Wega end to end, as the system handoff describes. Then
+   `/_gw/jobs?limit=5` shows `status: succeeded`, `upstreamAttempts` of at least 1, and
+   `upstreamParts` of 1 for a document of 5 pages or fewer, more for a larger PDF.
 
 ### Rollback
 
-Re-deploy the previous image digest. `Recreate` keeps the gateway at one pod, and the restart
-loses no accepted operation: ids and results live on the PVC, and jobs that were in flight re-run
-on boot. The job store has no migration framework (see the
-[coupling map](#coupling-map--if-you-change-x-you-must-also-change-y)). Before rolling across
-commits that change `schema` or `jobColumns` in `internal/store/db.go`, read what changed: a
-column that a newer build adds is not applied to an existing volume.
+Re-deploy the previous image digest — but read this first, because **this release migrates the
+job store** (schema version 1 → 2) on its first start, after copying the database to
+`/data/gateway.db.v1.bak`.
 
-### Known gaps for Wega, as of 2026-10-04
+- **Rolling back to `0f9c794` or any build before versioning:** that image does not check the
+  schema version. On the migrated database it would start and then fail every query naming a
+  dropped column. **Restore the backup first**: scale the gateway to 0; in a debug pod that mounts
+  the PVC, delete `gateway.db-wal` and `gateway.db-shm`, then copy `gateway.db.v1.bak` over
+  `gateway.db`; then deploy the old digest and scale back to 1. The full procedure is
+  [OPERATIONS §9](OPERATIONS.md#9-schema-migrations-and-rollback).
+- **Rolling back to a later build that knows migrations:** it refuses to start on a newer schema
+  and names the backup; restore it the same way, or roll forward.
+- **What a restore costs:** jobs accepted after the upgrade are not in the backup, so their ids
+  404. Prefer rolling forward when the reason allows.
 
-1. **It has never run against the DES mocks in a cluster.** DES `8c01dc9`, on DES `main`, adds
-   an opt-in test that drives both mocks through a gateway binary built from `0f9c794`, outside
-   a cluster. The mocks on DES `main` (`bf57bbb`) serve `GET /status`, Layout `:syncAnalyze` and
-   Read `syncAnalyze`, so an image built from it can pass the `infra-mocks` probes.
-2. **The staging and prod fleets give each cell `di.queue_depth: 4` but `read.queue_depth: 2`**
-   (`max_inflight` 8 and 4), at orchestrator `44016ec` and identically in vision. The gateway
-   has one `QUEUE_DEPTH`, so no cell can match both. The observer drift-checks `queueDepth`
-   against `di.queue_depth` only, so a cell set from the fleet takes `QUEUE_DEPTH=4`; its Read
-   admission limit is then 8, where the fleet declares 6. The alternative is to align the file
-   in both repositories. The cells themselves are open input `I-GATEWAY-CELLS`. dev and perf are
-   consistent: 4/2 on both surfaces, and `QUEUE_DEPTH=2`. The fix is not in this repository.
+Ids and results otherwise live on the PVC, and `Recreate` keeps the gateway at one pod.
 
-3. **The `clientRequestId` lookup (GW-CR-1) is not implemented.** `/_gw/jobs` ignores a
-   `clientRequestId` parameter, and `/_gw/version` advertises no `clientRequestIdLookup`. Vision
-   therefore treats the lookup as unsupported, which costs at most one extra resubmit after an
-   ambiguous submit.
-4. **The OpenShift SCC behaviour on `/data` is unverified**; see the security-context item above.
-5. **The base images are pinned by tag, not by digest**: `golang:1.26-bookworm` and
-   `gcr.io/distroless/static-debian12:nonroot`. Wega pins the built gateway image by digest
-   regardless.
-6. **`make image` last ran on 2026-09-09.** Docker was unavailable for the 2026-10-04
-   verification.
-7. Items 1 and 2 of [What is NOT done](#what-is-not-done) still stand: there has been no
-   end-to-end run against real containers, and `make sdk-test` has never been executed.
+### Known gaps for Wega
+
+As of 2026-10-11, against orchestrator `44016ec`, vision `5f93223` and DES `bf57bbb`:
+
+1. **The Wega follow-up for this release is not done** (a separate spec, sync-only design
+   "Rollout" item 3):
+   - `ocr-cell`'s `gateway.env` still sets `DI_SYNC_ANALYZE=off` and `ERROR_COMPAT=observed`. Both
+     only warn now; remove them.
+   - The fleet files still give `di.max_inflight: 4`, `queue_depth: 2`. Re-derive them as max
+     Azure pods × per-pod concurrency (16 for 8 × 2) and a burst-sized queue depth, with
+     `read.max_inflight: 0` for a DI-only gateway — in both repositories, since vision carries the
+     same file.
+   - Vision's KEDA ceilings are derived from the old slot counts and need re-deriving.
+   - **Vision's third attempt asks for `outputContentFormat=markdown` and `features=ocrHighResolution`.**
+     The gateway now rejects both with `400 InvalidArgument` until a probe proves the sync route
+     honours them, so that attempt fails fast instead of silently getting a result without them.
+     Vision must stop asking, or the parameters must be proven and allowlisted first.
+   - Vision's own split-and-merge is **kept as is**; the gateway's splitting composes with it.
+   - The orchestrator's system handoff needs the new settings, the migration and the rollback.
+2. **It has never run against the DES mocks in a cluster.** DES `8c01dc9` adds an opt-in test that
+   drives both mocks through a gateway binary built from `0f9c794`, outside a cluster; it predates
+   this release. The mocks serve `GET /status`, Layout `:syncAnalyze` and Read `syncAnalyze`, which
+   is now everything the gateway calls on them.
+3. **The staging and prod fleets give each cell `di.queue_depth: 4` but `read.queue_depth: 2`**.
+   The gateway has one `QUEUE_DEPTH`, so no cell can match both; the observer drift-checks
+   `queueDepth` against `di.queue_depth` only. The fix is not in this repository.
+4. **The `clientRequestId` lookup (GW-CR-1) is not implemented.** `/_gw/jobs` ignores a
+   `clientRequestId` parameter. With `apim-request-id` gone, `x-ms-client-request-id` is the only
+   correlation handle a client has, so this matters a little more than it did.
+5. **The OpenShift SCC behaviour on `/data` is unverified**; see the security-context item above.
+6. **The base images are pinned by tag, not by digest.** Wega pins the built image by digest.
+7. **The startup probe in `ocr-cell` allows 60 s.** The first start of this release migrates the
+   database before the listener opens. That takes seconds for a day of rows, but give it more room
+   (OPERATIONS §2 uses 5 s × 60).
 
 ### Build and deploy change log
 
@@ -472,19 +563,20 @@ column that a newer build adds is not applied to an existing volume.
 |---|---|---|
 | 2026-10-04 | `ec4da83` | The `OPERATIONS.md` sample labels its pods and selectors `app.kubernetes.io/name: azure-gateway-api`, the label Wega's NetworkPolicies select. |
 | 2026-10-04 | `656fa6b` | This section: how Wega deploys the gateway, the configuration rules, the health semantics, the build facts and the update rule. |
-| 2026-10-04 | `7743bc3` | This section checked against orchestrator `c8ce603`: the upstream port is filled in as 5000. The ConfigMap and Secret wiring, the PVC, probes, resources, security context, network policies, the mocks' `/status` and `syncAnalyze`, and the staging and prod cells now match `ocr-cell` and `infra-mocks`. The fleet mismatch with vision is recorded. |
-| 2026-10-04 | `e688dbb` | This section re-checked against the `main` branches of the orchestrator (`44016ec`), vision (`5f93223`) and DES (`bf57bbb`). The fleet gap is closed: vision's four fleet files are byte-identical to the orchestrator's from vision `4e9d40e`, so vision's perf ceiling is 7 against `di` 4/2, and its staging and prod egress reaches `gateway-<env>`. The DES mocks that serve `/status` and `syncAnalyze` are on DES `main`, so `527c6c0` and branch `wega/azure-mocks` are no longer cited. A staging or prod cell also needs ingress from `wega-<env>` and DNS egress. The staging and prod `queue_depth` mismatch is recorded. The code, the image and the values `ocr-cell` sets are unchanged. |
-| 2026-10-04 | The first commit after `e688dbb` | [Build and publish](#build-and-publish): `<registry>` now means the registry host plus the namespace (`P-REGISTRY`), as in the orchestrator's `SYSTEM-HANDOFF.md` §5 at `6cdaec6`, so the image is `<registry>/azure-gateway-api`. The old recipe wrote `wega-<env>` after `<registry>`, which doubled the namespace with the default registry this file named. The digest capture and the full-name release-overlay key are added; `kustomize build` over orchestrator `6cdaec6`'s dev overlay renders the given digest with the full-name key and the zero digest with a bare key. Between `44016ec` and `6cdaec6`, `ocr-cell`, the overlays and their fleet files are unchanged, and `infra-mocks` changed only `oracle-init.sh`; the DES mocks are unchanged between `bf57bbb` and `fec8bd7`. The code, the image and the values `ocr-cell` sets are unchanged. |
+| 2026-10-04 | `7743bc3` | This section checked against orchestrator `c8ce603`: the upstream port, ConfigMap and Secret wiring, PVC, probes, resources, security context, network policies, the mocks' `/status` and `syncAnalyze`, and the staging and prod cells. |
+| 2026-10-04 | `e688dbb` | Re-checked against the `main` branches of the orchestrator (`44016ec`), vision (`5f93223`) and DES (`bf57bbb`). |
+| 2026-10-04 | after `e688dbb` | [Build and publish](#build-and-publish): `<registry>` means the registry host plus the namespace (`P-REGISTRY`); digest capture and the full-name release-overlay key. |
+| 2026-10-11 | `feat/sync-only-upstream` | **Sync-only upstream and splitting.** 22 settings; eleven removed settings warn. The gateway calls only `:syncAnalyze`, `/status` and the GET relays. Migration 0002 runs on first start and writes `gateway.db.v1.bak`; rolling back to an older image needs that backup restored. New `/_gw/config` keys `splitPages`, `diEnabled`, `readEnabled`; `/_gw/health` loses `syncAnalyze` and gains `upstreamWaiting`/`upstreamLimit`; `/_gw/jobs` gains `upstreamAttempts` and `upstreamParts` and loses `upstreamMode`, `hasPdf`, `figures`. The DI parameter policy rejects `markdown`, `features` and `queryFields`. `Server: Kestrel`, no `apim-request-id`. Memory sizing for two concurrent splits. The Wega follow-up is listed under Known gaps. |
 
 ### Read next
 
 - [`OPERATIONS.md` §2](OPERATIONS.md#2-deployment): why the volume must be block-backed, why
   there is one replica, the probe advice, and a full sample manifest.
-- The [README configuration tables](../README.md#configuration): every variable and its default.
+- [`OPERATIONS.md` §9–§10](OPERATIONS.md#9-schema-migrations-and-rollback): migrations, rollback,
+  and the go-live gates.
+- The [README configuration table](../README.md#configuration): every variable and its default.
 - [`TESTING.md`](TESTING.md) and [`CONTAINER-BEHAVIOUR.md`](CONTAINER-BEHAVIOUR.md).
 - `document-embedding-orchestrator/docs/deploy/SYSTEM-HANDOFF.md`: the whole system.
-- `document-embedding-orchestrator/deploy/openshift/components/ocr-cell/` and
-  `components/infra-mocks/`: the manifests this section describes.
 
 ---
 
@@ -494,59 +586,86 @@ Do not "fix" these without reading the reason.
 
 | Looks wrong | Why it is that way |
 |---|---|
-| `TRUST_FORWARDED_HEADERS` defaults **off** | With it on and no allowlist, a caller sets `X-Forwarded-Host` and the gateway mints an `Operation-Location` pointing anywhere. Behind an OpenShift Route the request's own `Host` is already correct |
-| The unrouted 404 has **no body** | Both containers answer that way. Every *routed* endpoint still carries a body, which is what the Java-NPE rule requires |
-| DI's unknown-result-id error is **flat** while every other DI error is wrapped | The container does exactly this. It is not a bug in `azerr` |
-| `jsonx` hand-rolls a JSON scanner instead of using `encoding/json` | `Decoder.Token()` materialises every scalar. Measured at 309 MB of heap for a 107 MB `content` string — enough to OOM the pod with four workers |
-| The sync attempt has its own short timeout, separate from the upstream timeout | A build can *declare* `:syncAnalyze` in its swagger and never answer it. Without the separate bound, every job burned the full 15-minute timeout before falling back |
-| Boot recovery ignores leases; the periodic pass respects them | A freshly booted process holds no leases, so any `running` row is abandoned. Filtering on lease expiry at boot skipped exactly the jobs that needed rescuing |
-| Request contexts do not derive from the signal context | They used to, and `Shutdown` returned in ~1.5 ms while in-flight synchronous calls died with a 500. The grace period existed and nothing used it |
-| `Store.Delete` removes the row *before* the blobs | Blob-first meant a partial failure left a row pointing at a missing result, and the poll on it produced a body with no `status` — the shape that crashes Java clients |
-| Admission slots are held from admission to *completion* | That is what bounds upstream concurrency. Releasing at submit would let the container see unbounded load |
-| One replica only | Operation ids are pod-local by construction. A second replica cannot serve the first's polls |
+| A container's `202` is drained and retried, never polled | With autoscaled pods behind HAProxy, the operation lives only on the pod that answered, and a poll would land anywhere. The stored input makes a retry cheap and correct |
+| Every attempt opens a new connection | So HAProxy balances each attempt on its own and a retry can reach a different pod. Keep-alive would pin retries to the pod that just failed |
+| A job keeps its scheduler slot while it backs off | That is what makes a deployment answering 503 slow the gateway down. Releasing it would let newcomers hit the same overloaded pods |
+| Parts time out after 60 s while whole documents get 15 minutes | A 3–5 page part normally takes 2 s; a hung pod should cost a minute. A whole document is unknown work |
+| A terminal error on a part is re-checked against the original instead of failing the job | A splitting artefact must never fail a good document; Azure's answer about the original is the one that counts |
+| A merge check failure re-analyses the whole document instead of failing | The client asked for an analysis, not a merge. Whole is always correct |
+| `sched.Acquire` returns a nil `release` with an error | Deferring it unchecked would panic. Check the error first |
+| `pdfsplit.ErrPanic` wraps `ErrUnparseable` | Both send the document whole; check `ErrPanic` first so the metric says `panic` |
+| pdfcpu runs with `NewStatelessConfiguration` | The default configuration writes a config file in the home directory and panics when it cannot — which is always, on a read-only root filesystem |
+| An owner-password-only encrypted PDF is sent whole although pdfcpu could open it | The design splits only unencrypted documents; whole, Azure handles the encryption as it always did |
+| Parts have no named destinations | pdfcpu rewrites the `/Dests` tree in place while extracting, which gave later parts destinations pointing at pages they do not hold |
+| The merge refuses when a part's root span length disagrees with the gateway's grapheme count | uniseg and .NET can implement different Unicode versions. Where they disagree every shifted offset would be wrong |
+| Old migration files can never be edited, even for a typo | They have already run on volumes in service. `TestReleasedMigrationsAreUnchanged` pins them by sha256 |
+| The unrouted 404 has **no body** | Both containers answer that way. Every *routed* endpoint still carries a body |
+| DI's unknown-result-id error is **flat** while every other DI error is wrapped | The container does exactly this |
+| `jsonx` hand-rolls a JSON scanner and rewriter instead of using `encoding/json` | `Decoder.Token()` materialises every scalar: 309 MB of heap for a 107 MB `content` string. The rewriter must also copy every byte it does not change |
+| Boot recovery ignores leases; the periodic pass respects them | A freshly booted process holds no leases, so any `running` row is abandoned |
+| Request contexts do not derive from the signal context | They used to, and in-flight synchronous calls died with a 500 at SIGTERM |
+| `Store.Delete` removes the row *before* the blobs | Blob-first left a row pointing at a missing result, the shape that crashes Java clients |
+| One replica only | Operation ids are pod-local by construction |
 
 ---
 
 ## Coupling map — if you change X, you must also change Y
 
 - **`Operation-Location` format** → `internal/surface/di.go` *and* `read.go`, the conformance tests
-  that assert the shape, and `test/sdk/sdk_test.py`. Four SDKs parse this header with hard-coded
-  regexes; read [`api-surface.md`](api-surface.md) §4 first.
-- **Error shapes** → `internal/azerr`, the `Compat` switch, `internal/mockazure` (the fakes must
-  keep matching real containers), and the conformance tests.
-- **The job schema** → `internal/store/db.go` (`schema`, `jobColumns`, `scanJob`, `Create`). All
-  four must move together; there is no migration framework, and the schema uses
-  `CREATE TABLE IF NOT EXISTS`, so **adding a column will not apply to an existing volume**.
-- **Adding a config knob** → `internal/config/config.go` (field, parse, validate, `Redacted`), the
-  README table, and `OPERATIONS.md`.
-- **Anything touching admission** → check every path that calls `Admit`, `AdmitUpstream` or
-  `AdmitMetadata` releases its slot on *every* return path, including panics.
+  that assert the shape, and `test/sdk/sdk_test.py`. Read [`api-surface.md`](api-surface.md) §4
+  first.
+- **Error shapes** → `internal/azerr`, `internal/mockazure` (the fakes must keep matching real
+  containers), the conformance tests, and the golden recordings.
+- **The job schema** → **only through a new migration file** in `internal/store/migrations/`
+  (`NNNN_name.sql`, the next number), with its sha256 added to `TestReleasedMigrationsAreUnchanged`
+  — never by editing a released file — plus `jobColumns`, `scanJob`, `Create`, `Succeed`/`Fail` in
+  `internal/store/db.go`, the job view in `internal/admin`, and the rollback notes in
+  `OPERATIONS.md` §9 and [Rollback](#rollback).
+- **A setting** → `internal/config/config.go` (field, parse, validate, `Redacted`,
+  `TestRedactedCoversEveryField`), the README table, `OPERATIONS.md` §4 and the table above. A
+  **removed** setting goes into `removedSettings`, so manifests that still set it keep starting.
+  Settings Wega parses from `/_gw/config` (`diMaxInflight`, `readMaxInflight`, `queueDepth`) keep
+  their names.
+- **The parameter policy** → `internal/surface/params.go`, `test/conformance/params_test.go`,
+  `api-surface.md` §0, and the probe's per-parameter check that justifies the change.
+- **An attempt outcome or retry rule** → `internal/upstream/classify.go`, its row-by-row test, the
+  engine's handling, the `reason` labels in `gateway_upstream_retries_total`, and ARCHITECTURE
+  §4.1.
+- **A merge rule** → `internal/merge`, `internal/docgen` (so the round trip still holds),
+  `test/conformance/split_test.go`, a regression test from the document `--compare-split` found
+  it on, and ARCHITECTURE §4.7.
+- **Anything touching admission or slots** → every path that calls `Admit`, `AdmitMetadata`,
+  `sched.Acquire`, `TryAcquireIdle` or `Splitter.Open` releases on *every* return path, including
+  panics and cancellation.
+- **A metric** → `internal/engine/metrics.go` or `internal/admin`, `admin_test.go`, and the alerts
+  in `OPERATIONS.md` §5.
 
 ---
 
 ## How to work on this
 
-1. **Read the design spec's review section first.** 32 defects were found and fixed; the table says
-   what each one was. Re-introducing one is the most likely failure mode.
-2. **Change the fakes when the containers surprise you.** `internal/mockazure` is meant to model
-   real behaviour including failure modes. If a probe finds something new, the fake gets it first,
-   then the code, then a regression test.
-3. **Every fix gets a regression test that fails before it.** All 32 review fixes have one.
+1. **Read the design specs.** The original spec's review section lists 32 defects that were found
+   and fixed; the sync-only and splitting specs say what changed and why. Re-introducing a defect
+   is the most likely failure mode.
+2. **Change the fakes when the containers surprise you.** If a probe or a golden recording finds
+   something new, `internal/mockazure` gets it first, then the code, then a regression test.
+3. **Every fix gets a regression test that fails before it.**
 4. **Verify before claiming done:**
    ```bash
-   gofmt -l . && go vet ./... && go test -race ./... && make image
+   gofmt -l . && go vet ./... && go test -race ./... && scripts/e2e-local.sh && make image
    ```
-   The image build runs the suite inside it and has caught two bugs the local run missed — different
-   scheduling exposes different races. Do not skip it.
-5. **Re-probe after any container upgrade.** `./scripts/probe-containers.sh` — the verdict block
-   tells you which knobs to change.
+   The image build runs the suite inside it and has caught two bugs the local run missed. Do not
+   skip it.
+5. **Re-probe after any container upgrade**: `gateway probe` with `PROBE_DOCUMENT`, then
+   `--record` into a new image-tag directory, and `--compare-split` on the corpus.
 
 ### Conventions
 
 - Commits are authored `NilenduGanguli <nilendu.ganguli@gmail.com>`, conventional-commit prefixes,
   **no co-author trailers**.
 - Comments explain *why*, and name the specific client or observation that forces the behaviour.
-- `internal/` only; one external dependency (`modernc.org/sqlite`, pure Go, keeps the image static).
+- `internal/` only; three external dependencies, all pure Go so the image stays static:
+  `modernc.org/sqlite`, `github.com/pdfcpu/pdfcpu` (Apache-2.0) and `github.com/rivo/uniseg` (MIT).
 
 ### A warning about agent-assisted work
 
@@ -559,11 +678,11 @@ the history had to be rewound. **Stage explicit paths when agents can write to t
 
 | Question | Why it matters | How to settle it |
 |---|---|---|
-| Is `:syncAnalyze` broken on that build, or is the container starved? | Decides whether the fast path is ever usable | Give the Layout container its 8 cores / 16–24 GB and re-probe |
-| Do other environments' containers agree on error shapes? | The gateway reproduces one deployment's behaviour | Run the probe per environment |
-| Does `analyzeResults/{id}/pdf` ever return a real PDF? | It answered `200 application/json` on the probed build | Submit with `output=pdf` and re-check |
-| Do any clients actually use `/formrecognizer`? | Determines whether that surface needs its own tests | Ask, or log by prefix |
-| Is 90s for a blank PNG normal for this deployment? | Sets every timeout default | Compare against a resourced container |
+| Does the DI sync route honour `features`, `queryFields` and `outputContentFormat=markdown`? | They are rejected until it is proven; Wega's vision asks for two of them | `gateway probe` per-parameter checks against the real container |
+| Do the real containers' sync and async `analyzeResult`s match byte for byte? | A sync-backed poll is indistinguishable from a real pod's only if they do | The sync-equals-async case in `gateway probe --record` |
+| Which document-level judgements differ between whole and split analyses? | Each one needs a merge rule or an explicit acceptance | `gateway probe --compare-split` on 30+ representative PDFs |
+| Does the .NET runtime in the container count graphemes like uniseg? | A disagreement makes the merge refuse (and analyse whole) for affected scripts | Watch `gateway_split_fallback_total{reason="merge_check"}` on Devanagari-heavy documents |
+| Do other environments' containers agree on error shapes and headers? | The gateway reproduces one deployment's behaviour | Golden recordings per environment and image tag |
 
 ---
 

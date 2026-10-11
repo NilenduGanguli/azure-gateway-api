@@ -7,6 +7,15 @@ divergence, the evidence behind it, and the code that acts on it — because two
 changed the gateway's design after it was already built, and anyone changing that code needs to
 know why it looks the way it does.
 
+> **Pointer, 2026-10-10.** The observations below are kept exactly as recorded. What the gateway
+> does *about* them changed with the [sync-only upstream design](superpowers/specs/2026-10-10-sync-only-upstream-design.md):
+> it calls only `:syncAnalyze` and retries instead of falling back to `:analyze` and polling;
+> `ERROR_COMPAT`, `DI_SYNC_ANALYZE`, `DI_SYNC_PROBE_TIMEOUT` and artifact capture are gone; it
+> sends `Server: Kestrel` and no `apim-request-id`. Notes marked *Since the sync-only design*
+> say where a section's "what the gateway does" no longer holds. The gateway's current rules are in
+> [`api-surface.md` §0](api-surface.md#0-what-the-gateway-serves) and
+> [`ARCHITECTURE.md` §4](ARCHITECTURE.md#4-the-upstream-attempt-the-engine-and-splitting).
+
 ---
 
 ## 1. Why this document exists
@@ -152,6 +161,9 @@ the whole thing is provable on a laptop.
 
 ### What `ERROR_COMPAT=documented` is for
 
+> **Since the sync-only design (2026-10-10):** `ERROR_COMPAT` was removed. The gateway always
+> emits the observed shapes; a removed setting that is still set only warns.
+
 `ERROR_COMPAT` (`internal/config/config.go`, default **`observed`**, validated to be one of
 `observed` / `documented`) selects between the two. `cmd/gateway/main.go` calls
 `azerr.SetCompat(azerr.CompatDocumented)` once at startup when it is set, before anything is served.
@@ -216,6 +228,11 @@ answers before falling back to the route that works.**
 
 ### The three states a build can be in, and how the gateway detects each
 
+> **Since the sync-only design (2026-10-10):** there is no detection, latch or fallback any
+> more. A build that answers `:syncAnalyze` with 200 is ready; any other state means *this build
+> cannot run behind this gateway*, and `gateway probe` says so before go-live. A `202` is retried,
+> never polled.
+
 `(*DIClient).trySync` in `internal/upstream/di.go` switches on the response and maps it onto one of
 three outcomes `[CODE]`:
 
@@ -259,6 +276,10 @@ on restart. `/_gw/health` reports it per upstream as `syncAnalyze: unknown | ava
 
 ### `DI_SYNC_PROBE_TIMEOUT`
 
+> **Since the sync-only design (2026-10-10):** this setting was removed. Each attempt is bounded by
+> `DI_UPSTREAM_TIMEOUT` (whole documents) or 60 s (parts of a split PDF), and a timed-out attempt
+> is retried once.
+
 This is the setting the hung-route finding produced.
 
 | Setting | Default | Purpose |
@@ -291,6 +312,9 @@ the route again.
 
 ### The Read side
 
+> **Since the sync-only design (2026-10-10):** Read no longer falls back to `/read/analyze`; a
+> `404`/`405` on `syncAnalyze` fails the job as a deployment fault, like DI.
+
 Read always calls `syncAnalyze` first (design decision D6). It has **no capability latch**: a `404`
 or `405` there is treated as a misconfigured upstream rather than an image difference, because the
 route is documented for every 3.2 build, so `(*ReadClient).Analyze` falls back to
@@ -314,6 +338,10 @@ separate.
 Two headers that the gateway emits and the containers are not relied on to emit at all.
 
 ### `Retry-After`
+
+> **Since the sync-only design (2026-10-10):** the values are the constants 1 and 5 (`POLL_RETRY_AFTER`
+> and `BUSY_RETRY_AFTER` were removed). A `Retry-After` from HAProxy or a pod now also paces the
+> gateway's own retries, capped at 60 s.
 
 The DI spec declares `Retry-After` on the 202 `[SPEC]`; the CV Read container documentation's header
 dump for its 202 lists none `[DOC]`. The shell probe records the value on both submits, but reads
@@ -351,6 +379,10 @@ zeroes an upstream `Retry-After` before re-adding its own on a retriable status.
 `TestRetryAfterIsIntegerSeconds`.
 
 ### `apim-request-id`
+
+> **Since the sync-only design (2026-10-10):** the gateway no longer sends `apim-request-id`, because
+> the containers are not known to send it. The request id stays in the gateway's logs;
+> `x-ms-client-request-id` is echoed. Relayed GETs pass through whatever the container sends.
 
 This is a cloud front-door header. `docs/api-surface.md` §11 Q-A7 grades it *UNVERIFIED — assume no*
 for the container. Only the shell probe's Document Intelligence submit captures it, alongside
@@ -446,6 +478,10 @@ mock and requires a 404 with a zero-byte body, and `TestProxyNormalisesUnparseab
 requires an unparseable body to keep the container's own status.
 
 ### `analyzeResults/{id}/pdf` answering `200 application/json`
+
+> **Since the sync-only design (2026-10-10):** `output=pdf` and `output=figures` are rejected
+> with 400, and the gateway's `/pdf` and `/figures/{id}` routes always answer 404: a sync call never
+> creates the operation those files belong to.
 
 The searchable-PDF and cropped-figure endpoints are addressed by the **container's own** operation
 id, whose lifetime is the container's `StorageTimeToLiveInMinutes` and whose owning replica can
@@ -623,6 +659,12 @@ disagree.
 
 ### Finding → configuration decision
 
+> **Since the sync-only design (2026-10-10):** the `DI_SYNC_ANALYZE`, `DI_SYNC_PROBE_TIMEOUT` and
+> `ERROR_COMPAT` decisions in this table are void. `gateway probe` (with `PROBE_DOCUMENT`) now ends
+> in a sync-only verdict — `:syncAnalyze` 200 means ready, anything else means this build cannot
+> run behind the gateway — and go-live adds `--record` and `--compare-split`
+> ([`OPERATIONS.md` §10](OPERATIONS.md#10-go-live-gates)).
+
 The verdict block at the end of the run carries most of this; the rows marked *(row)* appear in the
 body of the report rather than in the verdict.
 
@@ -654,3 +696,4 @@ body of the report rather than in the verdict.
 | [`HANDOFF.md`](HANDOFF.md) | State of the work and what is still open |
 | [`api-surface.md`](api-surface.md) | The full container contract with per-claim citations, and the open questions the probe settles |
 | [`superpowers/specs/2026-09-08-azure-gateway-api-design.md`](superpowers/specs/2026-09-08-azure-gateway-api-design.md) | The approved design, the adversarial review outcomes, and *What probing a real deployment changed* |
+| [sync-only upstream design](superpowers/specs/2026-10-10-sync-only-upstream-design.md) | Why the gateway now calls only `:syncAnalyze`, and what it does about each finding here |
