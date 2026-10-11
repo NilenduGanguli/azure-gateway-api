@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -204,8 +205,9 @@ func TestRunPrintsALoopbackURLForEveryInterface(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading the address: %v", err)
 	}
-	url, ok := strings.CutPrefix(strings.TrimSpace(line), "DI_UPSTREAM_URL=http://127.0.0.1:")
-	if !ok || url == "" {
-		t.Fatalf("printed %q, want DI_UPSTREAM_URL=http://127.0.0.1:PORT", line)
+	// [::1] on a dual-stack host, where Go listens on the IPv6 wildcard; 127.0.0.1 elsewhere.
+	if !regexp.MustCompile(`^DI_UPSTREAM_URL=http://(127\.0\.0\.1|\[::1\]):[1-9][0-9]*$`).
+		MatchString(strings.TrimSpace(line)) {
+		t.Fatalf("printed %q, want DI_UPSTREAM_URL=http://127.0.0.1:PORT or http://[::1]:PORT", line)
 	}
 }

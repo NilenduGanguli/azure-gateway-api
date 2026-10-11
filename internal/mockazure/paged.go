@@ -130,12 +130,18 @@ func ListenPaged(addr string, o PagedOptions) (*Container, error) {
 }
 
 // dialable is the host:port a client on this host dials to reach a listener on addr. A listener on
-// the unspecified address accepts on every interface, loopback included, so 127.0.0.1 stands in
-// for it; Go listens on the unspecified address dual-stack, so that holds for "[::]" as well.
+// the unspecified address accepts on every interface, loopback included, so the loopback address
+// of its own family stands in for it. For the IPv6 wildcard, which is also what Go listens on for
+// ":5001" or "0.0.0.0:5001" on a dual-stack host, that is [::1] and not 127.0.0.1: on macOS
+// another process may bind 127.0.0.1 on the same port, a specific address outranking the
+// wildcard, and a URL naming 127.0.0.1 would then reach that process instead of this fake.
 func dialable(addr net.Addr) string {
 	tcp, ok := addr.(*net.TCPAddr)
 	if !ok || !tcp.IP.IsUnspecified() {
 		return addr.String()
+	}
+	if tcp.IP.To4() == nil {
+		return net.JoinHostPort("::1", strconv.Itoa(tcp.Port))
 	}
 	return net.JoinHostPort("127.0.0.1", strconv.Itoa(tcp.Port))
 }

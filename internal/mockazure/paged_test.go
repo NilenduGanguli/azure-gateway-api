@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -816,6 +817,10 @@ func TestListenPagedServesOnTheGivenAddress(t *testing.T) {
 // A fake listening on every interface (fakeazure -di :5001) gives a URL a client on this host can
 // use, not the wildcard address it listens on: the URL is printed for the gateway's settings and
 // is where Operation-Location sends a poll.
+// A wildcard listener's URL names the loopback address of its own family. An IPv6 wildcard,
+// which Go also uses for ":PORT", is reached through [::1]: on macOS another process may bind
+// 127.0.0.1 on the same port, since a specific address outranks the wildcard, and the URL would
+// then reach that process instead of the fake.
 func TestListenPagedOnEveryInterfaceGivesALoopbackURL(t *testing.T) {
 	for _, addr := range []string{":0", "0.0.0.0:0", "[::]:0"} {
 		t.Run(addr, func(t *testing.T) {
@@ -824,8 +829,12 @@ func TestListenPagedOnEveryInterfaceGivesALoopbackURL(t *testing.T) {
 				t.Skipf("this host cannot listen on %s: %v", addr, err)
 			}
 			defer c.Close()
-			if !regexp.MustCompile(`^http://127\.0\.0\.1:[1-9][0-9]*$`).MatchString(c.URL()) {
-				t.Fatalf("URL is %q, want http://127.0.0.1:PORT", c.URL())
+			want := `^http://127\.0\.0\.1:[1-9][0-9]*$`
+			if host, _, _ := net.SplitHostPort(c.server.Listener.Addr().String()); host == "::" {
+				want = `^http://\[::1\]:[1-9][0-9]*$`
+			}
+			if !regexp.MustCompile(want).MatchString(c.URL()) {
+				t.Fatalf("URL is %q, want it to match %s", c.URL(), want)
 			}
 			sub := postDoc(t, c, pagedRoutes[0].submit, "application/pdf", pdftest.Make(2))
 			loc := sub.header.Get("Operation-Location")

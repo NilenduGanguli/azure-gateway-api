@@ -74,7 +74,8 @@ func parseFlags(args []string, stderr io.Writer) (settings, error) {
 		fmt.Fprintf(fs.Output(), "usage: fakeazure [-di ADDR] [-read ADDR] [flags]\n\n"+
 			"Serves paged fake Azure containers until interrupted. Page flags apply to both.\n"+
 			"An ADDR with no host, such as :5001, listens on every interface, and the URL\n"+
-			"printed for it names 127.0.0.1.\n\n")
+			"printed for it names the loopback address: [::1] on a dual-stack host, else\n"+
+			"127.0.0.1.\n\n")
 		fs.PrintDefaults()
 	}
 
