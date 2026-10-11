@@ -85,9 +85,9 @@ type Options struct {
 	// The next four model what sits between the gateway and the containers: HAProxy in front of
 	// autoscaled pods. They apply to synchronous calls only, because that is the only route the
 	// gateway uses. Capacity, BusyFirst and StatusFirst are checked in that order, ahead of the
-	// container's own behaviour (Sync and the options above), and a call one of them answers
-	// never reaches the container, so Latency does not slow it. ResetMidBody then damages the
-	// 200 that behaviour sends.
+	// container's own behaviour (RequireAPIKey, Sync and the options above), and a call one of
+	// them answers never reaches the container: the key is not checked, Latency does not slow it,
+	// and Hits does not count it. ResetMidBody then damages the 200 that behaviour sends.
 
 	// BusyFirst answers the first n synchronous calls with 503 and Retry-After: 1, as HAProxy does
 	// when every pod is at its connection cap. The body is HAProxy's own page, which is HTML, not
@@ -110,6 +110,10 @@ type Options struct {
 	// from admission until its answer is written, Latency and a hang included, so this models a
 	// pod's connection cap (pod-concurrent-connections) and not a fixed number of failures.
 	Capacity int
+
+	// NoServerHeader drops the Server: Kestrel header the containers' web server puts on every
+	// answer, so a test can tell a header the gateway set itself from one it relayed.
+	NoServerHeader bool
 }
 
 // Container is a fake Azure container.
@@ -146,13 +150,14 @@ func (c *Container) URL() string { return c.server.URL }
 // Close shuts the container down.
 func (c *Container) Close() { c.server.Close() }
 
-// Hits reports how many analyze calls were served.
+// Hits reports how many analyze calls, synchronous or asynchronous, the container itself served:
+// a call HAProxy turned away (Capacity, BusyFirst, StatusFirst) never reached a pod, and one
+// refused for its API key was not served, so neither counts.
 func (c *Container) Hits() int64 { return c.hits.Load() }
 
 // SyncCalls reports how many synchronous analyze requests were received, whatever became of them:
 // a result, a failure mode, a hang, or a rejection for a bad API key. It is the attempt count a
-// retry loop is asserted against. Asynchronous submits and polls are not counted; Hits covers both
-// kinds of analyze call.
+// retry loop is asserted against. Asynchronous submits and polls are not counted.
 func (c *Container) SyncCalls() int64 { return c.syncCalls.Load() }
 
 // Requests returns the paths served so far.
@@ -194,23 +199,7 @@ func NewDI(opts Options) *Container {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /documentintelligence/documentModels/{action}", func(w http.ResponseWriter, r *http.Request) {
-		c.record(r.URL.Path)
-		_, verb, _ := strings.Cut(r.PathValue("action"), ":")
-		if verb == "syncAnalyze" {
-			// Counted before the key check: SyncCalls is every attempt a client made.
-			c.syncCalls.Add(1)
-		}
-		if !c.authorized(w, r) {
-			return
-		}
-		switch verb {
-		case "syncAnalyze":
-			c.serveSync(w, r, true)
-		case "analyze":
-			c.serveSubmit(w, r, "/documentintelligence/documentModels/prebuilt-layout/analyzeResults/")
-		default:
-			writeDIError(w, http.StatusNotFound, "NotFound", "Resource not found.")
-		}
+		c.serveAction(w, r, "/documentintelligence/documentModels/prebuilt-layout/analyzeResults/")
 	})
 
 	mux.HandleFunc("GET /documentintelligence/documentModels/{modelId}/analyzeResults/{resultId}",
@@ -222,22 +211,7 @@ func NewDI(opts Options) *Container {
 	// The legacy Form Recognizer family, which a probed layout-4.0 build declares alongside the
 	// newer one.
 	mux.HandleFunc("POST /formrecognizer/documentModels/{action}", func(w http.ResponseWriter, r *http.Request) {
-		c.record(r.URL.Path)
-		_, verb, _ := strings.Cut(r.PathValue("action"), ":")
-		if verb == "syncAnalyze" {
-			c.syncCalls.Add(1)
-		}
-		if !c.authorized(w, r) {
-			return
-		}
-		switch verb {
-		case "syncAnalyze":
-			c.serveSync(w, r, true)
-		case "analyze":
-			c.serveSubmit(w, r, "/formrecognizer/documentModels/prebuilt-layout/analyzeResults/")
-		default:
-			writeDIError(w, http.StatusNotFound, "NotFound", "Resource not found.")
-		}
+		c.serveAction(w, r, "/formrecognizer/documentModels/prebuilt-layout/analyzeResults/")
 	})
 	mux.HandleFunc("GET /formrecognizer/documentModels/{modelId}/analyzeResults/{resultId}",
 		func(w http.ResponseWriter, r *http.Request) {
@@ -297,8 +271,24 @@ func NewDI(opts Options) *Container {
 	}
 
 	c.addCommon(mux)
-	c.server = httptest.NewServer(mux)
+	c.start(mux)
 	return c
+}
+
+// serveAction answers a POST to a Document Intelligence model: :syncAnalyze, :analyze, or a verb
+// the container does not have.
+func (c *Container) serveAction(w http.ResponseWriter, r *http.Request, resultPrefix string) {
+	c.record(r.URL.Path)
+	switch _, verb, _ := strings.Cut(r.PathValue("action"), ":"); verb {
+	case "syncAnalyze":
+		c.serveSync(w, r, true)
+	case "analyze":
+		if c.authorized(w, r) {
+			c.serveSubmit(w, r, resultPrefix)
+		}
+	default:
+		writeDIError(w, http.StatusNotFound, "NotFound", "Resource not found.")
+	}
 }
 
 // NewRead starts a fake Computer Vision Read v3.2 container.
@@ -309,10 +299,6 @@ func NewRead(opts Options) *Container {
 
 	mux.HandleFunc("POST /vision/v3.2/read/syncAnalyze", func(w http.ResponseWriter, r *http.Request) {
 		c.record(r.URL.Path)
-		c.syncCalls.Add(1)
-		if !c.authorized(w, r) {
-			return
-		}
 		c.serveSync(w, r, false)
 	})
 
@@ -330,9 +316,38 @@ func NewRead(opts Options) *Container {
 	})
 
 	c.addCommon(mux)
-	c.server = httptest.NewServer(mux)
+	c.start(mux)
 	return c
 }
+
+// start serves mux the way Kestrel would. Every answer names Kestrel, and a request no route
+// matches gets Kestrel's bodyless 404, or a bodyless 405 with Allow for a known path and the wrong
+// verb, where net/http's mux would have written a line of text.
+func (c *Container) start(mux *http.ServeMux) {
+	c.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !c.opts.NoServerHeader {
+			w.Header().Set("Server", "Kestrel")
+		}
+		if _, pattern := mux.Handler(r); pattern == "" {
+			w = bodyless{w}
+		}
+		mux.ServeHTTP(w, r)
+	}))
+}
+
+// bodyless passes on a status and its headers and drops the body: the content headers net/http's
+// error helper set are removed before the status goes out, so the answer is an empty one.
+type bodyless struct{ http.ResponseWriter }
+
+func (b bodyless) WriteHeader(status int) {
+	h := b.Header()
+	h.Del("Content-Type")
+	h.Del("X-Content-Type-Options")
+	h.Set("Content-Length", "0")
+	b.ResponseWriter.WriteHeader(status)
+}
+
+func (b bodyless) Write(p []byte) (int, error) { return len(p), nil }
 
 func (c *Container) addCommon(mux *http.ServeMux) {
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
@@ -364,14 +379,15 @@ func (c *Container) authorized(w http.ResponseWriter, r *http.Request) bool {
 
 // serveSync answers the synchronous analyze route according to the configured behaviour.
 func (c *Container) serveSync(w http.ResponseWriter, r *http.Request, di bool) {
-	c.hits.Add(1)
+	// Counted first: SyncCalls is every attempt a client made, whoever answered it.
+	c.syncCalls.Add(1)
 	// The body is read before anything is answered, so a client still uploading meets the answer
 	// it is owed and not a connection closed under it.
 	_, _ = io.Copy(io.Discard, r.Body)
 
 	// What HAProxy and the autoscaler do to a call happens in front of the container, so it is
-	// decided before the container's own behaviour and costs no Latency. The order is the one
-	// Options documents.
+	// decided before anything the container does: its key check, its behaviour and its Latency.
+	// The order is the one Options documents.
 	if !c.admit() {
 		writeHAProxyBusy(w)
 		return
@@ -388,6 +404,12 @@ func (c *Container) serveSync(w http.ResponseWriter, r *http.Request, di bool) {
 		writeDIError(w, c.opts.StatusFirstCode, code, message)
 		return
 	}
+
+	// The call has reached a pod.
+	if !c.authorized(w, r) {
+		return
+	}
+	c.hits.Add(1)
 
 	if c.opts.Latency > 0 {
 		time.Sleep(c.opts.Latency)
@@ -440,23 +462,18 @@ func (c *Container) serveSync(w http.ResponseWriter, r *http.Request, di bool) {
 
 	if c.opts.FailSyncBare {
 		// The only error form Microsoft documents for CV syncAnalyze: capital F, no detail.
-		c.writeSyncBody(w, map[string]string{"status": "Failed"})
+		c.writeSyncBody(w, []byte(`{"status":"Failed"}`))
 		return
 	}
 	if c.opts.FailAnalysis {
-		c.writeSyncBody(w, c.failedEnvelope())
+		c.writeSyncBody(w, failedEnvelope(di))
 		return
 	}
 	if c.opts.SyncBodyBare {
 		c.writeSyncBody(w, c.analyzeResult(di))
 		return
 	}
-	c.writeSyncBody(w, map[string]any{
-		"status":              "succeeded",
-		"createdDateTime":     "2024-11-30T00:00:00Z",
-		"lastUpdatedDateTime": "2024-11-30T00:00:01Z",
-		"analyzeResult":       c.analyzeResult(di),
-	})
+	c.writeSyncBody(w, envelope("succeeded", syncUpdated, "analyzeResult", c.analyzeResult(di)))
 }
 
 // admit reserves an in-flight slot for a synchronous call, or reports that the container is at
@@ -486,13 +503,12 @@ func firstN(seen *atomic.Int64, n int) bool {
 
 // writeSyncBody sends a 200 from the synchronous route. With ResetMidBody it sends only half of
 // it and then drops the connection, which is how a client learns the pod answering it was killed.
-func (c *Container) writeSyncBody(w http.ResponseWriter, v any) {
+func (c *Container) writeSyncBody(w http.ResponseWriter, body []byte) {
 	if !c.opts.ResetMidBody {
-		writeJSON(w, http.StatusOK, v)
+		writeRaw(w, http.StatusOK, body)
 		return
 	}
 
-	body, _ := json.Marshal(v)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	// The whole body's length, not the half that follows: the client is left waiting for bytes that
 	// never come, and that is what lets it tell a cut body from a short one.
@@ -543,23 +559,14 @@ func (c *Container) servePoll(w http.ResponseWriter, id string, di bool) {
 	}
 	if polls <= c.opts.PollsBeforeSuccess {
 		w.Header().Set("Retry-After", "1")
-		writeJSON(w, http.StatusOK, map[string]any{
-			"status":              "running",
-			"createdDateTime":     "2024-11-30T00:00:00Z",
-			"lastUpdatedDateTime": "2024-11-30T00:00:01Z",
-		})
+		writeRaw(w, http.StatusOK, envelope("running", syncUpdated, "", nil))
 		return
 	}
 	if c.opts.FailAnalysis {
-		writeJSON(w, http.StatusOK, c.failedEnvelope())
+		writeRaw(w, http.StatusOK, failedEnvelope(di))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":              "succeeded",
-		"createdDateTime":     "2024-11-30T00:00:00Z",
-		"lastUpdatedDateTime": "2024-11-30T00:00:02Z",
-		"analyzeResult":       c.analyzeResult(di),
-	})
+	writeRaw(w, http.StatusOK, envelope("succeeded", pollUpdated, "analyzeResult", c.analyzeResult(di)))
 }
 
 func (c *Container) newOperation() string {
@@ -570,29 +577,54 @@ func (c *Container) newOperation() string {
 	return id
 }
 
-func (c *Container) failedEnvelope() map[string]any {
-	return map[string]any{
-		"status":              "failed",
-		"createdDateTime":     "2024-11-30T00:00:00Z",
-		"lastUpdatedDateTime": "2024-11-30T00:00:02Z",
-		"error": map[string]any{
-			"code":    "InvalidRequest",
-			"message": "Invalid request.",
-			"innererror": map[string]string{
-				"code":    "InvalidContent",
-				"message": "The file is corrupted or format is unsupported.",
-			},
-		},
+// The timestamps every envelope carries: when the operation was created, and when it was last
+// updated as seen by a synchronous call (or a poll still running) and by a terminal poll.
+const (
+	createdAt   = "2024-11-30T00:00:00Z"
+	syncUpdated = "2024-11-30T00:00:01Z"
+	pollUpdated = "2024-11-30T00:00:02Z"
+)
+
+// envelope returns an operation envelope with its members in the order the containers write them:
+// status, the two timestamps, then the one member that says how it ended, an error or the
+// analyzeResult, unless member is empty. value is that member's JSON, copied verbatim.
+//
+// It is written by hand rather than marshalled from a map, which would order the members
+// alphabetically and put analyzeResult first, and so that a result's bytes reach the client
+// exactly as they were built.
+func envelope(status, updated, member string, value []byte) []byte {
+	b := make([]byte, 0, 128+len(value))
+	b = append(b, `{"status":"`+status+`","createdDateTime":"`+createdAt+
+		`","lastUpdatedDateTime":"`+updated+`"`...)
+	if member != "" {
+		b = append(b, `,"`+member+`":`...)
+		b = append(b, value...)
 	}
+	return append(b, '}')
+}
+
+// invalidContent is Document Intelligence's error for a document it cannot read.
+var invalidContent = []byte(`{"code":"InvalidRequest","message":"Invalid request.",` +
+	`"innererror":{"code":"InvalidContent","message":"The file is corrupted or format is unsupported."}}`)
+
+// failedEnvelope is the envelope of an analysis that failed. Document Intelligence says why in an
+// error member. Read's operation schema has no error member at all, so a failed Read operation is
+// the bare envelope.
+func failedEnvelope(di bool) []byte {
+	if di {
+		return envelope("failed", pollUpdated, "error", invalidContent)
+	}
+	return envelope("failed", pollUpdated, "", nil)
 }
 
 // analyzeResult builds a result body for the surface being faked, padded when the test wants a
 // large one. The two surfaces share no result shape: Document Intelligence returns a Layout
 // analysis and Read returns readResults. Serving Read the Layout body hid every code path that
 // has to tell the two apart.
-func (c *Container) analyzeResult(di bool) any {
+func (c *Container) analyzeResult(di bool) []byte {
 	if !di {
-		return c.readBody()
+		b, _ := json.Marshal(c.readBody())
+		return b
 	}
 	out := map[string]any{
 		"apiVersion":      "2024-11-30",
@@ -609,7 +641,8 @@ func (c *Container) analyzeResult(di bool) any {
 	if c.opts.PadResultBytes > 0 {
 		out["padding"] = strings.Repeat("x", c.opts.PadResultBytes)
 	}
-	return out
+	b, _ := json.Marshal(out)
+	return b
 }
 
 // readResult is a Computer Vision Read v3.2 analyzeResult. It is a struct and not a map so its
@@ -672,6 +705,11 @@ func (c *Container) readBody() readResult {
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	body, _ := json.Marshal(v)
+	writeRaw(w, status, body)
+}
+
+// writeRaw sends body, which is already JSON.
+func writeRaw(w http.ResponseWriter, status int, body []byte) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Content-Length", fmt.Sprint(len(body)))
 	w.WriteHeader(status)
@@ -708,8 +746,9 @@ const haproxyBusyPage = "<html><body><h1>503 Service Unavailable</h1>\n" +
 
 // writeHAProxyBusy answers as HAProxy does when no pod can take a request, because every one is at
 // its connection cap or none is ready: a 503 with its HTML page and a Retry-After the gateway
-// adopts as its backoff.
+// adopts as its backoff. The page is HAProxy's own, so it does not name Kestrel.
 func writeHAProxyBusy(w http.ResponseWriter) {
+	w.Header().Del("Server")
 	w.Header().Set("Retry-After", "1")
 	w.Header().Set("Content-Type", "text/html")
 	w.WriteHeader(http.StatusServiceUnavailable)

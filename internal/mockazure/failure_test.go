@@ -258,7 +258,7 @@ func TestResetMidBodyAbortsTheHandlerWhenTheConnectionCannotBeHijacked(t *testin
 	var recovered any
 	func() {
 		defer func() { recovered = recover() }()
-		c.writeSyncBody(rec, map[string]string{"status": "succeeded"})
+		c.writeSyncBody(rec, []byte(`{"status":"succeeded"}`))
 	}()
 
 	if recovered != http.ErrAbortHandler {
