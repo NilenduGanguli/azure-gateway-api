@@ -103,6 +103,29 @@ func TestMembersAgreeWithEncodingJSON(t *testing.T) {
 	}
 }
 
+// TestMembersReportEscapedNames: a name written with any escape decodes to bytes that are not
+// its raw ones, which a caller copying names must know. Escapes in values do not count.
+func TestMembersReportEscapedNames(t *testing.T) {
+	doc := `{"plain":"\u0041","\u0062":1,"c\"d":2,"e\/":3,"f\\":4,"naïve":5}`
+	ms, err := Members(strings.NewReader(doc), 0, int64(len(doc)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []struct {
+		name    string
+		escaped bool
+	}{{"plain", false}, {"b", true}, {`c"d`, true}, {"e/", true}, {`f\`, true}, {"naïve", false}}
+	if len(ms) != len(want) {
+		t.Fatalf("got %d members, want %d", len(ms), len(want))
+	}
+	for i, w := range want {
+		if ms[i].Name != w.name || ms[i].Escaped != w.escaped {
+			t.Errorf("member %d: name %q escaped %v, want %q and %v",
+				i, ms[i].Name, ms[i].Escaped, w.name, w.escaped)
+		}
+	}
+}
+
 func TestMembersRejects(t *testing.T) {
 	for _, tc := range []struct {
 		in   string

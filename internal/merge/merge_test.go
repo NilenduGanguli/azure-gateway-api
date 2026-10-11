@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -44,14 +45,35 @@ func replace(t *testing.T, b []byte, old, new string) []byte {
 	return bytes.Replace(b, []byte(old), []byte(new), 1)
 }
 
+// diCheck is a TestDIChecks case: parts the merge must refuse, and why.
+type diCheck struct {
+	name  string
+	parts func(t *testing.T) []merge.Part
+	unit  textunit.Unit
+	want  string // in the error, so that a case cannot pass by failing another check first
+}
+
+// rootSpansCase is a diCheck whose second part's root section has the given spans, and whose
+// first part is as docgen writes it: pages 1-3, then 4-6 numbered locally.
+func rootSpansCase(name, spans, want string) diCheck {
+	return diCheck{name, func(t *testing.T) []merge.Part {
+		return diParts(t, [][]int{{1, 2, 3}, {4, 5, 6}}, func(i int, b []byte) []byte {
+			if i == 1 {
+				return withRootSpans(t, b, func(n int) string {
+					if n != 158 {
+						t.Fatalf("test bug: part 1's root is %d long, not 158", n)
+					}
+					return spans
+				})
+			}
+			return b
+		})
+	}, 0, want}
+}
+
 func TestDIChecks(t *testing.T) {
 	two := [][]int{{1, 2, 3}, {4, 5, 6}}
-	cases := []struct {
-		name  string
-		parts func(t *testing.T) []merge.Part
-		unit  textunit.Unit
-		want  string // in the error, so that a case cannot pass by failing another check first
-	}{
+	cases := []diCheck{
 		{"mismatched stringIndexType", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
 				if i == 1 {
@@ -228,7 +250,11 @@ func TestDIChecks(t *testing.T) {
 		{"content ending in CR, which would join the separator", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
 				if i == 0 {
-					return replace(t, b, `\nB3"`, `\nB3\r"`)
+					// The root span grows with the content, as the service's would.
+					b = replace(t, b, `\nB3"`, `\nB3\r"`)
+					return withRootSpans(t, b, func(n int) string {
+						return fmt.Sprintf(`[{"offset":0,"length":%d}]`, n+1)
+					})
 				}
 				return b
 			})
@@ -309,6 +335,97 @@ func TestDIChecks(t *testing.T) {
 			})
 		}, 0, "part 1 has content but no sections, while part 0 has them"},
 		{"no parts", func(t *testing.T) []merge.Part { return nil }, 0, "no parts"},
+
+		// Root section spans are decoded strictly: the merge writes the merged root's span
+		// itself, so it must know exactly what each part's says. Part 1's root is 158 long.
+		rootSpansCase("root span member in another case", `[{"Offset":0,"length":158}]`,
+			`part 1: root section span 0 has "Offset", not only "offset" and "length"`),
+		rootSpansCase("root span with an extra member", `[{"offset":0,"length":158,"x":1}]`,
+			`part 1: root section span 0 has "x", not only "offset" and "length"`),
+		rootSpansCase("root span with an empty object member", `[{"offset":0,"length":158,"x":{}}]`,
+			`part 1: root section span 0 has "x", not only "offset" and "length"`),
+		rootSpansCase("root span member given twice", `[{"offset":0,"offset":0,"length":158}]`,
+			`part 1: root section span 0 has "offset" twice`),
+		rootSpansCase("root span without a length", `[{"offset":0}]`,
+			`part 1: root section span 0 has no "length"`),
+		rootSpansCase("root span offset that is not canonical", `[{"offset":-0,"length":158}]`,
+			`part 1: root section span 0: offset -0 is not a non-negative integer`),
+		rootSpansCase("root span length that is a string", `[{"offset":0,"length":"158"}]`,
+			`part 1: root section span 0: length "158" is not a non-negative integer`),
+		rootSpansCase("root span that is not an object", `[[0,158]]`,
+			`part 1: root section span 0 is not an object`),
+		rootSpansCase("root spans that are not an array", `{"offset":0,"length":158}`,
+			`part 1: root section spans are not an array`),
+		rootSpansCase("root without spans in a part with content", `[]`,
+			`part 1 has content but its root section has no span`),
+		{"root without a spans member in a part with content", func(t *testing.T) []merge.Part {
+			return diParts(t, two, func(i int, b []byte) []byte {
+				if i == 1 {
+					return withoutRootSpans(t, b)
+				}
+				return b
+			})
+		}, 0, "part 1 has content but its root section has no span"},
+
+		// The unit self-check: a root span over the whole part is the service's own measure of
+		// the part's content, which must be the gateway's.
+		rootSpansCase("root span longer than the content", `[{"offset":0,"length":159}]`,
+			"part 1: the root section spans 159 textElements, but the content is 158 long: "+
+				"the service counts textElements differently from the gateway"),
+		{"root span shorter than the content, in code points", func(t *testing.T) []merge.Part {
+			opts := docgen.Options{Unit: textunit.UnicodeCodePoint}
+			var parts []merge.Part
+			for i, pages := range two {
+				b := docgen.DI(pages, docgen.Local, opts)
+				if i == 1 {
+					b = withRootSpans(t, b, func(n int) string {
+						return fmt.Sprintf(`[{"offset":0,"length":%d}]`, n-1)
+					})
+				}
+				parts = append(parts, writePart(t, b, pages, false))
+			}
+			return parts
+		}, textunit.UnicodeCodePoint, "the service counts unicodeCodePoint differently from the gateway"},
+		rootSpansCase("root span reaching past the content", `[{"offset":1,"length":158}]`,
+			"part 1: the root section's spans reach 159 textElements, past the content's 158: "+
+				"the service counts textElements differently from the gateway"),
+
+		// Member names are written as the merge read them, so one written with an escape would
+		// come out spelt differently. The service never escapes a name.
+		{"empty first part's root has no span, a later one's has", func(t *testing.T) []merge.Part {
+			blank := []byte(`{"apiVersion":"2024-11-30","modelId":"prebuilt-layout","stringIndexType":"textElements",` +
+				`"content":"","pages":[{"pageNumber":1,"spans":[{"offset":0,"length":0}]}],` +
+				`"sections":[{"elements":[]}],"contentFormat":"text"}`)
+			return []merge.Part{
+				writePart(t, blank, []int{1}, false),
+				writePart(t, docgen.DI([]int{2, 3}, docgen.Local, docgen.Options{}), []int{2, 3}, false),
+			}
+		}, 0, "part 0's root section has no span to start the merged root's, but part 1's has"},
+
+		{"escaped member name in a later part", func(t *testing.T) []merge.Part {
+			return diParts(t, two, func(i int, b []byte) []byte {
+				if i == 1 {
+					return replace(t, b, `"apiVersion"`, `"\u0061piVersion"`)
+				}
+				return b
+			})
+		}, 0, `part 1: member name "apiVersion" is written with an escape`},
+		{"escaped member name in the first part", func(t *testing.T) []merge.Part {
+			return diParts(t, two, func(i int, b []byte) []byte {
+				if i == 0 {
+					return replace(t, b, `"modelId"`, `"model\u0049d"`)
+				}
+				return b
+			})
+		}, 0, `part 0: member name "modelId" is written with an escape`},
+		{"escaped root section member name", func(t *testing.T) []merge.Part {
+			return diParts(t, two, func(i int, b []byte) []byte {
+				if i == 1 {
+					return replace(t, b, `"sections":[{"spans"`, `"sections":[{"\u0073pans"`)
+				}
+				return b
+			})
+		}, 0, `part 1: root section member name "spans" is written with an escape`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -333,6 +450,33 @@ func withoutSections(t *testing.T, b []byte) []byte {
 		t.Fatal("test bug: no sections member")
 	}
 	return append(append([]byte(nil), b[:i]...), b[j:]...)
+}
+
+// rootSpan is the root section's spans member as docgen writes it.
+var rootSpan = regexp.MustCompile(`"sections":\[\{"spans":\[\{"offset":0,"length":(\d+)\}\],`)
+
+// withRootSpans replaces the root section's spans in a docgen result with spans(n), where n is
+// the length of the root's one span as docgen wrote it.
+func withRootSpans(t *testing.T, b []byte, spans func(n int) string) []byte {
+	t.Helper()
+	m := rootSpan.FindSubmatch(b)
+	if m == nil {
+		t.Fatal("test bug: no root span")
+	}
+	n, err := strconv.Atoi(string(m[1]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rootSpan.ReplaceAllLiteral(b, []byte(`"sections":[{"spans":`+spans(n)+`,`))
+}
+
+// withoutRootSpans drops the root section's spans member from a docgen result.
+func withoutRootSpans(t *testing.T, b []byte) []byte {
+	t.Helper()
+	if !rootSpan.Match(b) {
+		t.Fatal("test bug: no root span")
+	}
+	return rootSpan.ReplaceAllLiteral(b, []byte(`"sections":[{`))
 }
 
 // rootSpansLast moves the root section's spans after its elements in a docgen result.
@@ -418,6 +562,14 @@ func TestReadChecks(t *testing.T) {
 				return b
 			})
 		}, `part 1: readResults[0].page is "1", not a page number`},
+		{"escaped member name", func(t *testing.T) []merge.Part {
+			return read(t, two, func(i int, b []byte) []byte {
+				if i == 1 {
+					return replace(t, b, `"version"`, `"\u0076ersion"`)
+				}
+				return b
+			})
+		}, `part 1: member name "version" is written with an escape`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := merge.Read(io.Discard, tc.parts(t))
@@ -676,13 +828,9 @@ func TestPartWithoutSectionsContributesNothing(t *testing.T) {
 // TestRootMembersKeepEveryPartsOrder: the merged root section's members follow the same rule as
 // the result's: a member only a later part's root has keeps its place in that root's order.
 func TestRootMembersKeepEveryPartsOrder(t *testing.T) {
-	noSpans := regexp.MustCompile(`"sections":\[\{"spans":\[[^\]]*\],`)
 	parts := diParts(t, [][]int{{1, 2, 3}, {4, 5, 6}}, func(i int, b []byte) []byte {
-		if i == 0 {
-			if !noSpans.Match(b) {
-				t.Fatal("test bug: no root spans")
-			}
-			return noSpans.ReplaceAll(b, []byte(`"sections":[{`))
+		if i == 1 {
+			return replace(t, b, `}],"elements":["/sections/1"`, `}],"x":{"role":"r"},"elements":["/sections/1"`)
 		}
 		return b
 	})
@@ -694,8 +842,97 @@ func TestRootMembersKeepEveryPartsOrder(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &r); err != nil {
 		t.Fatal(err)
 	}
-	if order := memberOrder(t, r.Sections[0]); order != "spans elements" {
-		t.Errorf("root section members %q, want %q", order, "spans elements")
+	if order := memberOrder(t, r.Sections[0]); order != "spans x elements" {
+		t.Errorf("root section members %q, want %q", order, "spans x elements")
+	}
+}
+
+// TestRootOfSeveralSpans: a root whose spans are not one span over the whole part says nothing
+// about how the service counts, so it is not self-checked; the merged root still runs from part
+// 0's root start to the last root's end.
+func TestRootOfSeveralSpans(t *testing.T) {
+	runs := [][]int{{1, 2, 3}, {4, 5, 6}}
+	whole := docgen.DI(pageRange(1, 6), docgen.Original, docgen.Options{})
+	total := textunit.Len(decodedContent(t, whole), textunit.TextElements)
+	for _, tc := range []struct {
+		name  string
+		part  int
+		spans func(n int) string
+		want  string // the merged root's spans
+	}{
+		{"later root in two spans", 1, func(n int) string {
+			return fmt.Sprintf(`[ {"length":100, "offset":0}, {"offset":100,"length":%d} ]`, n-100)
+		}, fmt.Sprintf(`[{"offset":0,"length":%d}]`, total)},
+		{"first root starting late", 0, func(n int) string {
+			return fmt.Sprintf(`[{"offset":2,"length":%d}]`, n-2)
+		}, fmt.Sprintf(`[{"offset":2,"length":%d}]`, total-2)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parts := diParts(t, runs, func(i int, b []byte) []byte {
+				if i == tc.part {
+					return withRootSpans(t, b, tc.spans)
+				}
+				return b
+			})
+			var out bytes.Buffer
+			if _, err := merge.DI(&out, parts, 0); err != nil {
+				t.Fatal(err)
+			}
+			want := withRootSpans(t, whole, func(int) string { return tc.want })
+			sameBytes(t, out.Bytes(), want)
+		})
+	}
+}
+
+// decodedContent is a result's content, decoded.
+func decodedContent(t *testing.T, b []byte) string {
+	t.Helper()
+	var r struct{ Content string }
+	if err := json.Unmarshal(b, &r); err != nil {
+		t.Fatal(err)
+	}
+	return r.Content
+}
+
+// TestUnitSelfCheckCatchesGraphemeRuleChanges is the case the unit self-check exists for. Unicode
+// 15.1 made a Devanagari conjunct (consonant, virama, consonant) one extended grapheme cluster
+// (rule GB9c); uniseg implements Unicode 15.0, which counts two. A service on a newer runtime
+// therefore measures such text shorter than the gateway does, and every offset shifted past it
+// would be off by one per conjunct. The root span over the whole part is the service's own
+// measure of the part's content, so a disagreement there is caught before anything is shifted.
+func TestUnitSelfCheckCatchesGraphemeRuleChanges(t *testing.T) {
+	const text = "क्षत्रिय नमस्ते" // three conjuncts: क्ष, त्र and स्त
+	part := func(page, rootLength int) []byte {
+		return []byte(fmt.Sprintf(`{"apiVersion":"2024-11-30","modelId":"prebuilt-layout",`+
+			`"stringIndexType":"textElements","content":%q,`+
+			`"pages":[{"pageNumber":%d,"spans":[{"offset":0,"length":%d}]}],`+
+			`"sections":[{"spans":[{"offset":0,"length":%d}],"elements":[]}],"contentFormat":"text"}`,
+			text, page, rootLength, rootLength))
+	}
+	gateway := textunit.Len(text, textunit.TextElements)
+	service := gateway - 3 // as a runtime with GB9c counts it
+	for _, tc := range []struct {
+		name   string
+		length int
+		ok     bool
+	}{
+		{"counted as the gateway counts", gateway, true},
+		{"counted with GB9c", service, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parts := []merge.Part{
+				writePart(t, part(1, tc.length), []int{1}, false),
+				writePart(t, part(1, tc.length), []int{2}, false),
+			}
+			_, err := merge.DI(io.Discard, parts, textunit.TextElements)
+			if tc.ok && err != nil {
+				t.Fatalf("err = %v, want the parts merged", err)
+			}
+			if !tc.ok && (!errors.Is(err, merge.ErrCheck) ||
+				!strings.Contains(err.Error(), "the service counts textElements differently")) {
+				t.Fatalf("err = %v, want ErrCheck for a unit the service counts differently", err)
+			}
+		})
 	}
 }
 

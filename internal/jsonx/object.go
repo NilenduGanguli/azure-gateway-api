@@ -1,6 +1,7 @@
 package jsonx
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 )
@@ -10,6 +11,10 @@ type Member struct {
 	Name       string
 	Start, End int64
 	Items      int // the number of items if the value is an array, or -1
+
+	// Escaped reports that the name was written with a backslash escape, so its raw bytes are
+	// not Name's. A caller that writes names back out cannot reproduce the original from Name.
+	Escaped bool
 }
 
 // Members lists the top-level members of the object occupying ra[start:end], in order.
@@ -65,6 +70,7 @@ func VisitMembers(
 		if err != nil {
 			return nil, err
 		}
+		escaped := bytes.IndexByte(w.name, '\\') >= 0 // w.name holds the name as written
 		if c, err = w.skipSpace(); err != nil {
 			return nil, err
 		}
@@ -93,7 +99,7 @@ func VisitMembers(
 			return nil, err
 		}
 		members = append(members,
-			Member{Name: name, Start: valueStart, End: w.offset(), Items: items})
+			Member{Name: name, Start: valueStart, End: w.offset(), Items: items, Escaped: escaped})
 
 		if c, err = w.skipSpace(); err != nil {
 			return nil, err

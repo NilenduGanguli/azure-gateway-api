@@ -65,6 +65,8 @@ func TestReadRootRefusesMalformedSections(t *testing.T) {
 		{`[{"spans":[],"spans":[]}]`, `the root section has "spans" twice`},
 		{`[{"spans":[]} x]`, "no comma after the root section"},
 		{`[{"spans":[]}  `, "sections ends after the root section"},
+		{`[{"sp\u0061ns":[]}]`, `part 2: root section member name "spans" is written with an escape`},
+		{`[{"a\/b":[]}]`, `part 2: root section member name "a/b" is written with an escape`},
 	} {
 		b := []byte(tc.in)
 		_, err := readRoot(2, bytes.NewReader(b), sectionsMember(b))
@@ -78,5 +80,32 @@ func TestReadRootRefusesMalformedSections(t *testing.T) {
 		if err != nil || r.rest != -1 {
 			t.Errorf("%q: root %+v, err %v; want a root and nothing after it", in, r, err)
 		}
+	}
+}
+
+// TestReadRootKeepsRawValues: the root's members are kept as their exact bytes, whitespace inside
+// a value included, so that what the merge copies from the root is what the service wrote.
+func TestReadRootKeepsRawValues(t *testing.T) {
+	b := []byte(`[ { "spans" : [ {"offset":0, "length":5} ] ,` + "\n" +
+		`"naïve":"\u00e9", "elements":["/sections/1"] } , {}]`)
+	r, err := readRoot(0, bytes.NewReader(b), sectionsMember(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"spans":    `[ {"offset":0, "length":5} ]`,
+		"naïve":    `"\u00e9"`,
+		"elements": `["/sections/1"]`,
+	}
+	if got := strings.Join(r.keys, " "); got != "spans naïve elements" {
+		t.Fatalf("keys %q", got)
+	}
+	for key, w := range want {
+		if v, _ := r.get(key); string(v) != w {
+			t.Errorf("%s = %s, want %s", key, v, w)
+		}
+	}
+	if r.rest != int64(bytes.LastIndexByte(b, ',')+1) {
+		t.Errorf("rest at %d, want just after the comma", r.rest)
 	}
 }

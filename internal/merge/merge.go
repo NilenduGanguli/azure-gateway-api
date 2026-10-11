@@ -19,12 +19,14 @@
 //
 // Before writing anything the merge checks that the parts can be merged exactly: same API
 // version, model, unit and content format; non-array members identical; member orders that do
-// not contradict each other; the pages returned covering the planned pages once each, in order;
-// sections in every part with content, or in none. References that can only be judged in place —
-// a pointer past its part's items, a region on a page outside its part, an offset that is not an
-// integer — are checked as they are copied. A failure wraps ErrCheck, and the caller discards the
-// output and analyses the whole document instead, so a split never produces a result the service
-// would not.
+// not contradict each other; member names written without escapes, so that they can be written
+// back byte for byte; the pages returned covering the planned pages once each, in order;
+// sections in every part with content, or in none; root section spans that are exactly offsets
+// and lengths within their part's content and, where one spans a whole part, measure it in the
+// unit as the gateway does. References that can only be judged in place — a pointer past its
+// part's items, a region on a page outside its part, an offset that is not an integer — are
+// checked as they are copied. A failure wraps ErrCheck, and the caller discards the output and
+// analyses the whole document instead, so a split never produces a result the service would not.
 package merge
 
 import (
@@ -150,6 +152,10 @@ type merger struct {
 	sep   []byte          // the raw page separator between parts' content
 	stats Stats
 
+	// Document Intelligence only: the parts with sections, and their root sections, in order.
+	with  []*part
+	roots []*root
+
 	// Reused across parts so that measuring hundreds of them allocates nothing per part.
 	cmpA, cmpB []byte
 	content    []byte
@@ -249,24 +255,17 @@ func (m *merger) write(w io.Writer) error {
 	return nil
 }
 
-// writeName writes a member name as a JSON string. Names in these results are plain identifiers;
-// only what JSON requires is escaped.
+// writeName writes a member name, of the result or of its root section, exactly as the service
+// wrote it.
+//
+// The merge keeps names decoded, and re-encoding a decoded name need not give back its original
+// bytes: "\u0061" would come out as "a". So the checks refuse any name written with an escape
+// (the service writes none), and a JSON string without one holds no quote, backslash or control
+// character — nothing that needs escaping. Its decoded bytes are then its raw bytes, and writing
+// them between quotes copies the name.
 func writeName(bw *bufio.Writer, name string) {
-	const hex = "0123456789abcdef"
 	bw.WriteByte('"')
-	for i := 0; i < len(name); i++ {
-		switch c := name[i]; {
-		case c == '"' || c == '\\':
-			bw.WriteByte('\\')
-			bw.WriteByte(c)
-		case c < 0x20:
-			bw.WriteString(`\u00`)
-			bw.WriteByte(hex[c>>4])
-			bw.WriteByte(hex[c&0xf])
-		default:
-			bw.WriteByte(c)
-		}
-	}
+	bw.WriteString(name)
 	bw.WriteByte('"')
 }
 

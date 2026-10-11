@@ -78,6 +78,9 @@ func (m *merger) measurePart(p *part, f, f0 io.ReaderAt) error {
 	p.isArray = make([]bool, len(members))
 	p.counts = map[string]int{}
 	for i, mb := range members {
+		if mb.Escaped {
+			return checkf("part %d: member name %q is written with an escape", p.k, mb.Name)
+		}
 		for _, prev := range members[:i] {
 			if prev.Name == mb.Name {
 				return checkf("part %d: member %q appears twice", p.k, mb.Name)
