@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"fmt"
 	"io/fs"
@@ -143,7 +144,9 @@ func schemaOf(t *testing.T, db *sql.DB) []schemaObject {
 	return out
 }
 
-// backups lists the pre-migration copies in dir.
+// backups lists every file in dir named like a backup: the copies migrate takes, any partial copy,
+// and whatever an operator saved alongside them. It is deliberately broader than what migrate
+// manages, so a test sees anything left behind.
 func backups(t *testing.T, dir string) []string {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
@@ -152,7 +155,7 @@ func backups(t *testing.T, dir string) []string {
 	}
 	var out []string
 	for _, e := range entries {
-		if ok, _ := filepath.Match(dbName+".v*.bak", e.Name()); ok {
+		if strings.HasPrefix(e.Name(), dbName+".v") {
 			out = append(out, filepath.Join(dir, e.Name()))
 		}
 	}
@@ -247,17 +250,18 @@ func currentVolume(t *testing.T, dir string) string {
 
 // startingState is a volume a new migration can meet in service.
 type startingState struct {
-	name  string
-	build func(t *testing.T, dir string) string // leaves a closed volume holding one job
-	from  int                                   // the version Open reports migrating from
-	stamp int                                   // user_version on disk before migrating
+	name   string
+	build  func(t *testing.T, dir string) string // leaves a closed volume holding one job
+	from   int                                   // the version Open reports migrating from
+	stamp  int                                   // user_version on disk before migrating
+	legacy bool                                  // whether Open reports a pre-versioning table
 }
 
 func startingStates() []startingState {
 	return []startingState{
-		{"at the newest version", currentVolume, SchemaVersion(), SchemaVersion()},
-		{"from before versioning", legacyVolume, 1, 0},
-		{"from before the prefix column", prePrefixVolume, 1, 0},
+		{"at the newest version", currentVolume, SchemaVersion(), SchemaVersion(), false},
+		{"from before versioning", legacyVolume, 1, 0, true},
+		{"from before the prefix column", prePrefixVolume, 1, 0, true},
 	}
 }
 
@@ -270,8 +274,8 @@ func TestFreshVolumeReachesLatest(t *testing.T) {
 	if got := userVersion(t, s.r); got != SchemaVersion() {
 		t.Errorf("user_version is %d, want %d", got, SchemaVersion())
 	}
-	if r := s.Migration; r.From != 0 || r.To != SchemaVersion() || r.Backup != "" {
-		t.Errorf("report %+v, want From=0 To=%d and no backup", r, SchemaVersion())
+	if r := s.Migration; r.From != 0 || r.To != SchemaVersion() || r.Backup != "" || r.Legacy {
+		t.Errorf("report %+v, want From=0 To=%d, no backup, not legacy", r, SchemaVersion())
 	}
 	if b := backups(t, dir); len(b) != 0 {
 		t.Errorf("a fresh volume was backed up: %v", b)
@@ -289,8 +293,10 @@ func TestLegacyDatabaseIsVersionOne(t *testing.T) {
 	id := legacyVolume(t, dir)
 
 	s := openVolume(t, dir)
-	if r := s.Migration; r.From != 1 || r.To != SchemaVersion() {
-		t.Errorf("report %+v, want From=1 To=%d", r, SchemaVersion())
+	// From and To are equal while 0001 is the only migration, but a stamp was written: Legacy is
+	// what tells the startup log line so.
+	if r := s.Migration; r.From != 1 || r.To != SchemaVersion() || !r.Legacy {
+		t.Errorf("report %+v, want From=1 To=%d and legacy", r, SchemaVersion())
 	}
 	if got := userVersion(t, s.r); got != SchemaVersion() {
 		t.Errorf("user_version is %d, want %d", got, SchemaVersion())
@@ -361,8 +367,8 @@ func TestEqualVersionDoesNoWrites(t *testing.T) {
 	if n := walSize(t, dir); n > 0 {
 		t.Errorf("the equal-version start wrote %d bytes of WAL", n)
 	}
-	if r := s.Migration; r.From != r.To || r.To != SchemaVersion() || r.Backup != "" {
-		t.Errorf("report %+v, want From=To=%d and no backup", r, SchemaVersion())
+	if r := s.Migration; r.From != r.To || r.To != SchemaVersion() || r.Backup != "" || r.Legacy {
+		t.Errorf("report %+v, want From=To=%d, no backup, not legacy", r, SchemaVersion())
 	}
 	if got := userVersion(t, s.r); got != SchemaVersion() {
 		t.Errorf("user_version is %d, want %d", got, SchemaVersion())
@@ -416,12 +422,21 @@ func TestNewerSchemaIsRefused(t *testing.T) {
 // added to complete a legacy table, so the gateway refuses to start on a database still exactly at
 // its old version, not one stranded between two.
 func TestFailedMigrationRollsBack(t *testing.T) {
-	for _, st := range startingStates() {
+	// A fresh volume runs 0001 in the same transaction as the failing migration, so it must end
+	// with no jobs table at all rather than a half-built schema stamped as nothing.
+	fresh := startingState{name: "on a fresh volume",
+		build: func(*testing.T, string) string { return "" }}
+	for _, st := range append(startingStates(), fresh) {
 		t.Run(st.name, func(t *testing.T) {
 			dir := t.TempDir()
 			id := st.build(t, dir)
-			db := rawDB(t, filepath.Join(dir, dbName))
-			want := schemaOf(t, db)
+			path := filepath.Join(dir, dbName)
+			var want []schemaObject
+			if id != "" {
+				before := rawDB(t, path)
+				want = schemaOf(t, before)
+				_ = before.Close()
+			}
 
 			// Two statements that succeed, then one that cannot, so the rollback has real work.
 			bad := nextMigration("broken", "CREATE TABLE extra (x INTEGER);\n"+
@@ -438,6 +453,7 @@ func TestFailedMigrationRollsBack(t *testing.T) {
 				t.Errorf("error %q does not name the failing migration %s", err, bad.name)
 			}
 
+			db := rawDB(t, path)
 			if got := userVersion(t, db); got != st.stamp {
 				t.Errorf("user_version is %d, want it left at %d", got, st.stamp)
 			}
@@ -445,7 +461,11 @@ func TestFailedMigrationRollsBack(t *testing.T) {
 				t.Errorf("the failed migration changed the schema:\nbefore %+v\nafter  %+v",
 					want, got)
 			}
-			if jobCount(t, db, id) != 1 {
+			if id == "" {
+				if hasTable(t, db, "jobs") {
+					t.Error("a fresh volume kept a jobs table from a migration that failed")
+				}
+			} else if jobCount(t, db, id) != 1 {
 				t.Error("the job row did not survive the failed migration")
 			}
 			// A transaction left open by the failed Open would still hold the write lock, and with
@@ -459,7 +479,8 @@ func TestFailedMigrationRollsBack(t *testing.T) {
 
 // TestBackupTakenBeforeMigrating checks the copy an operator restores after rolling an image back:
 // it must be a valid database holding the data and version from before the migration ran. Copies
-// from earlier migrations are replaced, not accumulated.
+// from earlier migrations are replaced, not accumulated, and a copy the operator made is left
+// alone however it is named.
 func TestBackupTakenBeforeMigrating(t *testing.T) {
 	for _, st := range startingStates() {
 		t.Run(st.name, func(t *testing.T) {
@@ -467,21 +488,34 @@ func TestBackupTakenBeforeMigrating(t *testing.T) {
 			id := st.build(t, dir)
 
 			// One stale copy shares the new backup's name, which VACUUM INTO refuses to overwrite.
-			for _, v := range []int{st.from, 42} {
-				if err := os.WriteFile(backupPath(dir, v), []byte("stale"), 0o600); err != nil {
+			stale := []string{backupPath(dir, st.from), backupPath(dir, 42),
+				backupPath(dir, st.from) + ".partial"}
+			for _, p := range stale {
+				if err := os.WriteFile(p, []byte("stale"), 0o600); err != nil {
 					t.Fatalf("seed stale backup: %v", err)
 				}
+			}
+			operator := filepath.Join(dir, dbName+".v1-before-upgrade.bak")
+			if err := os.WriteFile(operator, []byte("operator's own copy"), 0o600); err != nil {
+				t.Fatalf("seed operator copy: %v", err)
 			}
 			next := nextMigration("extra", "CREATE TABLE extra (x INTEGER);\n")
 			withMigration(t, next)
 
 			s := openVolume(t, dir)
 			bak := backupPath(dir, st.from)
-			if r := s.Migration; r.From != st.from || r.To != next.version || r.Backup != bak {
-				t.Errorf("report %+v, want From=%d To=%d Backup=%s", r, st.from, next.version, bak)
+			if r := s.Migration; r.From != st.from || r.To != next.version || r.Backup != bak ||
+				r.Legacy != st.legacy {
+				t.Errorf("report %+v, want From=%d To=%d Backup=%s Legacy=%v",
+					r, st.from, next.version, bak, st.legacy)
 			}
-			if got := backups(t, dir); !slices.Equal(got, []string{bak}) {
-				t.Errorf("backups on the volume are %v, want only %s", got, bak)
+			want := []string{bak, operator}
+			slices.Sort(want)
+			if got := backups(t, dir); !slices.Equal(got, want) {
+				t.Errorf("backup files on the volume are %v, want %v", got, want)
+			}
+			if body, err := os.ReadFile(operator); err != nil || string(body) != "operator's own copy" {
+				t.Errorf("the operator's copy changed: %q, %v", body, err)
 			}
 
 			old := rawDB(t, bak)
@@ -512,35 +546,182 @@ func TestBackupTakenBeforeMigrating(t *testing.T) {
 	}
 }
 
-// TestSchemaFromScratchEqualsMigrated is the rule every schema change answers to. A fresh volume
-// runs every migration from nothing; a volume in service since before versioning starts from the
-// frozen version-1 fixture. Both must end with the same schema, which fails the moment a released
-// migration is edited instead of a new one being added.
+// TestSchemaFromScratchEqualsMigrated checks that every migration after 0001 does the same thing
+// to a volume in service since before versioning as to a fresh one. A fresh volume runs every
+// migration from nothing; the legacy one starts from the frozen version-1 fixture. Both must end
+// with the same schema, compared by stored CREATE text. That also catches an in-place edit of
+// 0001, which the fixture would no longer match; edits to any other released migration are
+// TestReleasedMigrationsAreUnchanged's to catch.
 //
-// This compares the stored CREATE text itself. TestPrePrefixLegacyTableIsCompleted makes the same
-// comparison from the pre-prefix fixture, by column set for the jobs table, because the ADD COLUMN
-// that completes that table rewrites its text.
+// TestPrePrefixLegacyTableIsCompleted makes the same comparison from the pre-prefix fixture, by
+// column set for the jobs table, because the ADD COLUMN that completes that table rewrites its
+// text.
 func TestSchemaFromScratchEqualsMigrated(t *testing.T) {
 	fresh := schemaOf(t, openVolume(t, t.TempDir()).r)
-
-	dir := t.TempDir()
-	legacyVolume(t, dir)
-	migrated := schemaOf(t, openVolume(t, dir).r)
-
 	if len(fresh) == 0 {
 		t.Fatal("a fresh volume has no schema at all")
 	}
-	for i := range max(len(fresh), len(migrated)) {
-		var f, m schemaObject
-		if i < len(fresh) {
-			f = fresh[i]
+
+	// Before versioning, CREATE TABLE and its indexes ran as separate autocommit statements, so a
+	// crash between them could leave an index missing. Completing the legacy table restores it.
+	lostIndex := strings.Replace(legacySchema,
+		"CREATE INDEX IF NOT EXISTS jobs_expiry  ON jobs(expires_at);\n", "", 1)
+	if lostIndex == legacySchema {
+		t.Fatal("the lost-index fixture still creates jobs_expiry")
+	}
+	for _, tt := range []struct{ name, schema string }{
+		{"version-1 fixture", legacySchema},
+		{"version-1 fixture that lost an index", lostIndex},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			legacyVolumeWith(t, dir, tt.schema)
+			migrated := schemaOf(t, openVolume(t, dir).r)
+			for i := range max(len(fresh), len(migrated)) {
+				var f, m schemaObject
+				if i < len(fresh) {
+					f = fresh[i]
+				}
+				if i < len(migrated) {
+					m = migrated[i]
+				}
+				if f != m {
+					t.Errorf("schema object %d differs:\nfresh    %+v\nmigrated %+v", i, f, m)
+				}
+			}
+		})
+	}
+}
+
+// TestReleasedMigrationsAreUnchanged pins every migration that has shipped. A released file has
+// already run on volumes in service, so editing it changes nothing there and only makes fresh
+// volumes differ from old ones; a schema change must be a new file instead. Each release adds its
+// file's hash here.
+func TestReleasedMigrationsAreUnchanged(t *testing.T) {
+	released := map[string]string{
+		"0001_initial.sql": "de6eedb8ab8389d825f538658c3382eeeb905bc6cd0a4d60902af11ce10663eb",
+	}
+	for name, want := range released {
+		body, err := fs.ReadFile(migrationFS, "migrations/"+name)
+		if err != nil {
+			t.Errorf("released migration %s is gone: %v", name, err)
+			continue
 		}
-		if i < len(migrated) {
-			m = migrated[i]
+		if got := fmt.Sprintf("%x", sha256.Sum256(body)); got != want {
+			t.Errorf("released migration %s was edited: sha256 %s, want %s; add a new migration "+
+				"instead", name, got, want)
 		}
-		if f != m {
-			t.Errorf("schema object %d differs:\nfresh    %+v\nmigrated %+v", i, f, m)
-		}
+	}
+}
+
+// TestInterruptedBackupIsCleared covers a pod killed, or a node losing power, partway through the
+// pre-migration copy. Whatever VACUUM INTO had written by then is a valid SQLite file: a copy cut
+// short early has no pages at all, passes quick_check, and reads as an empty database. Restored as
+// gateway.db it would pass for a fresh volume and every job would be gone, so such a file must
+// never carry a backup's name, and the next start must clear it away.
+func TestInterruptedBackupIsCleared(t *testing.T) {
+	dir := t.TempDir()
+	id := currentVolume(t, dir)
+	base := SchemaVersion()
+	partial := backupPath(dir, base) + ".partial"
+	if err := os.WriteFile(partial, nil, 0o600); err != nil {
+		t.Fatalf("seed interrupted copy: %v", err)
+	}
+	// What makes the debris dangerous: SQLite accepts it as a sound, empty database.
+	debris := rawDB(t, partial)
+	var check string
+	if err := debris.QueryRow(`PRAGMA quick_check`).Scan(&check); err != nil || check != "ok" {
+		t.Fatalf("the seeded copy is not the valid-looking file a cut-short copy is: %q, %v",
+			check, err)
+	}
+	if len(schemaOf(t, debris)) != 0 {
+		t.Fatal("the seeded copy is not empty")
+	}
+	_ = debris.Close()
+
+	withMigration(t, nextMigration("extra", "CREATE TABLE extra (x INTEGER);\n"))
+	s := openVolume(t, dir)
+	bak := backupPath(dir, base)
+	if s.Migration.Backup != bak {
+		t.Errorf("report names backup %q, want %s", s.Migration.Backup, bak)
+	}
+	if got := backups(t, dir); !slices.Equal(got, []string{bak}) {
+		t.Errorf("backup files on the volume are %v, want only %s", got, bak)
+	}
+	if jobCount(t, rawDB(t, bak), id) != 1 {
+		t.Error("the backup is not a full copy of the database")
+	}
+}
+
+// TestBackupAppearsOnlyWhenComplete checks that a copy reaches the backup's name only through the
+// final rename. A copy that cannot be finished, here because a directory sits on its temporary
+// name, must fail the start with nothing under gateway.db.v<N>.bak and the database unchanged.
+func TestBackupAppearsOnlyWhenComplete(t *testing.T) {
+	dir := t.TempDir()
+	currentVolume(t, dir)
+	base := SchemaVersion()
+	blocker := backupPath(dir, base) + ".partial"
+	if err := os.MkdirAll(filepath.Join(blocker, "occupied"), 0o750); err != nil {
+		t.Fatalf("block the temporary name: %v", err)
+	}
+	withMigration(t, nextMigration("extra", "CREATE TABLE extra (x INTEGER);\n"))
+
+	s, err := Open(Options{DataDir: dir, AllowNetworkFS: true})
+	if err == nil {
+		_ = s.Close()
+		t.Fatal("Open succeeded although the backup could not be written")
+	}
+	if _, err := os.Stat(backupPath(dir, base)); !os.IsNotExist(err) {
+		t.Errorf("something appeared under %s although the copy failed: %v",
+			backupPath(dir, base), err)
+	}
+	db := rawDB(t, filepath.Join(dir, dbName))
+	if got := userVersion(t, db); got != base {
+		t.Errorf("user_version is %d, want it left at %d", got, base)
+	}
+	if hasTable(t, db, "extra") {
+		t.Error("the migration ran without a backup")
+	}
+}
+
+// TestVersionChangedBeforeTheLockIsRefused covers two gateways starting on one volume, as a
+// RollingUpdate can briefly run them. Each reads user_version before it takes the write lock, so
+// the one that gets the lock second must notice the other has already migrated, and stop, rather
+// than apply the same migrations again.
+func TestVersionChangedBeforeTheLockIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	currentVolume(t, dir)
+	base := SchemaVersion()
+	next := nextMigration("extra", "CREATE TABLE extra (x INTEGER);\n")
+	withMigration(t, next)
+
+	db := rawDB(t, filepath.Join(dir, dbName))
+	// The other gateway won the race: the version moved on after this one read base.
+	if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, next.version)); err != nil {
+		t.Fatalf("set user_version: %v", err)
+	}
+
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("conn: %v", err)
+	}
+	err = apply(ctx, conn, plan{seen: base, pending: []migration{next}, target: next.version})
+	_ = conn.Close()
+	if err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Fatalf("apply on a version that changed under it returned %v", err)
+	}
+	if !strings.HasPrefix(err.Error(), "store: ") {
+		t.Errorf("error %q is not a store error", err)
+	}
+	if hasTable(t, db, "extra") {
+		t.Error("the migration ran a second time")
+	}
+	if got := userVersion(t, db); got != next.version {
+		t.Errorf("user_version is %d, want the winner's %d", got, next.version)
+	}
+	if _, err := db.Exec(`BEGIN IMMEDIATE; ROLLBACK`); err != nil {
+		t.Errorf("the refused apply left the database locked: %v", err)
 	}
 }
 
@@ -589,8 +770,8 @@ func TestPrePrefixLegacyTableIsCompleted(t *testing.T) {
 	id := prePrefixVolume(t, dir)
 
 	s := openVolume(t, dir)
-	if r := s.Migration; r.From != 1 || r.To != SchemaVersion() {
-		t.Errorf("report %+v, want From=1 To=%d", r, SchemaVersion())
+	if r := s.Migration; r.From != 1 || r.To != SchemaVersion() || !r.Legacy {
+		t.Errorf("report %+v, want From=1 To=%d and legacy", r, SchemaVersion())
 	}
 	if got := userVersion(t, s.r); got != SchemaVersion() {
 		t.Errorf("user_version is %d, want %d", got, SchemaVersion())
@@ -680,6 +861,7 @@ func TestLoadMigrations(t *testing.T) {
 		{"duplicate", []string{"0001_a.sql", "0001_b.sql"}, nil, "0001_a.sql and 0001_b.sql"},
 		{"version zero", []string{"0000_z.sql", "0001_a.sql"}, nil, "0000_z.sql"},
 		{"misnamed", []string{"0001_a.sql", "2_b.sql"}, nil, "2_b.sql"},
+		{"upper-case extension", []string{"0001_a.sql", "0002_b.SQL"}, nil, "0002_b.SQL"},
 		{"empty", nil, nil, "no migrations"},
 	}
 	for _, tt := range tests {

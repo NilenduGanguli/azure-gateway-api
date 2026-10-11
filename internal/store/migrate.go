@@ -26,16 +26,31 @@ import (
 // number is the schema version this binary expects. The version a database is actually at lives in
 // PRAGMA user_version. A file holds plain DDL, every statement ending in ";" at the end of a line;
 // a "--" comment line never ends one. A released file is never edited: each change is a new file,
-// and TestSchemaFromScratchEqualsMigrated fails otherwise.
+// and TestReleasedMigrationsAreUnchanged pins every released file by hash.
+//
+// Every pending file runs inside one transaction, which rules two things out:
+//   - VACUUM cannot run inside a transaction, so a migration must not contain one.
+//   - PRAGMA foreign_keys=OFF does nothing inside a transaction, and the writer runs with
+//     foreign keys on. A table rebuild (create the new table, copy, drop, rename) therefore cannot
+//     switch them off; the schema has no foreign keys today, and one added later must account for
+//     that.
 
 // MigrationReport describes what Open did to the schema, for the startup log line.
 type MigrationReport struct {
-	From, To int           // schema versions before and after; equal when nothing ran
-	Backup   string        // path of the VACUUM INTO copy, "" when none was taken
-	Took     time.Duration // the whole check, backup included
+	// From and To are the schema versions before and after. They are equal when no migration file
+	// ran, which can still mean a write: see Legacy.
+	From, To int
+	// Legacy reports a table from before versioning, completed to version 1 where it fell short
+	// and stamped as such. From is then 1 although user_version was 0.
+	Legacy bool
+	Backup string        // path of the VACUUM INTO copy, "" when none was taken
+	Took   time.Duration // the whole check, backup included
 }
 
-//go:embed migrations/*.sql
+// The whole directory is embedded, not just *.sql, so that a misnamed file such as 0002_x.SQL
+// reaches the name check in loadMigrations and fails startup rather than being silently left out.
+//
+//go:embed migrations
 var migrationFS embed.FS
 
 // migration is one numbered schema change.
@@ -67,10 +82,11 @@ func SchemaVersion() int {
 //     without one is a fresh volume, migrated from nothing and not backed up.
 //  3. A version newer than this binary's is refused, because only the newer image knows what it
 //     means. Rolling an image back after a migration leaves exactly that behind.
-//  4. Otherwise the database is copied with VACUUM INTO, replacing any older copy, and every
-//     pending migration plus the new user_version is applied in one BEGIN IMMEDIATE transaction.
-//     A failure rolls all of it back, and a pod killed partway never commits, so either way the
-//     next start finds the old version intact and tries again.
+//  4. Otherwise the database is copied with VACUUM INTO, replacing any older copy and installed
+//     only once complete, and every pending migration plus the new user_version is applied in one
+//     BEGIN IMMEDIATE transaction, after checking under that lock that the version is still the
+//     one read. A failure rolls all of it back, and a pod killed partway never commits, so either
+//     way the next start finds the old version intact and tries again.
 //  5. It returns a report for the startup log line.
 //
 // All of it runs on one dedicated connection: the transaction is state of a single SQLite
@@ -90,10 +106,11 @@ func migrate(w *sql.DB, dataDir string) (MigrationReport, error) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	var from int
-	if err := conn.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&from); err != nil {
+	var seen int
+	if err := conn.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&seen); err != nil {
 		return MigrationReport{}, fmt.Errorf("store: read schema version: %w", err)
 	}
+	from := seen
 	legacy := false
 	switch {
 	case from == target:
@@ -122,7 +139,7 @@ func migrate(w *sql.DB, dataDir string) (MigrationReport, error) {
 			pending = append(pending, m)
 		}
 	}
-	report := MigrationReport{From: from, To: target}
+	report := MigrationReport{From: from, To: target, Legacy: legacy}
 	// The backup protects data a migration is about to change. A fresh volume holds none yet, and
 	// bringing a pre-versioning database to version 1 touches no row: it stamps the header and at
 	// most adds a column with a default, which leaves every earlier image able to run on it.
@@ -131,7 +148,8 @@ func migrate(w *sql.DB, dataDir string) (MigrationReport, error) {
 			return MigrationReport{}, err
 		}
 	}
-	if err := apply(ctx, conn, legacy, pending, target); err != nil {
+	p := plan{seen: seen, legacy: legacy, pending: pending, target: target}
+	if err := apply(ctx, conn, p); err != nil {
 		return MigrationReport{}, err
 	}
 	report.Took = time.Since(start)
@@ -158,28 +176,38 @@ func backupPath(dataDir string, v int) string {
 // backup copies the database to backupPath(dataDir, from) with VACUUM INTO, which writes one
 // consistent snapshot, WAL content included, as a standalone file.
 //
+// The copy is written under a ".partial" name and renamed into place only once it is complete and
+// fsynced. VACUUM INTO builds its output incrementally, and what it has written when the pod is
+// killed or the node loses power is still a valid SQLite file: a copy cut short early has no pages
+// at all, passes quick_check, and reads as an empty database. Under the backup's own name, an
+// operator restoring it would get a gateway that takes it for a fresh volume and silently drops
+// every job. A rename is atomic, so gateway.db.v<N>.bak is either complete or absent.
+//
 // Only the newest copy is kept. Older ones hold jobs long since expired, and VACUUM INTO refuses to
-// overwrite a file, which a retry at the same version after a failed migration would otherwise hit.
+// overwrite a file, which a leftover partial copy or a retry at the same version would otherwise
+// hit.
 func backup(ctx context.Context, conn *sql.Conn, dataDir string, from int) (_ string, err error) {
 	if err := removeBackups(dataDir); err != nil {
 		return "", err
 	}
 	bak := backupPath(dataDir, from)
+	partial := bak + ".partial"
 	defer func() {
 		if err != nil {
-			// A partial copy must not be left where an operator would take it for a good one.
-			_ = os.Remove(bak)
+			_ = os.Remove(partial)
 		}
 	}()
 	// The path is bound rather than quoted into the SQL, so no DATA_DIR can break out of it.
-	if _, err := conn.ExecContext(ctx, `VACUUM INTO ?`, bak); err != nil {
-		return "", fmt.Errorf("store: back up database to %s: %w", bak, err)
+	if _, err := conn.ExecContext(ctx, `VACUUM INTO ?`, partial); err != nil {
+		return "", fmt.Errorf("store: back up database to %s: %w", partial, err)
 	}
-	// VACUUM INTO does not fsync its output. The migration's COMMIT is durable under
-	// synchronous=FULL, so without this a power loss just after it could leave the only way back to
-	// the old schema incomplete.
-	if err := syncFile(bak); err != nil {
+	// VACUUM INTO does not fsync its output. The content must be on disk before the rename makes it
+	// the backup, and the migration's COMMIT that follows is itself durable under synchronous=FULL.
+	if err := syncFile(partial); err != nil {
 		return "", err
+	}
+	if err := os.Rename(partial, bak); err != nil {
+		return "", fmt.Errorf("store: install backup %s: %w", bak, err)
 	}
 	if err := syncDir(dataDir); err != nil {
 		return "", err
@@ -187,7 +215,13 @@ func backup(ctx context.Context, conn *sql.Conn, dataDir string, from int) (_ st
 	return bak, nil
 }
 
-// removeBackups deletes every earlier pre-migration copy in dataDir, that is gateway.db.v*.bak.
+// backupFile matches exactly the names backup writes: gateway.db.v<N>.bak, and the same with
+// ".partial" while a copy is in progress or after one was cut short. Anything else in DATA_DIR,
+// such as a copy an operator saved as gateway.db.v1-before-upgrade.bak, is theirs and is left
+// alone.
+var backupFile = regexp.MustCompile(`^` + regexp.QuoteMeta(dbName) + `\.v[0-9]+\.bak(\.partial)?$`)
+
+// removeBackups deletes every earlier pre-migration copy in dataDir, complete or partial.
 func removeBackups(dataDir string) error {
 	entries, err := os.ReadDir(dataDir)
 	if err != nil {
@@ -197,7 +231,7 @@ func removeBackups(dataDir string) error {
 		// Names are matched one by one rather than by globbing the joined path, which a DATA_DIR
 		// containing glob metacharacters would make match nothing at all.
 		name := e.Name()
-		if e.IsDir() || !strings.HasPrefix(name, dbName+".v") || !strings.HasSuffix(name, ".bak") {
+		if e.IsDir() || !backupFile.MatchString(name) {
 			continue
 		}
 		err := os.Remove(filepath.Join(dataDir, name))
@@ -225,6 +259,14 @@ func syncFile(name string) error {
 	return nil
 }
 
+// plan is what migrate decided from the version it read before taking the write lock.
+type plan struct {
+	seen    int  // user_version as migrate read it
+	legacy  bool // the database predates versioning
+	pending []migration
+	target  int
+}
+
 // apply runs the pending migrations and stamps the target version, in one transaction. A legacy
 // database has its jobs table completed to version 1 first, in the same transaction, so a failure
 // anywhere leaves that table as it was found too.
@@ -233,8 +275,12 @@ func syncFile(name string) error {
 // waited out, up to busy_timeout, before anything changes. A deferred transaction would take the
 // lock at its first write instead, and in WAL mode that upgrade can fail at once with SQLITE_BUSY,
 // busy_timeout or not.
-func apply(ctx context.Context, conn *sql.Conn, legacy bool, pending []migration,
-	target int) (err error) {
+//
+// The plan was made from a version read before the lock was taken. Two gateways can start on one
+// volume, as a RollingUpdate briefly runs them, and the one that waited for the lock would then
+// apply migrations the other has just committed. So the version is read again under the lock, and
+// any change stops this start; the restart that follows finds the schema current.
+func apply(ctx context.Context, conn *sql.Conn, p plan) (err error) {
 	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
 		return fmt.Errorf("store: begin migration: %w", err)
 	}
@@ -246,12 +292,20 @@ func apply(ctx context.Context, conn *sql.Conn, legacy bool, pending []migration
 			err = fmt.Errorf("%w (the rollback failed too: %w)", err, rbErr)
 		}
 	}()
-	if legacy {
+	var now int
+	if err := conn.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&now); err != nil {
+		return fmt.Errorf("store: re-read schema version: %w", err)
+	}
+	if now != p.seen {
+		return fmt.Errorf("store: schema version changed from v%d to v%d while this gateway was "+
+			"starting; another gateway process is migrating this volume", p.seen, now)
+	}
+	if p.legacy {
 		if err := completeLegacyTable(ctx, conn); err != nil {
 			return err
 		}
 	}
-	for _, m := range pending {
+	for _, m := range p.pending {
 		for i, stmt := range splitStatements(m.sql) {
 			if _, err := conn.ExecContext(ctx, stmt); err != nil {
 				return fmt.Errorf("store: migration %s, statement %d: %w", m.name, i+1, err)
@@ -259,9 +313,9 @@ func apply(ctx context.Context, conn *sql.Conn, legacy bool, pending []migration
 		}
 	}
 	// PRAGMA takes no bound parameters; target is an int, so formatting it in is safe.
-	stamp := fmt.Sprintf(`PRAGMA user_version = %d`, target)
+	stamp := fmt.Sprintf(`PRAGMA user_version = %d`, p.target)
 	if _, err := conn.ExecContext(ctx, stamp); err != nil {
-		return fmt.Errorf("store: set schema version %d: %w", target, err)
+		return fmt.Errorf("store: set schema version %d: %w", p.target, err)
 	}
 	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
 		return fmt.Errorf("store: commit migration: %w", err)
@@ -269,8 +323,8 @@ func apply(ctx context.Context, conn *sql.Conn, legacy bool, pending []migration
 	return nil
 }
 
-// completeLegacyTable brings a jobs table from before versioning to the columns migration 0001
-// declares, so that stamping it version 1 is true.
+// completeLegacyTable brings a jobs table from before versioning to what migration 0001 declares,
+// columns and indexes, so that stamping it version 1 is true.
 //
 // Builds before commit ef625fe created the table without prefix, and CREATE TABLE IF NOT EXISTS
 // never added it afterwards, so on such a volume every insert, which names prefix, fails. Each
@@ -279,7 +333,10 @@ func apply(ctx context.Context, conn *sql.Conn, legacy bool, pending []migration
 // three timestamps, there since the first schema) cannot be added in the form 0001 declares it,
 // and no gateway build ever lacked one, so such a table is refused rather than guessed at.
 //
-// Only the columns are reconciled: the three indexes have been identical in every released schema.
+// The indexes have been identical in every released schema, but pre-versioning gateways created
+// them as separate autocommit statements after the table and re-ran them at every start to make up
+// for a crash in between. 0001 is IF NOT EXISTS throughout, so re-running it here keeps that
+// repair for a volume whose last pre-versioning start was cut short.
 func completeLegacyTable(ctx context.Context, conn *sql.Conn) error {
 	want, err := v1Columns(ctx)
 	if err != nil {
@@ -316,6 +373,13 @@ func completeLegacyTable(ctx context.Context, conn *sql.Conn) error {
 	for _, c := range add {
 		if _, err := conn.ExecContext(ctx, c.addStatement()); err != nil {
 			return fmt.Errorf("store: add column %s to the legacy jobs table: %w", c.name, err)
+		}
+	}
+	v1 := migrations[0] // loadMigrations guarantees the first is version 1
+	for i, stmt := range splitStatements(v1.sql) {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("store: re-run %s on the legacy jobs table, statement %d: %w",
+				v1.name, i+1, err)
 		}
 	}
 	return nil
