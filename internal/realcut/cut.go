@@ -39,27 +39,66 @@ type cutter struct {
 	// sections
 	secContains [][]bool // [section][part]
 	secLocal    []map[int]int
+
+	pageAt map[int]int // page number -> index in pages
+	err    error       // the first thing the cut could not follow; validate should have refused it
 }
 
 func (c *cutter) notef(format string, args ...any) {
 	c.notes = append(c.notes, fmt.Sprintf(format, args...))
 }
 
+// failf records something the cut cannot follow. validate refuses such input up front, so this
+// only guards the lookups that would otherwise index out of range.
+func (c *cutter) failf(format string, args ...any) {
+	if c.err == nil {
+		c.err = malformedf(format, args...)
+	}
+}
+
 // CutDI cuts a whole Document Intelligence analyzeResult (bare or enveloped) into one bare,
 // compact analyzeResult per part of plan, numbered Local (pages 1..k), as Azure would answer if
 // each part's pages had been sent as their own PDF. notes lists every judgement the cut had to
 // make and anything in the input the cut could not place.
+//
+// Input the cut cannot follow — a span past the content or not on a unit of the result's
+// stringIndexType, a region on a page the result does not have, a pointer past its member, a
+// malformed figure id, a plan naming pages the result does not have — is an error wrapping
+// ErrMalformed that names where, never a panic.
 func CutDI(whole []byte, plan [][]int, unit textunit.Unit) (parts [][]byte, notes []string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			parts, err = nil, internalError(r)
+		}
+	}()
 	root, err := Parse(whole)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("%w: %w", ErrMalformed, err)
 	}
 	c := &cutter{r: Bare(root), unit: unit, plan: plan, partOf: map[int]int{}, localOf: map[int]int{},
 		itemPart: map[string][]int{}, itemLocal: map[string][]int{}}
+	if c.r.Kind != Obj {
+		return nil, nil, malformedf("the result is %s, not an object", rawOf(c.r))
+	}
+	if v := c.r.Get("stringIndexType"); v != nil {
+		s, isStr := v.Str()
+		if u, ok := textunit.Parse(s); !ok || !isStr {
+			return nil, nil, malformedf("stringIndexType %s is not a unit", rawOf(v))
+		} else if u != unit {
+			return nil, nil, malformedf("the result counts offsets in %s, but the cut was asked for %s", u, unit)
+		}
+	}
 	if f, ok := c.r.Get("contentFormat").Str(); ok && f == "markdown" {
 		c.markdown = true
 	}
-	if c.t, err = newText(c.r.Get("content").Raw, unit); err != nil {
+	content := c.r.Get("content")
+	if content == nil {
+		return nil, nil, malformedf("the result has no content")
+	}
+	if c.t, err = newText(content.Raw, unit); err != nil {
+		return nil, nil, err
+	}
+	if err := c.validate(); err != nil {
 		return nil, nil, err
 	}
 	for k, pages := range plan {
@@ -76,6 +115,9 @@ func CutDI(whole []byte, plan [][]int, unit textunit.Unit) (parts [][]byte, note
 	for k := range plan {
 		parts = append(parts, Encode(c.part(k)))
 	}
+	if c.err != nil {
+		return nil, c.notes, c.err
+	}
 	return parts, c.notes, nil
 }
 
@@ -87,7 +129,7 @@ func spanOf(s *Node) (int, int) {
 
 // ranges finds each part's content range from its pages' spans.
 func (c *cutter) ranges() error {
-	pages := c.r.Get("pages").Vals
+	pages := c.r.Get("pages").vals()
 	byNum := map[int]*Node{}
 	maxPage := 0
 	for _, p := range pages {
@@ -100,9 +142,9 @@ func (c *cutter) ranges() error {
 		for _, n := range pp {
 			p := byNum[n]
 			if p == nil {
-				return fmt.Errorf("page %d is not in the result", n)
+				return malformedf("page %d is not in the result", n)
 			}
-			for _, s := range p.Get("spans").Vals {
+			for _, s := range p.Get("spans").vals() {
 				o, l := spanOf(s)
 				if lo < 0 || o < lo {
 					lo = o
@@ -111,17 +153,20 @@ func (c *cutter) ranges() error {
 			}
 		}
 		if lo < 0 {
-			return fmt.Errorf("part %d: pages %v have no spans", k, pp)
+			return malformedf("part %d: pages %v have no spans", k, pp)
 		}
 		if c.markdown && pp[len(pp)-1] < maxPage {
 			// A markdown page's span runs to the next page's first element and so holds the
 			// "<!-- PageBreak -->" block; a part analysed alone has no next page. Keep the part's
 			// text up to and including the newline after its last element, as a single-page
 			// markdown result ends (real 1-page results end with exactly one "\n").
-			s := c.t.str(lo, hi)
+			s, err := c.t.str(lo, hi)
+			if err != nil {
+				return fmt.Errorf("part %d: %w", k, err)
+			}
 			i := strings.LastIndex(s, "<!-- PageBreak -->")
 			if i < 0 || strings.Trim(s[i+len("<!-- PageBreak -->"):], "\n") != "" {
-				return fmt.Errorf("part %d: markdown page span does not end with a page break: %q", k, s[max(0, len(s)-40):])
+				return malformedf("part %d: markdown page span does not end with a page break: %q", k, s[max(0, len(s)-40):])
 			}
 			j := i
 			for j > 0 && s[j-1] == '\n' {
@@ -129,21 +174,34 @@ func (c *cutter) ranges() error {
 			}
 			cut := j + 1 // keep one newline
 			c.notef("part %d: markdown: dropped %q from the end of the part's text (the whole document's page-break block)", k, s[cut:])
-			hi = c.unitOfByte(c.t.unitAt[lo] + cut)
+			if hi, err = c.t.unitOf(c.t.unitAt[lo] + cut); err != nil {
+				return fmt.Errorf("part %d: markdown: %w", k, err)
+			}
 		}
 		c.a = append(c.a, lo)
 		c.b = append(c.b, hi)
 	}
 	for k := 1; k < len(c.plan); k++ {
+		if c.b[k-1] > c.a[k] {
+			return malformedf("part %d's text [%d,%d) overlaps part %d's [%d,%d): the plan's parts must follow each other in the content",
+				k-1, c.a[k-1], c.b[k-1], k, c.a[k], c.b[k])
+		}
 		if c.markdown {
 			continue
 		}
-		if gap := c.t.str(c.b[k-1], c.a[k]); gap != "\n" {
+		gap, err := c.t.str(c.b[k-1], c.a[k])
+		if err != nil {
+			return fmt.Errorf("between part %d and %d: %w", k-1, k, err)
+		}
+		if gap != "\n" {
 			c.notef("text: whole content between part %d and %d is %q, not one \\n", k-1, k, gap)
 		}
 	}
 	for k := range c.plan {
-		raw := c.t.str(c.a[k], c.b[k])
+		raw, err := c.t.str(c.a[k], c.b[k])
+		if err != nil {
+			return fmt.Errorf("part %d: %w", k, err)
+		}
 		if n := textunit.Len(raw, c.unit); n != c.b[k]-c.a[k] {
 			c.notef("part %d: content is %d units alone but %d in the whole", k, n, c.b[k]-c.a[k])
 		}
@@ -157,14 +215,6 @@ func (c *cutter) pagePart(p int) int {
 		return k
 	}
 	return -1
-}
-
-func (c *cutter) unitOfByte(off int) int {
-	i, ok := slices.BinarySearch(c.t.unitAt, off)
-	if !ok {
-		panic("cut inside a unit")
-	}
-	return i
 }
 
 // elementPage is the original page an element is on: its first bounding region's.
@@ -235,14 +285,14 @@ func (n *Node) vals() []*Node {
 	return n.Vals
 }
 
-// parsePtr splits "/member/index".
+// parsePtr splits "/member/index": one member name, and a canonical non-negative index.
 func parsePtr(s string) (string, int, bool) {
-	if !strings.HasPrefix(s, "/") {
+	m, i, ok := strings.Cut(strings.TrimPrefix(s, "/"), "/")
+	if !ok || !strings.HasPrefix(s, "/") || m == "" || strings.Contains(i, "/") {
 		return "", 0, false
 	}
-	i := strings.LastIndexByte(s, '/')
-	n, err := strconv.Atoi(s[i+1:])
-	return s[1:i], n, err == nil && i > 0
+	n, ok := index(i)
+	return m, n, ok
 }
 
 // assignSections works out, per part, which sections hold something of the part, and their local
@@ -266,6 +316,10 @@ func (c *cutter) assignSections() {
 				continue
 			}
 			if m == "sections" {
+				if j >= len(secs) {
+					c.failf("sections[%d]: %s points past the %d sections", i, s, len(secs))
+					continue
+				}
 				visit(j)
 				for k := range c.plan {
 					c.secContains[i][k] = c.secContains[i][k] || c.secContains[j][k]
@@ -341,7 +395,11 @@ func (c *cutter) part(k int) *Node {
 		v := c.r.Vals[i]
 		switch key {
 		case "content":
-			out.Set(key, RawStrNode(c.t.rawSlice(a, b)))
+			raw, err := c.t.rawSlice(a, b)
+			if err != nil {
+				c.failf("part %d: content: %v", k, err)
+			}
+			out.Set(key, RawStrNode(raw))
 		case "pages":
 			arr := ArrNode()
 			for _, p := range v.Vals {
@@ -359,6 +417,10 @@ func (c *cutter) part(k int) *Node {
 		case "paragraphs", "tables", "figures", "keyValuePairs":
 			arr := ArrNode()
 			for j, it := range v.Vals {
+				if j >= len(c.itemPart[key]) {
+					c.failf("%s[%d] was not assigned a part", key, j)
+					break
+				}
 				if c.itemPart[key][j] == k {
 					arr.Vals = append(arr.Vals, c.rewrite(it.Clone(), []pe{{key: key}, {idx: true}}, k))
 				}
@@ -397,7 +459,7 @@ func (c *cutter) inPart(ptr string, k int) bool {
 		return false
 	}
 	if m == "sections" {
-		return j < len(c.secContains) && c.secContains[j][k]
+		return j < len(c.secContains) && c.secContains[j] != nil && c.secContains[j][k]
 	}
 	parts := c.itemPart[m]
 	return j < len(parts) && parts[j] == k
@@ -448,6 +510,7 @@ func (c *cutter) sections(k int) *Node {
 type pe struct {
 	key string
 	idx bool
+	i   int // the index, when idx; set only where a path is reported
 }
 
 // rewrite applies to part k the inverse of the merge's renumbering (merge.diVisitor): offsets
@@ -498,6 +561,10 @@ func (c *cutter) scalar(v *Node, path []pe, k int) *Node {
 				}
 				local = l
 			} else {
+				if j >= len(c.itemPart[m]) {
+					c.failf("part %d: pointer %s points past %s", k, s, m)
+					return v
+				}
 				if c.itemPart[m][j] != k {
 					c.notef("part %d: pointer %s to an item in part %d", k, s, c.itemPart[m][j])
 				}
@@ -527,26 +594,34 @@ func (c *cutter) scalar(v *Node, path []pe, k int) *Node {
 	case "id":
 		if n == 3 && path[0].key == "figures" && path[1].idx {
 			s, _ := v.Str()
-			dot := strings.IndexByte(s, '.')
-			p, err := strconv.Atoi(s[:max(dot, 0)])
-			if dot < 0 || err != nil {
-				c.notef("figure id %q is not <page>.<n>", s)
+			p, ok := figurePage(s)
+			if !ok {
+				c.failf("figure id %q is not <page>.<n>", s)
 				return v
 			}
-			return StrNode(strconv.Itoa(c.localOf[p]) + s[dot:])
+			return StrNode(strconv.Itoa(c.localOf[p]) + s[strings.IndexByte(s, '.'):])
 		}
 	}
 	return v
 }
 
-// CutRead cuts a whole Read v3.2 analyzeResult into parts numbered Local.
-func CutRead(whole []byte, plan [][]int) ([][]byte, error) {
+// CutRead cuts a whole Read v3.2 analyzeResult into parts numbered Local. A result whose
+// readResults are not pages numbered once each, or a plan naming pages it does not have, is an
+// error wrapping ErrMalformed, never a panic.
+func CutRead(whole []byte, plan [][]int) (parts [][]byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			parts, err = nil, internalError(r)
+		}
+	}()
 	root, err := Parse(whole)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrMalformed, err)
 	}
 	r := Bare(root)
-	var parts [][]byte
+	if err := validateRead(r, plan); err != nil {
+		return nil, err
+	}
 	for _, pages := range plan {
 		out := ObjNode()
 		for i, key := range r.Keys {
@@ -573,3 +648,28 @@ func CutRead(whole []byte, plan [][]int) ([][]byte, error) {
 
 // Items is n's items, or none for a nil node.
 func Items(n *Node) []*Node { return n.vals() }
+
+// validateRead checks a Read result's readResults and the plan against them.
+func validateRead(r *Node, plan [][]int) error {
+	var p problems
+	if r.Kind != Obj {
+		return malformedf("the result is %s, not an object", rawOf(r))
+	}
+	rr := r.Get("readResults")
+	if rr == nil || rr.Kind != Arr {
+		return malformedf("readResults is %s, not an array", rawOf(rr))
+	}
+	pageAt := map[int]int{}
+	for i, pg := range rr.Vals {
+		n, ok := pg.Get("page").Int()
+		if j, dup := pageAt[n]; ok && dup {
+			p.addf("readResults[%d] and readResults[%d] are both page %d", j, i, n)
+		} else if !ok || n < 1 {
+			p.addf("readResults[%d].page %s is not a page number", i, rawOf(pg.Get("page")))
+		} else {
+			pageAt[n] = i
+		}
+	}
+	checkPlan(plan, func(n int) bool { _, ok := pageAt[n]; return ok }, &p)
+	return p.err()
+}

@@ -9,6 +9,10 @@
 // the sections that hold any of them, clipped to its text. Every judgement and anything the cut
 // could not place is returned as a note, so a test can tell an exact cut from an approximate one.
 //
+// The real-data tests also cut the merge's own output, so a wrong merge is input here. What the
+// cut cannot follow (validate.go) is refused up front with ErrMalformed naming the paths, never a
+// panic: a panic would abort the test binary and hide every test after the one that failed.
+//
 // ojson.go is an order- and byte-preserving JSON tree: scalars keep their raw bytes (number
 // spelling, string escapes), objects keep member order, and Encode writes compact JSON, the way
 // the service writes it.
@@ -65,6 +69,9 @@ func (n *Node) Set(key string, v *Node) {
 
 // Del removes an object member.
 func (n *Node) Del(key string) {
+	if n == nil {
+		return
+	}
 	for i, k := range n.Keys {
 		if k == key {
 			n.Keys = append(n.Keys[:i:i], n.Keys[i+1:]...)
@@ -259,7 +266,7 @@ func (p *parser) value() (*Node, error) {
 	}
 }
 
-// Encode writes n as compact JSON.
+// Encode writes n as compact JSON; a nil node is null.
 func Encode(n *Node) []byte {
 	var b bytes.Buffer
 	enc(&b, n)
@@ -267,6 +274,10 @@ func Encode(n *Node) []byte {
 }
 
 func enc(b *bytes.Buffer, n *Node) {
+	if n == nil {
+		b.WriteString("null")
+		return
+	}
 	switch n.Kind {
 	case Obj:
 		b.WriteByte('{')

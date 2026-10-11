@@ -36,8 +36,12 @@ func realResult(t *testing.T, rel string) []byte {
 	}
 	r := realcut.Bare(n)
 	perPage := map[int]int{}
-	for _, f := range realcut.Items(r.Get("figures")) {
-		page, _ := realcut.Items(f.Get("boundingRegions"))[0].Get("pageNumber").Int()
+	for i, f := range realcut.Items(r.Get("figures")) {
+		regions := realcut.Items(f.Get("boundingRegions"))
+		if len(regions) == 0 {
+			t.Fatalf("%s: figures[%d] has no bounding region", rel, i)
+		}
+		page, _ := regions[0].Get("pageNumber").Int()
 		perPage[page]++
 		if id, _ := f.Get("id").Str(); id == "Sanitized" {
 			f.Set("id", realcut.StrNode(fmt.Sprintf("%d.%d", page, perPage[page])))

@@ -58,8 +58,12 @@ func loadReal(t *testing.T, rel string) (*realcut.Node, []byte) {
 	}
 	r := realcut.Bare(root)
 	perPage := map[int]int{}
-	for _, f := range realcut.Items(r.Get("figures")) {
-		page, _ := realcut.Items(f.Get("boundingRegions"))[0].Get("pageNumber").Int()
+	for i, f := range realcut.Items(r.Get("figures")) {
+		regions := realcut.Items(f.Get("boundingRegions"))
+		if len(regions) == 0 {
+			t.Fatalf("%s: figures[%d] has no bounding region", rel, i)
+		}
+		page, _ := regions[0].Get("pageNumber").Int()
 		perPage[page]++
 		if id, _ := f.Get("id").Str(); id == "Sanitized" {
 			f.Set("id", realcut.StrNode(fmt.Sprintf("%d.%d", page, perPage[page])))
@@ -219,13 +223,19 @@ func TestRealResultsAsParts(t *testing.T) {
 			if err != nil {
 				t.Fatalf("merge refused genuine results: %v", err)
 			}
-			back, _, err := realcut.CutDI(merged, plan, textunit.TextElements)
+			back, notes, err := realcut.CutDI(merged, plan, textunit.TextElements)
 			if err != nil {
-				t.Fatalf("cut back: %v", err)
+				t.Fatalf("the merged result cannot be cut back at its parts' pages: %v\ncut notes: %v", err, notes)
 			}
 			for k, name := range tc.names {
-				want, _ := realcut.Parse(parts[k])
-				got, _ := realcut.Parse(back[k])
+				want, err := realcut.Parse(parts[k])
+				if err != nil {
+					t.Fatalf("part %d (%s): %v", k, name, err)
+				}
+				got, err := realcut.Parse(back[k])
+				if err != nil {
+					t.Fatalf("part %d (%s) cut back from the merge does not parse: %v", k, name, err)
+				}
 				if k == tc.continues {
 					want.Del("sections")
 					got.Del("sections")
@@ -267,13 +277,24 @@ func TestContinuationOfARootOnlyPart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fig, _ := realcut.Parse(parts[0])
-	java, _ := realcut.Parse(parts[1])
+	fig, err := realcut.Parse(parts[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	java, err := realcut.Parse(parts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
 	got, err := realcut.Parse(merged)
 	if err != nil {
 		t.Fatal(err)
 	}
 	figSecs, gotSecs := realcut.Items(fig.Get("sections")), realcut.Items(got.Get("sections"))
+	javaSecs := realcut.Items(java.Get("sections"))
+	if len(figSecs) < 6 || len(javaSecs) == 0 || len(realcut.Items(javaSecs[0].Get("spans"))) == 0 {
+		t.Fatalf("test data: py_layout_figures has %d sections (want 6 or more), java_layout_with_pages %d (want a root with a span)",
+			len(figSecs), len(javaSecs))
+	}
 	if len(gotSecs) != len(figSecs) {
 		t.Fatalf("%d sections, want py_layout_figures's %d", len(gotSecs), len(figSecs))
 	}
@@ -294,7 +315,7 @@ func TestContinuationOfARootOnlyPart(t *testing.T) {
 		s, _ := e.Str()
 		want = append(want, s)
 	}
-	for _, e := range realcut.Items(realcut.Items(java.Get("sections"))[0].Get("elements")) {
+	for _, e := range realcut.Items(javaSecs[0].Get("elements")) {
 		s, _ := e.Str()
 		var member string
 		var i int
@@ -321,7 +342,7 @@ func TestContinuationOfARootOnlyPart(t *testing.T) {
 	// span shifted past the first part's content and the separator.
 	content, _ := fig.Get("content").Str()
 	shift := textunit.Len(content, textunit.TextElements) + 1
-	javaRoot := realcut.Items(realcut.Items(java.Get("sections"))[0].Get("spans"))[0]
+	javaRoot := realcut.Items(javaSecs[0].Get("spans"))[0]
 	jo, _ := javaRoot.Get("offset").Int()
 	jl, _ := javaRoot.Get("length").Int()
 	wantSpans := fmt.Sprintf(`[{"offset":477,"length":819},{"offset":%d,"length":%d}]`, jo+shift, jl)

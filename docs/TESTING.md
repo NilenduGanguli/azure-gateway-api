@@ -25,7 +25,7 @@ at different layers.
 |---|---|---|
 | Unit tests | `internal/<pkg>/*_test.go` | One package at a time: parsing, validation, migrations, the attempt classifier, the scheduler, the splitter, the rewriter, the merge, error rendering. Table-driven. |
 | Round-trip tests | `internal/merge/roundtrip_test.go` | A whole-document result from `docgen`, cut into parts, merged back: **byte for byte** equal, for both surfaces, all three `stringIndexType` units and every `docgen` shape (plain, realistic, 2023-07-31). |
-| Real-data merge tests | `internal/merge/realdata_test.go` | **Genuine** service outputs (`test/azure-reference`), cut by `internal/realcut` at every page boundary and merged back: byte for byte the real whole-document result. |
+| Real-data merge tests | `internal/merge/realdata_test.go` | **Genuine** service outputs (`test/azure-reference`), cut by `internal/realcut` at every page boundary and merged back: byte for byte the real whole-document result. `realcut` checks every span (in the result's `stringIndexType`), region page, pointer and figure id before it cuts, so a merge that writes a wrong offset fails these tests with an `ErrMalformed` naming the path instead of panicking and aborting the package; `internal/realcut/cut_test.go` and its fuzz targets (`FuzzCut`, `FuzzCutFields`) hold it to that. |
 | Azure-shape validation | `internal/azschema`, `test/conformance/azureshape_test.go` | Every analyze response the gateway serves, whole and split, validated against Microsoft's own specs (strictly), the invariants real output keeps, and the member order of real outputs. §10. |
 | Engine tests | `internal/engine/engine_test.go` | The whole/split decision, retries, hedges, halving, re-checks, fallbacks, fairness and cancellation, against the paged fake with real PDFs. |
 | Fakes | `internal/mockazure`, `cmd/fakeazure` | Not tests. HTTP servers that impersonate both containers *including their failure modes and HAProxy's*, and a paged fake that answers per original page. |
@@ -317,6 +317,7 @@ The sync-only and splitting work is mostly new packages, each test-first. What e
 | `internal/jsonx` | `Rewrite` identity over escapes, nested arrays, `-0.0`, `1e-07` and 20-digit integers; targeted replacements change only their bytes; visitor paths; long strings copied unvisited; truncated input and trailing garbage are errors; `ArrayItems`, `Members`, `CountItems`; an allocation bound on a 10 MB input | the merge copies what it does not rewrite byte for byte, in bounded memory |
 | `internal/docgen` | every shape (plain, realistic, 2023-07-31), page set and unit, validated with `internal/azschema` against the spec, the invariants and the real member order; the realistic shape keeps furniture and blank pages out of every section; deterministic bytes; local numbering differs only in page numbers | the reference results the fakes and the round trip use |
 | `internal/azschema` | calibration: every vendored real output passes with no finding; 17 planted departures (an undeclared member, an integer written as a float, a span off by one, pages not joined by one separator, a pointer past its array, members out of the real order, `styles` left out, an empty `figures`, a figure id on the wrong page, a section pointed at twice, Read's `"v3.2"`, a line without `appearance`, …) and 7 envelope cases are each caught by the rule meant to catch them | the validator the shape tests rely on |
+| `internal/realcut` (`cut_test.go`) | a well-formed two-page layout result, a Read result and a UTF-16 result cut cleanly; 46 malformed DI results (a span past, before or inside a surrogate pair of the content, a span that is not `{offset, length}`, a pointer past its member, negative, non-canonical or into a member the cut does not renumber, a region or figure id on a page the result lacks, a figure id that is not `<page>.<n>` or names another page than its first region's, content missing, not a string or with a broken escape, a unit other than the result's, members that are not arrays of objects or appear twice, a plan with no parts, an empty part, a page in two parts or parts out of order) and 8 malformed Read results are each refused with an `ErrMalformed` naming the path, never a panic; `FuzzCut` (any bytes, any plan, every unit) and `FuzzCutFields` (the span, pointer, region page and figure id numbers of a valid result) never reach the `ErrInternal` panic backstop | the cutter the real-data tests trust (§10): a merge that writes a wrong offset fails them with a message instead of aborting the package |
 | `internal/merge` | **round trip**: for `n ∈ {1, 2, 6, 7, 11, 23}`, each unit, each `docgen` shape, parts numbered locally, originally, and mixed, merging `docgen` parts reproduces the whole result **byte for byte**, DI and Read; **real data** (`realdata_test.go`): every vendored real result cut at every set of page boundaries merges back to the original byte for byte, real one-page results merged as parts cut back to themselves, and a section that continues across a cut is folded back into one; every safety check (`stringIndexType` mismatch, missing, duplicated or out-of-order pages, a differing unknown member, contradictory member orders, page spans that disagree with the content's length in the unit, a root that reaches past its part); the markdown separator and its escaping; unknown arrays shifted; a memory bound on a 60 MB result | merge rules of ARCHITECTURE §4.7 |
 | `internal/upstream` (`attempt_test.go`) | the outcome table row by row against `mockazure` and `httptest` edge cases; a 202 is never polled; cancellation wins over a transport error; a new connection per attempt (`ConnState` sees one `StateNew` per attempt); `Backoff` with jitter 0 and 1, `Retry-After` override and caps | sync-only design §1 |
 | `internal/engine` | whole for a 3-page PDF, a JPEG and `urlSource`; split for 23 pages (parts 5,5,5,4,4) equal to `docgen.DI(1..23)`; `pages=3-14`; `base64Source`; `SPLIT_PAGES=0`; a page that always hangs is halved down to itself and fails with a timeout; a first-call hang is hedged and the hedge wins; `FailFirst` retried; bad content re-checked (success when only split; the container's error otherwise); unparseable → whole; a failed merge check → whole; fairness (a 1-page job finishes before a 30-page job's third part); cancellation mid-split returns `context.Canceled`, leaks no goroutine and removes the work folder; Read 12 pages | splitting design §3–§5, §9 |
@@ -604,6 +605,38 @@ The question every other layer answers indirectly — *is this exactly what Azur
 
 Its own tests calibrate it — every real output passes with no finding — and check that planted
 departures are caught (§4).
+
+### The cutter: `internal/realcut` (tests only)
+
+The real outputs are whole documents; the merge needs parts. `realcut` is the merge's inverse: it
+cuts a real result at a plan's pages into what the service would have answered for each part alone
+(local page numbers, offsets from the part's start, pointers into the part's own arrays, figure ids
+on the local page). The real-data tests cut, merge and compare byte for byte, and also cut a
+*merged* result back, so `realcut` reads output the merge wrote.
+
+So it trusts nothing it reads. **Before any cut** it checks every member it follows, in one walk,
+and answers an error wrapping `realcut.ErrMalformed` that spells out up to eight problems by path
+rather than cutting:
+
+- every `span` and `spans[]` element is an integer `{offset, length}` within the content in the
+  result's own `stringIndexType`, starting and ending on a unit (never inside a surrogate pair);
+- every `boundingRegions[].pageNumber` is a page of the result, and pages are numbered once each;
+- every `elements[]` pointer is a canonical `/<member>/<index>` into `paragraphs`, `tables`,
+  `figures`, `keyValuePairs` or `sections`, within that member;
+- every figure id is `<page>.<n>` naming a page of the result, the page of its first region;
+- the members it splits are arrays of objects with no member written twice, the content is a JSON
+  string in the unit the cut was asked for, and the plan's parts are non-empty, name pages the
+  result has once each and follow each other in the content.
+
+The slicing itself is bounds-checked too, and a `recover` in `CutDI` and `CutRead` turns a panic
+that got past all that into `realcut.ErrInternal` with its stack, so one bad cut fails its own test
+instead of aborting the test binary. `cut_test.go` treats `ErrInternal` as a bug, and its fuzz
+targets hold any input to that (§4). In practice: shift every offset one unit too far in
+`merge.shift` and every `internal/merge` test still runs, the real-data ones failing with
+`pages[2].words[239].span {offset 4299, length 1} runs past the end of the content, 4298
+textElements long` — where the same mistake used to panic in the cut and take the rest of the
+package with it. `TestRealOutputThroughTheGateway`'s replay reports a part it cannot cut as a test
+error, and the fake answers that call with a 500.
 
 ### What is validated
 

@@ -21,13 +21,16 @@ func short(b []byte) string {
 	return string(b)
 }
 
-// DiffNodes lists differences between want and got, at most limit of them.
+// DiffNodes lists differences between want and got, at most limit of them. A nil side (a member
+// one result lacks) differs from anything but another nil, and is never dereferenced.
 func DiffNodes(want, got *Node, path string, out *[]Diff, limit int) {
 	if len(*out) >= limit {
 		return
 	}
-	if want.Kind != got.Kind {
-		*out = append(*out, Diff{path, short(Encode(want)), short(Encode(got))})
+	if want == nil || got == nil || want.Kind != got.Kind {
+		if want != nil || got != nil {
+			*out = append(*out, Diff{path, short(Encode(want)), short(Encode(got))})
+		}
 		return
 	}
 	switch want.Kind {
@@ -62,9 +65,24 @@ type MemberReport struct {
 	NDiffs    int    `json:"nDiffs,omitempty"`
 }
 
-// CompareMembers compares want and got (bare analyzeResults) member by member.
+// CompareMembers compares want and got (bare analyzeResults) member by member. A nil or
+// non-object side is reported as one difference, not a panic.
 func CompareMembers(want, got *Node) (bool, []MemberReport, []string, []string) {
 	same := bytes.Equal(Encode(want), Encode(got))
+	if want == nil || got == nil || want.Kind != Obj || got.Kind != Obj {
+		if same {
+			return true, nil, nil, nil
+		}
+		var wk, gk []string
+		if want != nil {
+			wk = want.Keys
+		}
+		if got != nil {
+			gk = got.Keys
+		}
+		return false, []MemberReport{{Member: "(result)", NDiffs: 1,
+			Diffs: []Diff{{Path: "(result)", Want: short(Encode(want)), Got: short(Encode(got))}}}}, wk, gk
+	}
 	var reps []MemberReport
 	for i, k := range want.Keys {
 		g := got.Get(k)

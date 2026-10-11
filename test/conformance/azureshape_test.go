@@ -253,8 +253,12 @@ func realWhole(t *testing.T, rel string) []byte {
 	}
 	r := realcut.Bare(n)
 	perPage := map[int]int{}
-	for _, f := range realcut.Items(r.Get("figures")) {
-		page, _ := realcut.Items(f.Get("boundingRegions"))[0].Get("pageNumber").Int()
+	for i, f := range realcut.Items(r.Get("figures")) {
+		regions := realcut.Items(f.Get("boundingRegions"))
+		if len(regions) == 0 {
+			t.Fatalf("%s: figures[%d] has no bounding region", rel, i)
+		}
+		page, _ := regions[0].Get("pageNumber").Int()
 		perPage[page]++
 		if id, _ := f.Get("id").Str(); id == "Sanitized" {
 			f.Set("id", realcut.StrNode(fmt.Sprintf("%d.%d", page, perPage[page])))
@@ -281,21 +285,26 @@ func TestRealOutputThroughTheGateway(t *testing.T) {
 	} {
 		whole := realWhole(t, tc.rel)
 		di := tc.family == azschema.DocumentIntelligence
-		replay := func(pages []int, _ docgen.Numbering, isDI bool) []byte {
-			if isDI != di {
-				return nil
+		// replay runs on the fake's goroutine: it reports a cut it cannot make with t.Errorf
+		// (safe from any goroutine) and answers nothing, which the fake turns into a 500.
+		replay := func(t *testing.T) func([]int, docgen.Numbering, bool) []byte {
+			return func(pages []int, _ docgen.Numbering, isDI bool) []byte {
+				if isDI != di {
+					return nil
+				}
+				var parts [][]byte
+				var err error
+				if di {
+					parts, _, err = realcut.CutDI(whole, [][]int{pages}, textunit.TextElements)
+				} else {
+					parts, err = realcut.CutRead(whole, [][]int{pages})
+				}
+				if err != nil {
+					t.Errorf("realcut cannot cut pages %v out of %s: %v", pages, tc.rel, err)
+					return nil
+				}
+				return parts[0]
 			}
-			var parts [][]byte
-			var err error
-			if di {
-				parts, _, err = realcut.CutDI(whole, [][]int{pages}, textunit.TextElements)
-			} else {
-				parts, err = realcut.CutRead(whole, [][]int{pages})
-			}
-			if err != nil {
-				return nil
-			}
-			return parts[0]
 		}
 		n, _ := realcut.Parse(whole)
 		pages := len(realcut.Items(n.Get("pages")))
@@ -308,8 +317,8 @@ func TestRealOutputThroughTheGateway(t *testing.T) {
 		for _, split := range []int{0, 1} {
 			t.Run(fmt.Sprintf("%s/split %d", filepath.Base(tc.rel), split), func(t *testing.T) {
 				h := newSplitHarness(t, split, harnessOpts{
-					diPaged:   mockazure.PagedOptions{Replay: replay},
-					readPaged: mockazure.PagedOptions{Replay: replay},
+					diPaged:   mockazure.PagedOptions{Replay: replay(t)},
+					readPaged: mockazure.PagedOptions{Replay: replay(t)},
 				})
 				doc := pdftest.Make(pages)
 				final := h.awaitSucceeded(h.submit(route.submit, doc))
@@ -323,8 +332,12 @@ func TestRealOutputThroughTheGateway(t *testing.T) {
 						t.Errorf("the %s body is not shaped as Azure's:\n  %s", what, showFindings(fs))
 					}
 					if got := analyzeResultOf(t, body); !bytes.Equal(got, whole) {
-						g, _ := realcut.Parse(got)
-						w, _ := realcut.Parse(whole)
+						g, err := realcut.Parse(got)
+						if err != nil {
+							t.Errorf("the %s result does not parse: %v", what, err)
+							continue
+						}
+						w, _ := realcut.Parse(whole) // parsed by realWhole
 						_, members, _, _ := realcut.CompareMembers(w, g)
 						var diffs []string
 						for _, m := range members {

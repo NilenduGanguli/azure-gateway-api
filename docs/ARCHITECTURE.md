@@ -640,6 +640,17 @@ point, page header and footer recognition, a table Azure joins across a page bre
 `gateway probe --compare-split` measures them on real documents, and a rule is added only for what
 it shows (splitting design §6; OPERATIONS §10).
 
+**How the rules are held to real output.** The tests run every rule above backwards with
+`internal/realcut` (tests only), the merge's inverse: a recorded whole-document result is cut into
+the parts the service would have answered, merged, and compared byte for byte, and a merged result
+is cut back into its parts. Because the cutter then reads the merge's own output, it validates
+before it cuts — every span within the content in the result's unit and on a unit boundary, every
+region on a page of the result, every pointer canonical and within its member, every figure id
+`<page>.<n>` on its first region's page, the plan's pages in the result once each — and refuses
+anything else with `realcut.ErrMalformed` naming the paths. A merge that shifts offsets wrongly
+therefore fails the real-data tests with the offending span spelled out, and cannot panic in the
+cut and abort the rest of the merge suite (TESTING §10).
+
 ### 4.8 Engine observability
 
 `engine.Metrics` holds atomic counters and fixed-bucket histograms (buckets 0.25, 0.5, 1, 2, 5,
