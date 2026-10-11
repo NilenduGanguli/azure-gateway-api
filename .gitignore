@@ -11,6 +11,10 @@
 *.db-wal
 *.db-shm
 
+# the real-SDK harness's virtualenv (test/sdk/run.sh creates it on first use)
+/test/sdk/.venv/
+__pycache__/
+
 # go
 *.test
 *.out
