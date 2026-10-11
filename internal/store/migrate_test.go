@@ -65,7 +65,7 @@ var prePrefixSchema = strings.Replace(legacySchema,
 // volume close it earlier themselves, which is safe because Close is idempotent.
 func openVolume(t *testing.T, dir string) *Store {
 	t.Helper()
-	s, err := Open(Options{DataDir: dir, AllowNetworkFS: true})
+	s, err := Open(Options{DataDir: dir})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -398,7 +398,7 @@ func TestNewerSchemaIsRefused(t *testing.T) {
 		t.Fatalf("set user_version: %v", err)
 	}
 
-	s, err := Open(Options{DataDir: dir, AllowNetworkFS: true})
+	s, err := Open(Options{DataDir: dir})
 	if err == nil {
 		_ = s.Close()
 		t.Fatal("Open accepted a database newer than this gateway")
@@ -444,7 +444,7 @@ func TestFailedMigrationRollsBack(t *testing.T) {
 				"INSERT INTO no_such_table VALUES (1);\n")
 			withMigration(t, bad)
 
-			s, err := Open(Options{DataDir: dir, AllowNetworkFS: true})
+			s, err := Open(Options{DataDir: dir})
 			if err == nil {
 				_ = s.Close()
 				t.Fatal("Open succeeded although a migration failed")
@@ -691,7 +691,7 @@ func TestBackupAppearsOnlyWhenComplete(t *testing.T) {
 	}
 	withMigration(t, nextMigration("extra", "CREATE TABLE extra (x INTEGER);\n"))
 
-	s, err := Open(Options{DataDir: dir, AllowNetworkFS: true})
+	s, err := Open(Options{DataDir: dir})
 	if err == nil {
 		_ = s.Close()
 		t.Fatal("Open succeeded although the backup could not be written")
@@ -884,7 +884,7 @@ func TestLegacyTableWithoutRequiredColumnIsRefused(t *testing.T) {
 	db := rawDB(t, filepath.Join(dir, dbName))
 	want := schemaOf(t, db)
 
-	s, err := Open(Options{DataDir: dir, AllowNetworkFS: true})
+	s, err := Open(Options{DataDir: dir})
 	if err == nil {
 		_ = s.Close()
 		t.Fatal("Open accepted a jobs table that lacks required columns")
