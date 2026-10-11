@@ -1,8 +1,13 @@
 // Package upstream makes the gateway's calls to the Azure containers.
 //
-// Every strategy is hidden behind one blocking Analyze call, so a worker never knows whether the
-// container answered synchronously, degraded to a 202 it had to poll, or lacks the synchronous
-// route entirely.
+// Client is the sync-only path. One attempt is one POST of the stored document to the container's
+// synchronous analyze route, through the HAProxy in front of autoscaled pods, on a connection of
+// its own. Do classifies the attempt into an Outcome and leaves retrying to its caller, with
+// Backoff for the wait. Nothing is ever polled: an asynchronous operation lives on the pod that
+// minted it, and an autoscaled pod can be gone before the poll arrives.
+//
+// DIClient and ReadClient are the older clients, which hide a sync, degraded-202 and async
+// strategy behind one blocking Analyze call. They stay until their callers have moved to Client.
 //
 // Both containers expose a native synchronous analyze route. Read's is documented; Document
 // Intelligence's is not — it is absent from every public doc and from azure-rest-api-specs, and
@@ -26,7 +31,7 @@ import (
 	"time"
 
 	"github.com/NilenduGanguli/azure-gateway-api/internal/azerr"
-	"github.com/NilenduGanguli/azure-gateway-api/internal/store"
+	"github.com/NilenduGanguli/azure-gateway-api/internal/config"
 )
 
 // HeaderAPIKey is the subscription key header both containers accept.
@@ -45,56 +50,6 @@ type Document struct {
 	ContentType string
 	Size        int64
 	Open        func() (io.ReadCloser, error)
-}
-
-// Result is a successful analysis.
-//
-// The raw upstream response is left on disk at Path and Start/End delimit the analyzeResult
-// member inside it, so the caller can compose its client-facing envelope with a range copy
-// instead of loading a result that Azure permits to be 500 MB.
-type Result struct {
-	Path           string
-	Start, End     int64
-	Mode           store.UpstreamMode
-	UpstreamMS     int64
-	UpstreamStatus int
-	// UpstreamOpID is the container's own operation id, set only when the asynchronous path ran.
-	// It is what the result-file endpoints are addressed by.
-	UpstreamOpID string
-
-	// affinity is the job's connection pool and cookie jar, kept alive past Analyze whenever an
-	// upstream operation exists. The result-file endpoints are addressed by that operation's id,
-	// which is meaningful only to the replica that minted it — fetching the searchable PDF or a
-	// figure over the shared pool lands on an arbitrary replica and 404s.
-	affinity *affinityClient
-}
-
-// Size is the length of the analyzeResult member.
-func (r *Result) Size() int64 { return r.End - r.Start }
-
-// Cleanup removes the temporary upstream response and releases the job's affinity client. It is
-// safe to call more than once.
-func (r *Result) Cleanup() {
-	if r == nil {
-		return
-	}
-	if r.affinity != nil {
-		r.affinity.close()
-		r.affinity = nil
-	}
-	if r.Path == "" {
-		return
-	}
-	_ = os.Remove(r.Path)
-	r.Path = ""
-}
-
-// client returns the HTTP client a follow-up call about this result must use.
-func (r *Result) client(fallback *http.Client) *http.Client {
-	if r != nil && r.affinity != nil {
-		return r.affinity.http
-	}
-	return fallback
 }
 
 // Request carries the per-call parameters that vary between surfaces.
@@ -127,19 +82,6 @@ type Analyzer interface {
 	Surface() azerr.Surface
 	// Health reports whether the container is reachable and what the gateway detected about it.
 	Health(ctx context.Context) Health
-}
-
-// Health is a snapshot of one upstream's state, surfaced on the admin endpoints.
-type Health struct {
-	Name string `json:"name"`
-	URL  string `json:"url"`
-	OK   bool   `json:"ok"`
-	// Detail carries the container's own status message, or the reason it is unreachable.
-	Detail string `json:"detail,omitempty"`
-	// SyncAnalyze reports what the gateway has learned about the synchronous route:
-	// "unknown" before the first call, then "available" or "unavailable".
-	SyncAnalyze string `json:"syncAnalyze"`
-	LatencyMS   int64  `json:"latencyMs,omitempty"`
 }
 
 // transportConfig builds the shared HTTP transport settings.
@@ -353,50 +295,6 @@ func drain(resp *http.Response) {
 	_ = resp.Body.Close()
 }
 
-// checkStatus fetches the container's /status endpoint, which validates its billing key without
-// consuming a model query.
-func (b *base) checkStatus(ctx context.Context) Health {
-	h := Health{Name: b.name, URL: redactUserinfo(b.baseURL), SyncAnalyze: "unknown"}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	started := time.Now()
-	req, err := b.newRequest(ctx, http.MethodGet, b.baseURL+"/status", nil)
-	if err != nil {
-		h.Detail = err.Error()
-		return h
-	}
-	resp, err := b.client.Do(req)
-	if err != nil {
-		h.Detail = err.Error()
-		return h
-	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
-	drain(resp)
-	h.LatencyMS = time.Since(started).Milliseconds()
-	h.OK = resp.StatusCode == http.StatusOK
-	h.Detail = summarizeStatus(body, resp.StatusCode)
-	return h
-}
-
-// summarizeStatus extracts the container's apiStatus fields when present.
-func summarizeStatus(body []byte, code int) string {
-	var s struct {
-		APIStatus  string `json:"apiStatus"`
-		APIMessage string `json:"apiStatusMessage"`
-	}
-	if err := jsonUnmarshal(body, &s); err == nil && s.APIStatus != "" {
-		if s.APIMessage != "" {
-			return s.APIStatus + ": " + s.APIMessage
-		}
-		return s.APIStatus
-	}
-	if code != http.StatusOK {
-		return fmt.Sprintf("HTTP %d", code)
-	}
-	return ""
-}
-
 // joinURL builds an upstream URL from a path and query.
 func (b *base) joinURL(path string, q url.Values) string {
 	u := b.baseURL + path
@@ -440,3 +338,66 @@ var ErrSyncUnavailable = errors.New("upstream: synchronous analyze route unavail
 
 // ErrDegradedToAsync reports that a synchronous call returned 202 instead of a result.
 var ErrDegradedToAsync = errors.New("upstream: synchronous analyze degraded to async")
+
+// Client makes synchronous calls to one surface's container.
+//
+// It holds no connection between calls. Every attempt, health check and relayed GET dials afresh,
+// so HAProxy balances each one on its own and a retry is free to reach a different pod. The
+// gateway cannot address or count the pods behind the route; a new connection is the only lever
+// it has.
+type Client struct {
+	b *base
+}
+
+// NewClient builds the client for one surface's container.
+//
+// tempDir receives the containers' answers. It is the blob root, so the blob sweeper reclaims a
+// file left by a process that died mid-download. maxResultBytes caps one answer; zero or less is
+// the 512 MB default.
+func NewClient(surface azerr.Surface, up config.Upstream, tempDir string, maxResultBytes int64) *Client {
+	name := "document-intelligence"
+	if surface == azerr.SurfaceRead {
+		name = "computer-vision-read"
+	}
+	b := newBase(name, up.BaseURL, up.APIKey, up.Timeout, tempDir, surface, 1, maxResultBytes)
+	// The base's pooled client would keep an idle connection to HAProxy between health checks.
+	// This one shares a transport that never keeps one, and bounds nothing itself: checkStatus
+	// applies its own deadline.
+	b.client = &http.Client{Transport: newAttemptTransport(), CheckRedirect: noRedirects}
+	return &Client{b: b}
+}
+
+// Surface identifies the error vocabulary this client speaks.
+func (c *Client) Surface() azerr.Surface { return c.b.surface }
+
+// Name is the container's name in logs and errors: "document-intelligence" or
+// "computer-vision-read".
+func (c *Client) Name() string { return c.b.name }
+
+// attemptDialTimeout bounds connecting to HAProxy. It is deliberately not the attempt's deadline:
+// a route that cannot be reached fails in seconds and is classified as a connection failure,
+// which is retried as often as needed, rather than as a slow analysis, which is retried once.
+const attemptDialTimeout = 10 * time.Second
+
+// newAttemptTransport builds the transport for one call.
+//
+// Keep-alive is off, so the connection closes when the answer has been read, and nothing outlives
+// the call to pin the next one to the pod that just failed. HTTP/2 is not forced: a connection
+// carries one request, so multiplexing gains nothing.
+//
+// TCP keep-alive probes stay on. A synchronous analysis holds a silent connection open for
+// minutes, and a middlebox that sees no traffic may drop it.
+func newAttemptTransport() *http.Transport {
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   attemptDialTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout: 10 * time.Second,
+		DisableKeepAlives:   true,
+	}
+}
+
+// noRedirects stops a client following a redirect, for the reason newTransport gives.
+func noRedirects(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
