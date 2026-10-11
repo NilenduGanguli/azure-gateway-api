@@ -62,8 +62,9 @@ func SchemaVersion() int {
 //
 //  1. A database already at SchemaVersion costs one read and is not written: that is every
 //     ordinary restart.
-//  2. user_version 0 with a jobs table is a volume from before versioning, which is version 1.
-//     user_version 0 without one is a fresh volume, migrated from nothing and not backed up.
+//  2. user_version 0 with a jobs table is a volume from before versioning, which is version 1
+//     once its table holds every column 0001 declares (see completeLegacyTable). user_version 0
+//     without one is a fresh volume, migrated from nothing and not backed up.
 //  3. A version newer than this binary's is refused, because only the newer image knows what it
 //     means. Rolling an image back after a migration leaves exactly that behind.
 //  4. Otherwise the database is copied with VACUUM INTO, replacing any older copy, and every
@@ -93,6 +94,7 @@ func migrate(w *sql.DB, dataDir string) (MigrationReport, error) {
 	if err := conn.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&from); err != nil {
 		return MigrationReport{}, fmt.Errorf("store: read schema version: %w", err)
 	}
+	legacy := false
 	switch {
 	case from == target:
 		return MigrationReport{From: from, To: target, Took: time.Since(start)}, nil
@@ -103,13 +105,13 @@ func migrate(w *sql.DB, dataDir string) (MigrationReport, error) {
 	case from < 0:
 		return MigrationReport{}, fmt.Errorf("store: database schema version %d is invalid", from)
 	case from == 0:
-		legacy, err := tableExists(ctx, conn, "jobs")
-		if err != nil {
+		if legacy, err = tableExists(ctx, conn, "jobs"); err != nil {
 			return MigrationReport{}, err
 		}
 		if legacy {
-			// Before versioning, Open applied what is now migration 0001 and never set
-			// user_version, so this volume is at version 1, not empty.
+			// Before versioning, Open applied its build's schema and never set user_version: what
+			// is now migration 0001, or 0001 less a column apply adds back. Either way this volume
+			// is at version 1, not empty.
 			from = 1
 		}
 	}
@@ -122,13 +124,14 @@ func migrate(w *sql.DB, dataDir string) (MigrationReport, error) {
 	}
 	report := MigrationReport{From: from, To: target}
 	// The backup protects data a migration is about to change. A fresh volume holds none yet, and
-	// stamping a pre-versioning database as version 1 rewrites only the header.
+	// bringing a pre-versioning database to version 1 touches no row: it stamps the header and at
+	// most adds a column with a default, which leaves every earlier image able to run on it.
 	if from > 0 && len(pending) > 0 {
 		if report.Backup, err = backup(ctx, conn, dataDir, from); err != nil {
 			return MigrationReport{}, err
 		}
 	}
-	if err := apply(ctx, conn, pending, target); err != nil {
+	if err := apply(ctx, conn, legacy, pending, target); err != nil {
 		return MigrationReport{}, err
 	}
 	report.Took = time.Since(start)
@@ -222,13 +225,16 @@ func syncFile(name string) error {
 	return nil
 }
 
-// apply runs the pending migrations and stamps the target version, in one transaction.
+// apply runs the pending migrations and stamps the target version, in one transaction. A legacy
+// database has its jobs table completed to version 1 first, in the same transaction, so a failure
+// anywhere leaves that table as it was found too.
 //
 // BEGIN IMMEDIATE takes the write lock before the first statement runs, so a competing writer is
 // waited out, up to busy_timeout, before anything changes. A deferred transaction would take the
 // lock at its first write instead, and in WAL mode that upgrade can fail at once with SQLITE_BUSY,
 // busy_timeout or not.
-func apply(ctx context.Context, conn *sql.Conn, pending []migration, target int) (err error) {
+func apply(ctx context.Context, conn *sql.Conn, legacy bool, pending []migration,
+	target int) (err error) {
 	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
 		return fmt.Errorf("store: begin migration: %w", err)
 	}
@@ -240,6 +246,11 @@ func apply(ctx context.Context, conn *sql.Conn, pending []migration, target int)
 			err = fmt.Errorf("%w (the rollback failed too: %w)", err, rbErr)
 		}
 	}()
+	if legacy {
+		if err := completeLegacyTable(ctx, conn); err != nil {
+			return err
+		}
+	}
 	for _, m := range pending {
 		for i, stmt := range splitStatements(m.sql) {
 			if _, err := conn.ExecContext(ctx, stmt); err != nil {
@@ -256,6 +267,133 @@ func apply(ctx context.Context, conn *sql.Conn, pending []migration, target int)
 		return fmt.Errorf("store: commit migration: %w", err)
 	}
 	return nil
+}
+
+// completeLegacyTable brings a jobs table from before versioning to the columns migration 0001
+// declares, so that stamping it version 1 is true.
+//
+// Builds before commit ef625fe created the table without prefix, and CREATE TABLE IF NOT EXISTS
+// never added it afterwards, so on such a volume every insert, which names prefix, fails. Each
+// column the schema gained that way carries a DEFAULT, which is what lets ADD COLUMN append it to
+// a table already holding rows. A missing column with no default (id, surface, status and the
+// three timestamps, there since the first schema) cannot be added in the form 0001 declares it,
+// and no gateway build ever lacked one, so such a table is refused rather than guessed at.
+//
+// Only the columns are reconciled: the three indexes have been identical in every released schema.
+func completeLegacyTable(ctx context.Context, conn *sql.Conn) error {
+	want, err := v1Columns(ctx)
+	if err != nil {
+		return err
+	}
+	have, err := jobsColumns(ctx, conn)
+	if err != nil {
+		return err
+	}
+	present := make(map[string]bool, len(have))
+	for _, c := range have {
+		present[strings.ToLower(c.name)] = true // SQLite column names are case-insensitive
+	}
+	var add []column
+	var missing []string
+	for _, c := range want {
+		switch {
+		case present[strings.ToLower(c.name)]:
+		case c.dflt.Valid:
+			add = append(add, c)
+		default:
+			missing = append(missing, c.name)
+		}
+	}
+	if len(missing) > 0 {
+		noun := "column"
+		if len(missing) > 1 {
+			noun = "columns"
+		}
+		return fmt.Errorf("store: jobs table from before versioning lacks %s %s, which %s declares "+
+			"without a default, so it cannot be brought to schema v1",
+			noun, strings.Join(missing, ", "), migrations[0].name)
+	}
+	for _, c := range add {
+		if _, err := conn.ExecContext(ctx, c.addStatement()); err != nil {
+			return fmt.Errorf("store: add column %s to the legacy jobs table: %w", c.name, err)
+		}
+	}
+	return nil
+}
+
+// column is one jobs column as PRAGMA table_info describes it.
+type column struct {
+	name    string
+	decl    string // declared type, "" when there is none
+	notNull bool
+	dflt    sql.NullString // the DEFAULT expression as written; NULL when there is none
+}
+
+// addStatement is the ALTER TABLE that adds c to the jobs table as declared. The name, type and
+// default come from migration 0001, which this binary carries, so they are formatted in as
+// written. For prefix that is
+//
+//	ALTER TABLE jobs ADD COLUMN prefix TEXT NOT NULL DEFAULT ''
+func (c column) addStatement() string {
+	stmt := "ALTER TABLE jobs ADD COLUMN " + c.name
+	if c.decl != "" {
+		stmt += " " + c.decl
+	}
+	if c.notNull {
+		stmt += " NOT NULL"
+	}
+	return stmt + " DEFAULT " + c.dflt.String
+}
+
+// queryer is the part of *sql.DB and *sql.Conn that jobsColumns uses.
+type queryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// jobsColumns lists the jobs table's columns in declaration order.
+func jobsColumns(ctx context.Context, q queryer) ([]column, error) {
+	rows, err := q.QueryContext(ctx, `PRAGMA table_info(jobs)`)
+	if err != nil {
+		return nil, fmt.Errorf("store: read jobs columns: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []column
+	for rows.Next() {
+		var cid, pk int
+		var c column
+		if err := rows.Scan(&cid, &c.name, &c.decl, &c.notNull, &c.dflt, &pk); err != nil {
+			return nil, fmt.Errorf("store: read jobs columns: %w", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: read jobs columns: %w", err)
+	}
+	return out, nil
+}
+
+// v1Columns returns the jobs columns migration 0001 creates, as SQLite itself reads them, by
+// applying 0001 to an empty in-memory database. Deriving them keeps 0001 the one place the
+// version-1 schema is written down.
+func v1Columns(ctx context.Context) ([]column, error) {
+	v1 := migrations[0] // loadMigrations guarantees the first is version 1
+	scratch, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		return nil, fmt.Errorf("store: open scratch database: %w", err)
+	}
+	defer func() { _ = scratch.Close() }()
+	// Every connection to :memory: is a database of its own, so all of this uses one.
+	conn, err := scratch.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("store: open scratch database: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	for _, stmt := range splitStatements(v1.sql) {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			return nil, fmt.Errorf("store: apply %s to a scratch database: %w", v1.name, err)
+		}
+	}
+	return jobsColumns(ctx, conn)
 }
 
 // splitStatements cuts a migration file into statements, ending one at each line whose last

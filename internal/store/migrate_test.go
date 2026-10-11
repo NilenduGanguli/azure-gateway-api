@@ -14,10 +14,10 @@ import (
 	"time"
 )
 
-// legacySchema is the schema every gateway applied before versioning, frozen here as the version-1
-// fixture. It is a copy rather than a read of migrations/0001_initial.sql on purpose: volumes in
-// service hold exactly this text, so if 0001 were ever edited in place, a fresh volume would drift
-// from a migrated one and TestSchemaFromScratchEqualsMigrated would fail.
+// legacySchema is the schema gateways applied before versioning from commit ef625fe on, frozen
+// here as the version-1 fixture. It is a copy rather than a read of migrations/0001_initial.sql on
+// purpose: volumes in service hold exactly this text, so if 0001 were ever edited in place, a fresh
+// volume would drift from a migrated one and TestSchemaFromScratchEqualsMigrated would fail.
 const legacySchema = `
 CREATE TABLE IF NOT EXISTS jobs (
   id                TEXT PRIMARY KEY,
@@ -51,6 +51,14 @@ CREATE INDEX IF NOT EXISTS jobs_status  ON jobs(status, created_at);
 CREATE INDEX IF NOT EXISTS jobs_expiry  ON jobs(expires_at);
 CREATE INDEX IF NOT EXISTS jobs_surface ON jobs(surface, status);
 `
+
+// prePrefixSchema is the schema gateways applied before commit ef625fe added the prefix column,
+// the only other schema ever released: legacySchema without its last column. CREATE TABLE IF NOT
+// EXISTS never added the column to those tables afterwards, so such a volume predates versioning
+// without being at version 1.
+var prePrefixSchema = strings.Replace(legacySchema,
+	"  figures           TEXT NOT NULL DEFAULT '',\n  prefix            TEXT NOT NULL DEFAULT ''\n",
+	"  figures           TEXT NOT NULL DEFAULT ''\n", 1)
 
 // openVolume opens a Store over dir and closes it when the test ends. Tests that reopen the same
 // volume close it earlier themselves, which is safe because Close is idempotent.
@@ -166,30 +174,55 @@ func nextMigration(name, body string) migration {
 	return migration{version: v, name: fmt.Sprintf("%04d_%s.sql", v, name), sql: body}
 }
 
-// legacyVolume leaves in dir the gateway.db a pre-versioning gateway wrote: the version-1 schema
-// applied the way Open used to apply it, in WAL mode, user_version never set, and one job row. It
-// returns the row's id.
-func legacyVolume(t *testing.T, dir string) string {
+// legacyDatabase leaves in dir the gateway.db a pre-versioning gateway wrote: schema applied the
+// way Open used to apply it, in WAL mode, with user_version never set. fill, when not nil, adds
+// rows before the database is closed.
+func legacyDatabase(t *testing.T, dir, schema string, fill func(*sql.DB) error) {
 	t.Helper()
 	db, err := sql.Open("sqlite", dsn(filepath.Join(dir, dbName), "FULL"))
 	if err != nil {
 		t.Fatalf("open legacy database: %v", err)
 	}
-	if _, err := db.Exec(legacySchema); err != nil {
+	if _, err := db.Exec(schema); err != nil {
 		_ = db.Close()
 		t.Fatalf("apply legacy schema: %v", err)
 	}
-	const id = "00000000-0000-4000-8000-00000000a001"
-	now := time.Now().Unix()
-	if _, err := db.Exec(`INSERT INTO jobs (id, surface, model_id, status, created_at, updated_at,
-		expires_at) VALUES (?, 'di', 'prebuilt-layout', ?, ?, ?, ?)`,
-		id, string(StatusSucceeded), now, now, now+3600); err != nil {
-		_ = db.Close()
-		t.Fatalf("insert legacy job: %v", err)
+	if fill != nil {
+		if err := fill(db); err != nil {
+			_ = db.Close()
+			t.Fatalf("fill legacy database: %v", err)
+		}
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("close legacy database: %v", err)
 	}
+}
+
+// legacyVolume leaves in dir a version-1 database from before versioning holding one job row, and
+// returns the row's id.
+func legacyVolume(t *testing.T, dir string) string {
+	t.Helper()
+	return legacyVolumeWith(t, dir, legacySchema)
+}
+
+// prePrefixVolume is legacyVolume for a volume created before the prefix column existed.
+func prePrefixVolume(t *testing.T, dir string) string {
+	t.Helper()
+	return legacyVolumeWith(t, dir, prePrefixSchema)
+}
+
+// legacyVolumeWith is legacyVolume over another schema from before versioning. Its row names only
+// columns every released schema has.
+func legacyVolumeWith(t *testing.T, dir, schema string) string {
+	t.Helper()
+	const id = "00000000-0000-4000-8000-00000000a001"
+	now := time.Now().Unix()
+	legacyDatabase(t, dir, schema, func(db *sql.DB) error {
+		_, err := db.Exec(`INSERT INTO jobs (id, surface, model_id, status, created_at, updated_at,
+			expires_at) VALUES (?, 'di', 'prebuilt-layout', ?, ?, ?, ?)`,
+			id, string(StatusSucceeded), now, now, now+3600)
+		return err
+	})
 	return id
 }
 
@@ -224,6 +257,7 @@ func startingStates() []startingState {
 	return []startingState{
 		{"at the newest version", currentVolume, SchemaVersion(), SchemaVersion()},
 		{"from before versioning", legacyVolume, 1, 0},
+		{"from before the prefix column", prePrefixVolume, 1, 0},
 	}
 }
 
@@ -378,8 +412,9 @@ func TestNewerSchemaIsRefused(t *testing.T) {
 }
 
 // TestFailedMigrationRollsBack checks that a migration is all or nothing. A statement failing
-// partway must take every earlier statement with it, including the version stamp, so the gateway
-// refuses to start on a database still exactly at its old version, not one stranded between two.
+// partway must take every earlier statement with it, including the version stamp and any column
+// added to complete a legacy table, so the gateway refuses to start on a database still exactly at
+// its old version, not one stranded between two.
 func TestFailedMigrationRollsBack(t *testing.T) {
 	for _, st := range startingStates() {
 		t.Run(st.name, func(t *testing.T) {
@@ -481,6 +516,10 @@ func TestBackupTakenBeforeMigrating(t *testing.T) {
 // runs every migration from nothing; a volume in service since before versioning starts from the
 // frozen version-1 fixture. Both must end with the same schema, which fails the moment a released
 // migration is edited instead of a new one being added.
+//
+// This compares the stored CREATE text itself. TestPrePrefixLegacyTableIsCompleted makes the same
+// comparison from the pre-prefix fixture, by column set for the jobs table, because the ADD COLUMN
+// that completes that table rewrites its text.
 func TestSchemaFromScratchEqualsMigrated(t *testing.T) {
 	fresh := schemaOf(t, openVolume(t, t.TempDir()).r)
 
@@ -502,6 +541,126 @@ func TestSchemaFromScratchEqualsMigrated(t *testing.T) {
 		if f != m {
 			t.Errorf("schema object %d differs:\nfresh    %+v\nmigrated %+v", i, f, m)
 		}
+	}
+}
+
+// columnInfo is one PRAGMA table_info row without cid, the column's position.
+type columnInfo struct {
+	Name, Type string
+	NotNull    bool
+	Default    sql.NullString
+	PK         int
+}
+
+// jobsColumnSet returns the jobs table's columns ordered by name, so two tables holding the same
+// columns in a different order compare equal.
+func jobsColumnSet(t *testing.T, db *sql.DB) []columnInfo {
+	t.Helper()
+	rows, err := db.Query(`PRAGMA table_info(jobs)`)
+	if err != nil {
+		t.Fatalf("read jobs columns: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []columnInfo
+	for rows.Next() {
+		var cid int
+		var c columnInfo
+		if err := rows.Scan(&cid, &c.Name, &c.Type, &c.NotNull, &c.Default, &c.PK); err != nil {
+			t.Fatalf("scan jobs column: %v", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read jobs columns: %v", err)
+	}
+	slices.SortFunc(out, func(a, b columnInfo) int { return strings.Compare(a.Name, b.Name) })
+	return out
+}
+
+// TestPrePrefixLegacyTableIsCompleted covers a volume created before the prefix column existed.
+// Stamping its table version 1 as it stands would be false, and every insert the gateway makes,
+// all of which name prefix, would fail. Open must add the column first, inside the migration's
+// transaction, which TestFailedMigrationRollsBack checks from this same starting state.
+func TestPrePrefixLegacyTableIsCompleted(t *testing.T) {
+	if strings.Contains(prePrefixSchema, "prefix") {
+		t.Fatal("the pre-prefix fixture still declares the prefix column")
+	}
+	dir := t.TempDir()
+	id := prePrefixVolume(t, dir)
+
+	s := openVolume(t, dir)
+	if r := s.Migration; r.From != 1 || r.To != SchemaVersion() {
+		t.Errorf("report %+v, want From=1 To=%d", r, SchemaVersion())
+	}
+	if got := userVersion(t, s.r); got != SchemaVersion() {
+		t.Errorf("user_version is %d, want %d", got, SchemaVersion())
+	}
+	ctx := context.Background()
+	job, err := s.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("the legacy row is unreadable after migrating: %v", err)
+	}
+	if job.Prefix != "" || job.Surface != "di" || job.ModelID != "prebuilt-layout" {
+		t.Errorf("the legacy row changed: %+v", job)
+	}
+	now := time.Now().UTC()
+	added := &Job{
+		ID: "00000000-0000-4000-8000-00000000a002", Surface: "di", Status: StatusNotStarted,
+		CreatedAt: now, UpdatedAt: now, ExpiresAt: now.Add(time.Hour), Prefix: "/formrecognizer",
+	}
+	if err := s.Create(ctx, added); err != nil {
+		t.Fatalf("create on the completed table: %v", err)
+	}
+	if got, err := s.Get(ctx, added.ID); err != nil || got.Prefix != added.Prefix {
+		t.Errorf("prefix did not round-trip: %+v, %v", got, err)
+	}
+
+	// ADD COLUMN appends the column and splices its definition into the stored CREATE TABLE text,
+	// so against a fresh volume the jobs table is compared by its set of columns, not by that
+	// text. Every other schema object, the three indexes included, must match exactly.
+	fresh := openVolume(t, t.TempDir())
+	if got, want := jobsColumnSet(t, s.r), jobsColumnSet(t, fresh.r); !slices.Equal(got, want) {
+		t.Errorf("jobs columns differ from a fresh volume's:\nfresh    %+v\nmigrated %+v", want, got)
+	}
+	isJobsTable := func(o schemaObject) bool { return o.Type == "table" && o.Name == "jobs" }
+	got := slices.DeleteFunc(schemaOf(t, s.r), isJobsTable)
+	want := slices.DeleteFunc(schemaOf(t, fresh.r), isJobsTable)
+	if len(want) == 0 || !slices.Equal(got, want) {
+		t.Errorf("schema differs from a fresh volume's:\nfresh    %+v\nmigrated %+v", want, got)
+	}
+}
+
+// TestLegacyTableWithoutRequiredColumnIsRefused covers a jobs table no gateway wrote. Every build
+// had id, surface, status and the three timestamps, and none of them can be added in the form 0001
+// declares them, so Open must refuse, name what is missing, and leave the database as it found it.
+func TestLegacyTableWithoutRequiredColumnIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	legacyDatabase(t, dir, `CREATE TABLE jobs (id TEXT PRIMARY KEY, surface TEXT NOT NULL);`, nil)
+	db := rawDB(t, filepath.Join(dir, dbName))
+	want := schemaOf(t, db)
+
+	s, err := Open(Options{DataDir: dir, AllowNetworkFS: true})
+	if err == nil {
+		_ = s.Close()
+		t.Fatal("Open accepted a jobs table that lacks required columns")
+	}
+	msg := err.Error()
+	if !strings.HasPrefix(msg, "store: ") {
+		t.Errorf("error %q is not a store error", msg)
+	}
+	for _, col := range []string{"status", "created_at", "updated_at", "expires_at"} {
+		if !strings.Contains(msg, col) {
+			t.Errorf("error %q does not name the missing column %s", msg, col)
+		}
+	}
+	if strings.Contains(msg, "surface") {
+		t.Errorf("error %q names surface, which the table has", msg)
+	}
+	if got := userVersion(t, db); got != 0 {
+		t.Errorf("user_version is %d, want it left at 0", got)
+	}
+	if got := schemaOf(t, db); !slices.Equal(got, want) {
+		t.Errorf("the refused start changed the schema:\nbefore %+v\nafter  %+v", want, got)
 	}
 }
 
