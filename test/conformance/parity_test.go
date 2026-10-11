@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/png"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,6 +21,7 @@ import (
 	"github.com/NilenduGanguli/azure-gateway-api/internal/ids"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/mockazure"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/pdftest"
+	"github.com/NilenduGanguli/azure-gateway-api/internal/probe"
 )
 
 // goldenCase is one exchange recorded from a real container by `gateway probe --record`, in the
@@ -31,6 +34,9 @@ type goldenCase struct {
 		Path        string `json:"path"`
 		Query       string `json:"query"`
 		ContentType string `json:"contentType"`
+		// Document names the body the case sent: probe.DocumentSample, probe.DocumentJunk, or ""
+		// for none. Absent in a handmade case, which sends a document with every POST and PUT.
+		Document *string `json:"document"`
 	} `json:"request"`
 	Response struct {
 		Status int `json:"status"`
@@ -58,45 +64,115 @@ func (g *goldenCase) header(name string) (string, bool) {
 	return "", false
 }
 
-// TestGoldenParity replays the recorded container exchanges under testdata/golden/<surface>/<tag>
-// against the gateway and requires the same answer, under the masks: the status, the header
-// names, the shapes of Content-Type, Operation-Location, Retry-After, Content-Length and Server,
-// and the body's members, their order and their JSON types. The fakes serve the recorded
-// synchronous body, so a poll is compared on the container's own analyzeResult.
+// TestGoldenParity replays the recorded container exchanges against the gateway and requires the
+// same answer, under the masks: the status, the header names, the shapes of Content-Type,
+// Operation-Location, Retry-After, Content-Length and Server, and the body's members, their order
+// and their JSON types. The fakes serve the recorded synchronous body, so a poll is compared on
+// the container's own analyzeResult.
+//
+// A set is a folder of cases: testdata/golden/<surface>/<image-tag>/, as the operator commits a
+// recording from the real containers, or testdata/golden/<tag>/<surface>/, as `gateway probe
+// --record DIR` writes one (the probe's own set, recorded from the paged fake, is golden/fake/).
 //
 // Real recordings come from the operator's network (OPERATIONS §10) and are a go-live gate. The
-// handmade set exists so the replay path itself is exercised before they do; it mirrors the
-// gateway's documented answers and proves nothing about a container.
+// handmade and fake sets exist so the replay path itself is exercised before they do; they prove
+// nothing about a container.
 func TestGoldenParity(t *testing.T) {
-	dirs, err := filepath.Glob(filepath.Join("testdata", "golden", "*", "*"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var sets []string
-	for _, d := range dirs {
-		if files, _ := filepath.Glob(filepath.Join(d, "*.json")); len(files) > 0 {
-			sets = append(sets, d)
-		}
-	}
+	sets := goldenSets(t)
 	if len(sets) == 0 {
 		t.Skip("no golden recordings under testdata/golden/<surface>/<tag>; record them with " +
 			"gateway probe --record (OPERATIONS §10)")
 	}
-	for _, dir := range sets {
-		surface, tag := filepath.Base(filepath.Dir(dir)), filepath.Base(dir)
-		t.Run(surface+"/"+tag, func(t *testing.T) {
+	for _, set := range sets {
+		t.Run(set.name, func(t *testing.T) {
 			t.Parallel()
-			replayGoldenSet(t, surface, loadGoldenSet(t, dir))
+			replayGoldenSet(t, set.surface, set.profile, loadGoldenSet(t, set.dir))
 		})
 	}
 }
 
-// loadGoldenSet reads a set's cases in file-name order, which is the order they replay in: a
-// case naming an operation uses the one the latest replayed :analyze created.
+// goldenSet is one folder of recorded cases, the surface they were recorded on, and what the
+// replay may not compare.
+type goldenSet struct {
+	name, dir, surface string
+	profile            *parityProfile
+}
+
+// parityProfile lists what a set's replay leaves out, each with the reason. A recording from a
+// real container is compared in full (a nil profile); only a set recorded from a fake has gaps.
+type parityProfile struct {
+	// headers are response header names the recording does not have and the gateway sends.
+	headers []string
+	// locationQuery leaves Operation-Location's query string out of its shape.
+	locationQuery bool
+	// skip maps a case name to why it is not replayed.
+	skip map[string]string
+}
+
+// fakeProfile is what the paged fake does not model, so its recording (golden/fake/) cannot
+// settle. The set still replays every other case through the full comparison, which is what
+// proves the --record file format and the replay agree before a real recording exists.
+var fakeProfile = &parityProfile{
+	// The gateway's NoCache middleware adds it to every answer. Whether a real container sends
+	// it is for the first real recording to settle.
+	headers: []string{"Cache-Control"},
+	// The fake's Operation-Location carries no api-version; Azure's, and the gateway's, do.
+	locationQuery: true,
+	skip: map[string]string{
+		probe.CaseMissingAPIVersion: "the fake accepts an analyze without api-version",
+		probe.CaseResultPDF:         "the fake serves a searchable PDF for any result id",
+		probe.CaseResultFigure:      "the fake serves a figure for any result id",
+		probe.CaseWrongVerb:         "the fake answers a wrong verb with an empty 405",
+	},
+}
+
+// goldenSets finds every folder of cases two levels under testdata/golden. The surface is
+// whichever of the two folder names is di or read.
+func goldenSets(t *testing.T) []goldenSet {
+	t.Helper()
+	dirs, err := filepath.Glob(filepath.Join("testdata", "golden", "*", "*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sets []goldenSet
+	for _, d := range dirs {
+		if files, _ := filepath.Glob(filepath.Join(d, "*.json")); len(files) == 0 {
+			continue // a comparisons file beside the case folders, or an empty folder
+		}
+		outer, inner := filepath.Base(filepath.Dir(d)), filepath.Base(d)
+		set := goldenSet{name: outer + "/" + inner, dir: d}
+		if outer == "fake" {
+			set.profile = fakeProfile
+		}
+		switch {
+		case isSurface(outer):
+			set.surface = outer
+		case isSurface(inner):
+			set.surface = inner
+		default:
+			t.Fatalf("%s: neither %q nor %q names a surface; the folders are "+
+				"<surface>/<tag> or <tag>/<surface>, with surface di or read", d, outer, inner)
+		}
+		sets = append(sets, set)
+	}
+	return sets
+}
+
+func isSurface(name string) bool { return name == "di" || name == "read" }
+
+// loadGoldenSet reads a set's cases in replay order: a case naming an operation uses the one the
+// latest replayed :analyze created. A handmade set is numbered, so file-name order is replay
+// order; a probe recording names its cases, so the probe's analyze round trip replays first, in
+// the order --record made it, and every other case follows in file-name order.
 func loadGoldenSet(t *testing.T, dir string) []*goldenCase {
 	t.Helper()
 	files, _ := filepath.Glob(filepath.Join(dir, "*.json"))
-	sort.Strings(files)
+	slices.SortStableFunc(files, func(a, b string) int {
+		if c := recordRank(a) - recordRank(b); c != 0 {
+			return c
+		}
+		return strings.Compare(a, b)
+	})
 	out := make([]*goldenCase, 0, len(files))
 	for _, f := range files {
 		data, err := os.ReadFile(f)
@@ -115,9 +191,23 @@ func loadGoldenSet(t *testing.T, dir string) []*goldenCase {
 	return out
 }
 
+// recordOrder is the order `gateway probe --record` makes its analyze round trip in; each of
+// these cases depends on the ones before it.
+var recordOrder = []string{probe.CaseAnalyze, probe.CasePollRunning, probe.CasePoll, probe.CaseHead,
+	probe.CaseDelete, probe.CaseAfterDelete, probe.CaseSync}
+
+// recordRank places a case file in replay order: the round trip's cases by recordOrder, every
+// other case after them.
+func recordRank(file string) int {
+	if i := slices.Index(recordOrder, strings.TrimSuffix(filepath.Base(file), ".json")); i >= 0 {
+		return i
+	}
+	return len(recordOrder)
+}
+
 // replayGoldenSet replays one surface's recorded cases against a gateway fronting only that kind
 // of container, as the recordings were made against one pod.
-func replayGoldenSet(t *testing.T, surface string, cases []*goldenCase) {
+func replayGoldenSet(t *testing.T, surface string, profile *parityProfile, cases []*goldenCase) {
 	t.Helper()
 	// The recorded synchronous answer, served by the fake for every analysis.
 	var syncBody []byte
@@ -145,6 +235,9 @@ func replayGoldenSet(t *testing.T, surface string, cases []*goldenCase) {
 	var opLoc string // the latest replayed 202's Operation-Location
 	for _, gc := range cases {
 		t.Run(strings.TrimSuffix(gc.file, ".json"), func(t *testing.T) {
+			if profile != nil && profile.skip[strings.TrimSuffix(gc.file, ".json")] != "" {
+				t.Skip(profile.skip[strings.TrimSuffix(gc.file, ".json")])
+			}
 			if relayedPath(gc.Request.Path) {
 				// The gateway relays these byte for byte, which the endpoint and relay tests check;
 				// their status and body here would be the fake's, not the gateway's.
@@ -170,24 +263,61 @@ func replayGoldenSet(t *testing.T, surface string, cases []*goldenCase) {
 				target = strings.ReplaceAll(target, "<guid>", id)
 			}
 
-			var body []byte
+			body := goldenBody(t, gc)
 			var headers []string
-			if gc.Request.Method == http.MethodPost || gc.Request.Method == http.MethodPut {
-				body = pdftest.Make(1)
-				if strings.HasPrefix(gc.Request.ContentType, "application/json") {
-					body = []byte(`{"base64Source":"` + base64.StdEncoding.EncodeToString(body) + `"}`)
-				}
-			}
 			if gc.Request.ContentType != "" {
 				headers = append(headers, "Content-Type", gc.Request.ContentType)
 			}
 			resp, got := h.do(gc.Request.Method, target, body, headers...)
-			compareGolden(t, gc, resp, got)
+			compareGolden(t, gc, profile, resp, got)
 			if resp.StatusCode == http.StatusAccepted {
 				opLoc = resp.Header.Get("Operation-Location")
 			}
 		})
 	}
+}
+
+// goldenBody is the body to send for a case: the kind the case recorded, in its Content-Type.
+func goldenBody(t *testing.T, gc *goldenCase) []byte {
+	t.Helper()
+	document := ""
+	switch {
+	case gc.Request.Document != nil:
+		document = *gc.Request.Document
+	case gc.Request.Method == http.MethodPost || gc.Request.Method == http.MethodPut:
+		document = probe.DocumentSample // a handmade case sends a document with every upload
+	}
+	switch document {
+	case "":
+		return nil
+	case probe.DocumentJunk:
+		return []byte("not a document")
+	case probe.DocumentSample:
+	default:
+		t.Fatalf("%s: unknown request.document %q", gc.file, document)
+	}
+	if strings.HasPrefix(gc.Request.ContentType, "image/png") {
+		return blankPNG(t)
+	}
+	body := pdftest.Make(1)
+	if strings.HasPrefix(gc.Request.ContentType, "application/json") {
+		body = []byte(`{"base64Source":"` + base64.StdEncoding.EncodeToString(body) + `"}`)
+	}
+	return body
+}
+
+// blankPNG is an image like the probe's default document, for a case recorded with one.
+func blankPNG(t *testing.T) []byte {
+	t.Helper()
+	img := image.NewGray(image.Rect(0, 0, 200, 120))
+	for i := range img.Pix {
+		img.Pix[i] = 0xff
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
 }
 
 // relayedPath reports whether the gateway relays a path to the container rather than answering
@@ -201,20 +331,24 @@ func relayedPath(path string) bool { return relayedPattern.MatchString(path) }
 var ignoredHeaders = []string{"Date", "Connection", "Keep-Alive", "Transfer-Encoding"}
 
 // compareGolden reports every way the gateway's answer differs from the recorded one.
-func compareGolden(t *testing.T, gc *goldenCase, resp *http.Response, body []byte) {
+func compareGolden(t *testing.T, gc *goldenCase, profile *parityProfile, resp *http.Response, body []byte) {
 	t.Helper()
+	ignored := ignoredHeaders
+	if profile != nil {
+		ignored = append(slices.Clone(ignoredHeaders), profile.headers...)
+	}
 	if resp.StatusCode != gc.Response.Status {
 		t.Errorf("status %d, recorded %d\n%s", resp.StatusCode, gc.Response.Status, truncate(string(body)))
 	}
 
 	var want, got []string
 	for k := range gc.Response.Headers {
-		if !slices.Contains(ignoredHeaders, http.CanonicalHeaderKey(k)) {
+		if !slices.Contains(ignored, http.CanonicalHeaderKey(k)) {
 			want = append(want, http.CanonicalHeaderKey(k))
 		}
 	}
 	for k := range resp.Header {
-		if !slices.Contains(ignoredHeaders, k) {
+		if !slices.Contains(ignored, k) {
 			got = append(got, k)
 		}
 	}
@@ -231,7 +365,12 @@ func compareGolden(t *testing.T, gc *goldenCase, resp *http.Response, body []byt
 		t.Errorf("Server %q, recorded %q", resp.Header.Get("Server"), v)
 	}
 	if v, ok := gc.header("Operation-Location"); ok {
-		if g, w := locationShape(resp.Header.Get("Operation-Location")), locationShape(v); g != w {
+		g, w := locationShape(resp.Header.Get("Operation-Location")), locationShape(v)
+		if profile != nil && profile.locationQuery {
+			g, _, _ = strings.Cut(g, "?")
+			w, _, _ = strings.Cut(w, "?")
+		}
+		if g != w {
 			t.Errorf("Operation-Location shape %q, recorded %q", g, w)
 		}
 	}
@@ -281,15 +420,22 @@ func bodyKind(raw json.RawMessage) string {
 	}
 }
 
+// baseRE is a URL's scheme and authority, which a probe recording masks as <base>.
+var baseRE = regexp.MustCompile(`^https?://[^/]+`)
+
 var guidRE = regexp.MustCompile(`(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
 
 // locationShape is an Operation-Location without its authority and with its id masked: what a
-// client parses, independent of where the container or the gateway listens.
+// client parses, independent of where the container or the gateway listens. A probe recording
+// writes the probed base URL as <base>.
 func locationShape(loc string) string {
+	if rest, ok := strings.CutPrefix(loc, "<base>"); ok {
+		return "<authority>" + guidRE.ReplaceAllString(rest, "<guid>")
+	}
 	if i := strings.Index(loc, "://"); i >= 0 {
 		rest := loc[i+3:]
 		if j := strings.IndexByte(rest, '/'); j >= 0 {
-			loc = loc[:i+3] + "<authority>" + rest[j:]
+			loc = "<authority>" + rest[j:]
 		}
 	}
 	return guidRE.ReplaceAllString(loc, "<guid>")
@@ -398,8 +544,12 @@ func compareMasked(want, got string) string {
 		}
 		return ""
 	}
-	if strings.Contains(want, "<guid>") {
-		if masked := guidRE.ReplaceAllString(got, "<guid>"); masked != want {
+	if strings.Contains(want, "<guid>") || strings.HasPrefix(want, "<base>") {
+		masked := guidRE.ReplaceAllString(got, "<guid>")
+		if strings.HasPrefix(want, "<base>") {
+			masked = baseRE.ReplaceAllString(masked, "<base>")
+		}
+		if masked != want {
 			return fmt.Sprintf("is %q, recorded %q", masked, want)
 		}
 	}
@@ -429,6 +579,9 @@ func TestGoldenComparatorCatchesDifferences(t *testing.T) {
 			`{"t":"2026-10-11T08:00:00.1234567+00:00"}`, true},
 		{"mask echoed from a served recording", `{"t":"<datetime:2006-01-02T15:04:05Z>"}`,
 			`{"t":"<datetime:2006-01-02T15:04:05Z>"}`, false},
+		{"base mask", `{"u":"<base>/x/<guid>"}`, `{"u":"http://h:1/x/3b31320d-8bab-4f88-b19c-2322a7f11034"}`, false},
+		{"base mask on another route", `{"u":"<base>/x/<guid>"}`,
+			`{"u":"http://h:1/y/3b31320d-8bab-4f88-b19c-2322a7f11034"}`, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			want, err := parseOrdered([]byte(tc.want))
@@ -447,6 +600,8 @@ func TestGoldenComparatorCatchesDifferences(t *testing.T) {
 
 	for _, tc := range []struct{ a, b string }{
 		{"http://localhost:5000/vision/v3.2/read/analyzeResults/<guid>",
+			"http://127.0.0.1:8080/vision/v3.2/read/analyzeResults/3b31320d-8bab-4f88-b19c-2322a7f11034"},
+		{"<base>/vision/v3.2/read/analyzeResults/<guid>",
 			"http://127.0.0.1:8080/vision/v3.2/read/analyzeResults/3b31320d-8bab-4f88-b19c-2322a7f11034"},
 	} {
 		if locationShape(tc.a) != locationShape(tc.b) {
