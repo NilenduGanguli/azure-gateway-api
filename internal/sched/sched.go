@@ -68,7 +68,8 @@ func New(limit int) *Scheduler {
 	return &Scheduler{limit: limit, waiters: map[string][]*waiter{}}
 }
 
-// Acquire blocks until a slot is granted for job or ctx is done. release is idempotent.
+// Acquire blocks until a slot is granted for job or ctx is done. release is idempotent, and nil
+// when err is non-nil, so check err before deferring it.
 //
 // A ctx that has already ended gets its error even when a slot is free, and so does one that
 // ends just as its grant arrives: the call it would start is bound to be cancelled, and the slot
