@@ -14,12 +14,12 @@ func TestLen(t *testing.T) {
 		{"ascii", "abc", 3, 3, 3},
 		{"decomposed e acute", "é", 1, 2, 2},
 		{"precomposed e acute", "é", 1, 1, 1},
-		{"zwj family", "\U0001F469‍\U0001F469‍\U0001F467", 1, 5, 8},
+		{"zwj family", "\U0001F469\u200d\U0001F469\u200d\U0001F467", 1, 5, 8},
 		{"flag", "\U0001F1EE\U0001F1F3", 1, 2, 4},
 		{"newline", "\n", 1, 1, 1},
 		{"crlf is one element", "\r\n", 1, 2, 2},
 		{"empty", "", 0, 0, 0},
-		{"mixed line", "Line 3.1 naïve \U0001F469‍\U0001F469‍\U0001F467 text", 21, 25, 28},
+		{"mixed line", "Line 3.1 naïve \U0001F469\u200d\U0001F469\u200d\U0001F467 text", 21, 25, 28},
 		// Invalid UTF-8 decodes as U+FFFD, one unit per bad byte in every unit, as Go and .NET do
 		// when they meet it in a string.
 		{"invalid byte", "a\xffb", 3, 3, 3},
@@ -50,10 +50,10 @@ func TestLenIsAdditiveAcrossNewlines(t *testing.T) {
 	pieces := []string{
 		"abc",
 		"́ starts with a combining mark",
-		"ends with a zwj ‍",
+		"ends with a zwj \u200d",
 		"\U0001F1EE",
 		"\U0001F1F3 a lone regional indicator each side",
-		"\U0001F469‍\U0001F469‍\U0001F467",
+		"\U0001F469\u200d\U0001F469\u200d\U0001F467",
 		"",
 	}
 	for _, u := range []Unit{TextElements, UnicodeCodePoint, UTF16CodeUnit} {
