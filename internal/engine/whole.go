@@ -2,11 +2,9 @@ package engine
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"net/url"
 
-	"github.com/NilenduGanguli/azure-gateway-api/internal/azerr"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/upstream"
 )
 
@@ -64,7 +62,10 @@ func (e *Engine) whole(ctx context.Context, job string, call upstream.Call, t *t
 			e.metrics.exhaust()
 			log.Warn("engine: attempts exhausted", "attempts", n, "reason", a.Reason, "status", a.Status,
 				"cause", a.Cause)
-			return nil, exhausted(e.attemptErr(a), n)
+			// The last attempt's error goes to the client as the container sent it: the service
+			// never says how often it was asked. The count is in this log line, the job's run
+			// output and /_gw/jobs (upstreamAttempts).
+			return nil, e.attemptErr(a)
 		}
 		e.metrics.retry(a.Reason)
 		wait := e.backoff(n, a.RetryAfter)
@@ -74,16 +75,4 @@ func (e *Engine) whole(ctx context.Context, job string, call upstream.Call, t *t
 			return nil, err
 		}
 	}
-}
-
-// exhausted is the last attempt's error, saying how many attempts were made. It is a copy: the
-// attempt's error may be shared.
-func exhausted(err error, attempts int) error {
-	apiErr, ok := err.(*azerr.APIError)
-	if !ok {
-		return err
-	}
-	c := *apiErr
-	c.Message = fmt.Sprintf("%s (after %d attempts)", c.Message, attempts)
-	return &c
 }

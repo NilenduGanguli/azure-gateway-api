@@ -321,8 +321,8 @@ func TestHangHalvesDownToOnePage(t *testing.T) {
 	_, err := e.Run(context.Background(), pdfInput(t, "job-hang", 12, nil))
 	var apiErr *azerr.APIError
 	if !errors.As(err, &apiErr) || !strings.Contains(apiErr.Message, "timeout") ||
-		!strings.HasSuffix(apiErr.Message, "(after 2 attempts)") {
-		t.Fatalf("Run error %v, want the re-check's timeout after 2 attempts", err)
+		strings.Contains(apiErr.Message, "attempts") {
+		t.Fatalf("Run error %v, want the re-check's timeout, its message as it was", err)
 	}
 	var covering [][]int
 	for _, c := range fake.Calls() {
@@ -400,10 +400,15 @@ func TestWholeRetriesAndExhaustion(t *testing.T) {
 	t.Run("exhausted", func(t *testing.T) {
 		fake := newFake(t, mockazure.PagedOptions{FailFirst: map[int]int{1: 99}})
 		e := newEngine(t, azerr.SurfaceDI, fake.URL(), 4)
-		_, err := e.Run(context.Background(), pdfInput(t, "job-x", 3, nil))
+		out, err := e.Run(context.Background(), pdfInput(t, "job-x", 3, nil))
+		// The container's own message, verbatim: the service never says how often it was asked.
+		// The count is the run's, for the log and /_gw/jobs.
 		var apiErr *azerr.APIError
-		if !errors.As(err, &apiErr) || !strings.HasSuffix(apiErr.Message, "(after 5 attempts)") {
-			t.Fatalf("Run error %v, want the last error after 5 attempts", err)
+		if !errors.As(err, &apiErr) || apiErr.Message != "A transient error occurred. Try again." {
+			t.Fatalf("Run error %v, want the container's last error as it sent it", err)
+		}
+		if out == nil || out.Attempts != WholeAttempts {
+			t.Errorf("failed run output %+v, want %d attempts", out, WholeAttempts)
 		}
 		if got := len(fake.Calls()); got != WholeAttempts {
 			t.Errorf("%d calls, want %d", got, WholeAttempts)
@@ -416,10 +421,13 @@ func TestWholeRetriesAndExhaustion(t *testing.T) {
 		fake := newFake(t, mockazure.PagedOptions{Hang: map[int]bool{1: true}})
 		e := newEngine(t, azerr.SurfaceDI, fake.URL(), 4)
 		e.o.WholeTimeout = 100 * time.Millisecond
-		_, err := e.Run(context.Background(), pdfInput(t, "job-t", 3, nil))
+		out, err := e.Run(context.Background(), pdfInput(t, "job-t", 3, nil))
 		var apiErr *azerr.APIError
-		if !errors.As(err, &apiErr) || !strings.HasSuffix(apiErr.Message, "(after 2 attempts)") {
-			t.Fatalf("Run error %v, want the timeout after 2 attempts", err)
+		if !errors.As(err, &apiErr) || strings.Contains(apiErr.Message, "attempts") {
+			t.Fatalf("Run error %v, want the timeout, its message as it was", err)
+		}
+		if out == nil || out.Attempts != 2 {
+			t.Errorf("failed run output %+v, want 2 attempts", out)
 		}
 	})
 }

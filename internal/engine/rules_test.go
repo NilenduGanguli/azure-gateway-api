@@ -261,8 +261,9 @@ func TestSinglePageExhaustionIsRechecked(t *testing.T) {
 		e.o.WholeTimeout = 300 * time.Millisecond
 		_, err := e.Run(context.Background(), pdfInput(t, "job-hung-page", 12, nil))
 		var apiErr *azerr.APIError
-		if !errors.As(err, &apiErr) || !strings.HasSuffix(apiErr.Message, "(after 2 attempts)") {
-			t.Fatalf("Run error %v, want the re-check's timeout after 2 attempts", err)
+		if !errors.As(err, &apiErr) || !strings.Contains(apiErr.Message, "timeout") ||
+			strings.Contains(apiErr.Message, "attempts") {
+			t.Fatalf("Run error %v, want the re-check's timeout, its message as it was", err)
 		}
 		var rechecks int
 		for _, c := range fake.Calls() {

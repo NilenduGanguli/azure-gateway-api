@@ -686,7 +686,7 @@ then go whole, as before.
 | Signal in `error` / logs | Cause |
 |---|---|
 | `The … container does not serve the synchronous analyze route.` | This build does not answer `:syncAnalyze` (404/405/501 or `UnhandledEndpointException`). Re-run the probe (§1); the build cannot run behind this gateway. |
-| `… (after 5 attempts)` | Every attempt failed transiently. The attempt lines' `reason` says how: 503s from HAProxy, resets, timeouts. |
+| `engine: attempts exhausted` in the log, the job's `upstreamAttempts` at 5 in `/_gw/jobs` | Every attempt failed transiently, and the client got the last attempt's error verbatim. The attempt lines' `reason` says how: 503s from HAProxy, resets, timeouts. |
 | `Unauthorized` / an upstream 401 | Wrong or missing `*_UPSTREAM_API_KEY`. |
 | `400 InvalidArgument` naming `features`, `queryFields`, `outputContentFormat` or `output` | The parameter policy (README, api-surface §0). Not a container failure. |
 | `upstream: response exceeds the configured maximum` | `MAX_RESULT_BYTES` is smaller than the real output. |

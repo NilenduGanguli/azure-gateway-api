@@ -478,8 +478,9 @@ with its own error, rather than the gateway inventing one.
 attempt is `Sched.Acquire(ctx, jobID)` → `Client.Do` with `Timeout` = `DI_UPSTREAM_TIMEOUT` or
 `READ_SYNC_TIMEOUT` → release, with the backoff of §4.2 between attempts. `AnalysisFailed`,
 `Terminal` and `RouteMissing` return at once. When attempts run out, the job fails with the
-**last** attempt's error, its message extended with the attempt count (*"… (after 5 attempts)"*),
-and `gateway_upstream_exhausted_total` counts it.
+**last** attempt's error exactly as the container sent it, since the service never reports how often
+it was asked. The attempt count goes to the `engine: attempts exhausted` log line and to the job's
+`upstreamAttempts` in `/_gw/jobs`, and `gateway_upstream_exhausted_total` counts the job.
 
 ### 4.4 Splitting (`internal/pdfsplit`)
 
