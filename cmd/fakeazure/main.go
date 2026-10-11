@@ -5,7 +5,7 @@
 //	fakeazure -di 127.0.0.1:5001 -read 127.0.0.1:5002 -hang 7 -fail-first 3:2 -title-first
 //
 // Each fake answers from docgen for the original pages it is sent, as mockazure.NewPaged does,
-// and the page flags apply to both. It prints one NAME=URL line per fake, in the form the
+// in docgen's realistic shape unless -plain is given, and the page flags apply to both. It prints one NAME=URL line per fake, in the form the
 // gateway's settings take, and serves until interrupted.
 //
 // It is a development tool: the image builds cmd/gateway only.
@@ -23,6 +23,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/NilenduGanguli/azure-gateway-api/internal/docgen"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/mockazure"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/pdfsplit"
 )
@@ -69,6 +70,10 @@ func parseFlags(args []string, stderr io.Writer) (settings, error) {
 		"for each `PAGE:N,...` pair, the first N calls covering PAGE answer 503")
 	fs.BoolVar(&s.opts.Doc.TitleOnFirstPage, "title-first", false,
 		"mark each analysed document's first heading as a title, so split and whole results differ")
+	var plain bool
+	fs.BoolVar(&plain, "plain", false,
+		"answer Document Intelligence in docgen's plain shape, without the page headers, footers\n"+
+			"and numbers, blank pages (every seventh), captions and selection marks real documents have")
 	fs.DurationVar(&s.opts.Latency, "latency", 0, "delay each synchronous call by `DUR`")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "usage: fakeazure [-di ADDR] [-read ADDR] [flags]\n\n"+
@@ -87,6 +92,12 @@ func parseFlags(args []string, stderr io.Writer) (settings, error) {
 	}
 	if s.di == "" && s.read == "" {
 		return settings{}, errors.New("give -di or -read, or both: there is nothing to serve")
+	}
+	if !plain {
+		// Every request names its own stringIndexType, or gets the service's default.
+		realistic := docgen.Realistic(0)
+		realistic.TitleOnFirstPage = s.opts.Doc.TitleOnFirstPage
+		s.opts.Doc = realistic
 	}
 
 	var err error

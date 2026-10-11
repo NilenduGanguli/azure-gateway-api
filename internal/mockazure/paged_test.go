@@ -112,12 +112,14 @@ func tryPostDoc(ctx context.Context, c *Container, path, contentType string, bod
 		body: raw, err: err}, nil
 }
 
-// expected is the analyzeResult docgen gives for pages on the route's surface.
-func expected(s Surface, pages []int, n docgen.Numbering, o docgen.Options) []byte {
-	if s == DI {
+// expected is the analyzeResult docgen gives for pages of a PDF on the route: in the 2023-07-31
+// shape on the legacy family, and in inches on Read.
+func expected(rt pagedRoute, pages []int, n docgen.Numbering, o docgen.Options) []byte {
+	if rt.surface == DI {
+		o.Legacy = strings.Contains(rt.sync, "api-version="+docgen.LegacyAPIVersion)
 		return docgen.DI(pages, n, o)
 	}
-	return docgen.Read(pages, n)
+	return docgen.Read(pages, n, docgen.ReadOptions{})
 }
 
 // succeeded wraps a result in the envelope the synchronous route answers with, written out here
@@ -165,7 +167,7 @@ func TestPagedWholeDocumentUsesOriginalNumbering(t *testing.T) {
 			defer c.Close()
 
 			r := postDoc(t, c, rt.sync, "application/pdf", pdftest.Make(12))
-			wantSucceeded(t, r, expected(rt.surface, pageRange(1, 12), docgen.Original, docgen.Options{}))
+			wantSucceeded(t, r, expected(rt, pageRange(1, 12), docgen.Original, docgen.Options{}))
 			wantCalls(t, c, pageRange(1, 12))
 		})
 	}
@@ -178,7 +180,7 @@ func TestPagedPartUsesLocalNumbering(t *testing.T) {
 			defer c.Close()
 
 			r := postDoc(t, c, rt.sync, "application/pdf", partOf(t, 12, 4, 5, 6))
-			wantSucceeded(t, r, expected(rt.surface, []int{4, 5, 6}, docgen.Local, docgen.Options{}))
+			wantSucceeded(t, r, expected(rt, []int{4, 5, 6}, docgen.Local, docgen.Options{}))
 			wantCalls(t, c, []int{4, 5, 6})
 		})
 	}
@@ -204,7 +206,7 @@ func TestPagedPagesParameter(t *testing.T) {
 				defer c.Close()
 
 				r := postDoc(t, c, withQuery(rt.sync, "pages="+tc.pages), "application/pdf", tc.body(t))
-				wantSucceeded(t, r, expected(rt.surface, tc.want, docgen.Original, docgen.Options{}))
+				wantSucceeded(t, r, expected(rt, tc.want, docgen.Original, docgen.Options{}))
 				wantCalls(t, c, tc.want)
 			})
 		}
@@ -320,7 +322,12 @@ func TestPagedBodiesItCannotIdentify(t *testing.T) {
 				defer c.Close()
 
 				r := postDoc(t, c, rt.sync, tc.contentType, tc.body)
-				wantSucceeded(t, r, expected(rt.surface, tc.want, docgen.Original, docgen.Options{}))
+				want := expected(rt, tc.want, docgen.Original, docgen.Options{})
+				if rt.surface == Read && tc.contentType == "image/png" {
+					// Read measures an image in pixels.
+					want = docgen.Read(tc.want, docgen.Original, docgen.ReadOptions{Image: true})
+				}
+				wantSucceeded(t, r, want)
 				wantCalls(t, c, tc.want)
 			})
 		}
@@ -372,7 +379,7 @@ func TestPagedHangBlocksUntilTheRequestEnds(t *testing.T) {
 
 			// Another part is answered while the first is still held.
 			wantSucceeded(t, postDoc(t, c, rt.sync, "application/pdf", partOf(t, 8, 7, 8)),
-				expected(rt.surface, []int{7, 8}, docgen.Local, docgen.Options{}))
+				expected(rt, []int{7, 8}, docgen.Local, docgen.Options{}))
 			select {
 			case err := <-held:
 				t.Fatalf("the call covering page 5 ended (%v) before its client gave up", err)
@@ -415,11 +422,11 @@ func TestPagedHangFirstHangsOnlyTheFirstCall(t *testing.T) {
 			}()
 			waitUntil(t, "the first call to be recorded", func() bool { return len(c.Calls()) == 1 })
 
-			want := expected(rt.surface, []int{4, 5, 6}, docgen.Local, docgen.Options{})
+			want := expected(rt, []int{4, 5, 6}, docgen.Local, docgen.Options{})
 			wantSucceeded(t, postDoc(t, c, rt.sync, "application/pdf", part), want) // the hedge
 			// Page 6 hung in that first call too, so a call covering it alone is answered.
 			wantSucceeded(t, postDoc(t, c, withQuery(rt.sync, "pages=6"), "application/pdf",
-				pdftest.Make(8)), expected(rt.surface, []int{6}, docgen.Original, docgen.Options{}))
+				pdftest.Make(8)), expected(rt, []int{6}, docgen.Original, docgen.Options{}))
 
 			cancel()
 			if err := <-held; !errors.Is(err, context.Canceled) {
@@ -441,7 +448,7 @@ func TestPagedFailFirstCountsDown(t *testing.T) {
 
 			// A part not covering a failing page is untouched.
 			wantSucceeded(t, postDoc(t, c, rt.sync, "application/pdf", partOf(t, 6, 5, 6)),
-				expected(rt.surface, []int{5, 6}, docgen.Local, docgen.Options{}))
+				expected(rt, []int{5, 6}, docgen.Local, docgen.Options{}))
 
 			for n := 1; n <= 2; n++ {
 				r := postDoc(t, c, rt.sync, "application/pdf", part)
@@ -457,7 +464,7 @@ func TestPagedFailFirstCountsDown(t *testing.T) {
 				}
 			}
 			wantSucceeded(t, postDoc(t, c, rt.sync, "application/pdf", part),
-				expected(rt.surface, []int{3, 4}, docgen.Local, docgen.Options{}))
+				expected(rt, []int{3, 4}, docgen.Local, docgen.Options{}))
 			wantCalls(t, c, []int{5, 6}, []int{3, 4}, []int{3, 4}, []int{3, 4})
 		})
 	}
@@ -496,14 +503,14 @@ func TestPagedBadContent(t *testing.T) {
 
 				wantBad("part", postDoc(t, c, rt.sync, "application/pdf", partOf(t, 12, 5, 6, 7, 8)))
 				wantSucceeded(t, postDoc(t, c, rt.sync, "application/pdf", partOf(t, 12, 9, 10)),
-					expected(rt.surface, []int{9, 10}, docgen.Local, docgen.Options{}))
+					expected(rt, []int{9, 10}, docgen.Local, docgen.Options{}))
 
 				recheck := postDoc(t, c, withQuery(rt.sync, "pages=5-8"), "application/pdf", pdftest.Make(12))
 				whole := postDoc(t, c, rt.sync, "application/pdf", pdftest.Make(12))
 				if onlySplit {
-					wantSucceeded(t, recheck, expected(rt.surface, []int{5, 6, 7, 8}, docgen.Original,
+					wantSucceeded(t, recheck, expected(rt, []int{5, 6, 7, 8}, docgen.Original,
 						docgen.Options{}))
-					wantSucceeded(t, whole, expected(rt.surface, pageRange(1, 12), docgen.Original,
+					wantSucceeded(t, whole, expected(rt, pageRange(1, 12), docgen.Original,
 						docgen.Options{}))
 				} else {
 					wantBad("re-check", recheck)
@@ -532,7 +539,7 @@ func TestPagedAsyncRouteServesTheSameResult(t *testing.T) {
 			poll := fetch(t, http.MethodGet, loc)
 			want := `{"status":"succeeded","createdDateTime":"2024-11-30T00:00:00Z",` +
 				`"lastUpdatedDateTime":"2024-11-30T00:00:02Z","analyzeResult":` +
-				string(expected(rt.surface, []int{2, 3, 4}, docgen.Original, docgen.Options{})) + `}`
+				string(expected(rt, []int{2, 3, 4}, docgen.Original, docgen.Options{})) + `}`
 			if poll.status != http.StatusOK || string(poll.body) != want {
 				t.Errorf("poll: status %d\n got: %.300s\nwant: %.300s", poll.status, poll.body, want)
 			}
@@ -550,7 +557,7 @@ func TestPagedBareBody(t *testing.T) {
 			c := NewPaged(PagedOptions{Surface: rt.surface, SyncBodyBare: true})
 			defer c.Close()
 			r := postDoc(t, c, rt.sync, "application/pdf", partOf(t, 5, 2, 3))
-			want := expected(rt.surface, []int{2, 3}, docgen.Local, docgen.Options{})
+			want := expected(rt, []int{2, 3}, docgen.Local, docgen.Options{})
 			if r.status != http.StatusOK || !bytes.Equal(r.body, want) {
 				t.Errorf("status %d, body %.200s; want docgen's bare result", r.status, r.body)
 			}
@@ -576,7 +583,7 @@ func TestPagedFrontDoorAndKey(t *testing.T) {
 			}
 			wantSucceeded(t, postDoc(t, c, rt.sync, "application/pdf", doc,
 				"Ocp-Apim-Subscription-Key", "secret"),
-				expected(rt.surface, pageRange(1, 3), docgen.Original, docgen.Options{}))
+				expected(rt, pageRange(1, 3), docgen.Original, docgen.Options{}))
 
 			// Only the call the container served analysed anything.
 			wantCalls(t, c, pageRange(1, 3))

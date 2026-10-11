@@ -8,7 +8,7 @@
   "response": {
     "status": 200,
     "headers": {
-      "Content-Length": "2771",
+      "Content-Length": "2770",
       "Content-Type": "application/json; charset=utf-8",
       "Server": "Kestrel"
     },
@@ -277,10 +277,15 @@
             ]
           }
         ],
+        "tables": [],
         "paragraphs": [
           {
-            "role": "sectionHeading",
-            "content": "Heading P1",
+            "spans": [
+              {
+                "offset": 0,
+                "length": 10
+              }
+            ],
             "boundingRegions": [
               {
                 "pageNumber": 1,
@@ -296,15 +301,16 @@
                 ]
               }
             ],
-            "spans": [
-              {
-                "offset": 0,
-                "length": 10
-              }
-            ]
+            "role": "sectionHeading",
+            "content": "Heading P1"
           },
           {
-            "content": "Line 1.1 naïve 👩‍👩‍👧 text",
+            "spans": [
+              {
+                "offset": 11,
+                "length": 21
+              }
+            ],
             "boundingRegions": [
               {
                 "pageNumber": 1,
@@ -320,15 +326,15 @@
                 ]
               }
             ],
-            "spans": [
-              {
-                "offset": 11,
-                "length": 21
-              }
-            ]
+            "content": "Line 1.1 naïve 👩‍👩‍👧 text"
           },
           {
-            "content": "Line 1.2 plain",
+            "spans": [
+              {
+                "offset": 33,
+                "length": 14
+              }
+            ],
             "boundingRegions": [
               {
                 "pageNumber": 1,
@@ -344,16 +350,11 @@
                 ]
               }
             ],
-            "spans": [
-              {
-                "offset": 33,
-                "length": 14
-              }
-            ]
+            "content": "Line 1.2 plain"
           }
         ],
-        "tables": [],
-        "figures": [],
+        "styles": [],
+        "contentFormat": "text",
         "sections": [
           {
             "spans": [
@@ -379,8 +380,7 @@
               "/paragraphs/2"
             ]
           }
-        ],
-        "contentFormat": "text"
+        ]
       }
     }
   }

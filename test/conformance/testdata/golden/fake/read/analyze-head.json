@@ -8,7 +8,7 @@
   "response": {
     "status": 200,
     "headers": {
-      "Content-Length": "563",
+      "Content-Length": "970",
       "Content-Type": "application/json; charset=utf-8",
       "Server": "Kestrel"
     },

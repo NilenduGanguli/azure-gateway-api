@@ -108,32 +108,47 @@ var numberings = map[string]func(i int) docgen.Numbering{
 	},
 }
 
+// shapes are docgen's shapes: plain; realistic, with page furniture outside every section,
+// blank pages, captions and selection marks, as real documents have; and the /formrecognizer
+// 2023-07-31 shape, with no sections or figures.
+var shapes = map[string]func(u textunit.Unit) docgen.Options{
+	"plain":     func(u textunit.Unit) docgen.Options { return docgen.Options{Unit: u} },
+	"realistic": docgen.Realistic,
+	"legacy": func(u textunit.Unit) docgen.Options {
+		o := docgen.Realistic(u)
+		o.Legacy = true
+		return o
+	},
+}
+
 func TestDIRoundTrip(t *testing.T) {
 	for _, n := range []int{1, 2, 6, 7, 11, 23} {
 		for _, u := range units {
-			opts := docgen.Options{Unit: u}
-			whole := docgen.DI(pageRange(1, n), docgen.Original, opts)
-			for name, numbering := range numberings {
-				t.Run(fmt.Sprintf("%d pages/%v/%s", n, u, name), func(t *testing.T) {
-					var parts []merge.Part
-					for i, pages := range plan(n, 5) {
-						parts = append(parts, writePart(t, docgen.DI(pages, numbering(i), opts), pages, i%2 == 1))
-					}
-					var out bytes.Buffer
-					st, err := merge.DI(&out, parts, u)
-					if err != nil {
-						t.Fatalf("merge.DI: %v", err)
-					}
-					sameBytes(t, out.Bytes(), whole)
-					if st.Pages != n || st.Bytes != int64(len(whole)) {
-						t.Errorf("stats pages=%d bytes=%d, want %d and %d", st.Pages, st.Bytes, n, len(whole))
-					}
-					for member, c := range counts(t, whole) {
-						if st.Counts[member] != c {
-							t.Errorf("stats count %s=%d, want %d", member, st.Counts[member], c)
+			for shape, options := range shapes {
+				opts := options(u)
+				whole := docgen.DI(pageRange(1, n), docgen.Original, opts)
+				for name, numbering := range numberings {
+					t.Run(fmt.Sprintf("%d pages/%v/%s/%s", n, u, shape, name), func(t *testing.T) {
+						var parts []merge.Part
+						for i, pages := range plan(n, 5) {
+							parts = append(parts, writePart(t, docgen.DI(pages, numbering(i), opts), pages, i%2 == 1))
 						}
-					}
-				})
+						var out bytes.Buffer
+						st, err := merge.DI(&out, parts, u)
+						if err != nil {
+							t.Fatalf("merge.DI: %v", err)
+						}
+						sameBytes(t, out.Bytes(), whole)
+						if st.Pages != n || st.Bytes != int64(len(whole)) {
+							t.Errorf("stats pages=%d bytes=%d, want %d and %d", st.Pages, st.Bytes, n, len(whole))
+						}
+						for member, c := range counts(t, whole) {
+							if st.Counts[member] != c {
+								t.Errorf("stats count %s=%d, want %d", member, st.Counts[member], c)
+							}
+						}
+					})
+				}
 			}
 		}
 	}
@@ -142,21 +157,26 @@ func TestDIRoundTrip(t *testing.T) {
 // TestDIRoundTripAnyPlan merges plans the splitter would not make, down to one page per part and
 // with pages skipped, as a client's pages= selection would leave them.
 func TestDIRoundTripAnyPlan(t *testing.T) {
-	selected := []int{2, 3, 4, 8, 9, 12, 13, 16, 20, 21, 24}
-	for _, u := range units {
-		opts := docgen.Options{Unit: u}
-		whole := docgen.DI(selected, docgen.Original, opts)
-		for _, size := range []int{1, 2, 3, 4} {
-			var parts []merge.Part
-			for i := 0; i < len(selected); i += size {
-				pages := selected[i:min(i+size, len(selected))]
-				parts = append(parts, writePart(t, docgen.DI(pages, numberings["mixed"](i), opts), pages, false))
+	// Pages 7, 14 and 21 are blank in the realistic shape, so some plans have a part of blank
+	// pages only, first part included.
+	for _, selected := range [][]int{{2, 3, 4, 8, 9, 12, 13, 16, 20, 21, 24}, {7, 8, 9, 14, 15, 21, 22}} {
+		for _, u := range units {
+			for shape, options := range shapes {
+				opts := options(u)
+				whole := docgen.DI(selected, docgen.Original, opts)
+				for _, size := range []int{1, 2, 3, 4} {
+					var parts []merge.Part
+					for i := 0; i < len(selected); i += size {
+						pages := selected[i:min(i+size, len(selected))]
+						parts = append(parts, writePart(t, docgen.DI(pages, numberings["mixed"](i), opts), pages, false))
+					}
+					var out bytes.Buffer
+					if _, err := merge.DI(&out, parts, u); err != nil {
+						t.Fatalf("%v %s pages %v size %d: %v", u, shape, selected, size, err)
+					}
+					sameBytes(t, out.Bytes(), whole)
+				}
 			}
-			var out bytes.Buffer
-			if _, err := merge.DI(&out, parts, u); err != nil {
-				t.Fatalf("%v size %d: %v", u, size, err)
-			}
-			sameBytes(t, out.Bytes(), whole)
 		}
 	}
 }
@@ -166,7 +186,7 @@ func TestDIRoundTripAnyPlan(t *testing.T) {
 // exercises whitespace between members, around items and after the root section.
 func TestPrettyPrintedParts(t *testing.T) {
 	for _, u := range units {
-		opts := docgen.Options{Unit: u}
+		opts := docgen.Realistic(u)
 		whole := docgen.DI(pageRange(1, 11), docgen.Original, opts)
 		var parts []merge.Part
 		for i, pages := range plan(11, 5) {
@@ -197,8 +217,10 @@ func TestArraysAbsentFromSomeParts(t *testing.T) {
 	for i, pages := range runs {
 		b := docgen.DI(pages, docgen.Local, docgen.Options{})
 		switch i {
-		case 0: // pages 1-3 have no figure
-			b = bytes.Replace(b, []byte(`,"figures":[]`), nil, 1)
+		case 0: // pages 1-3 have no figure, and docgen leaves the member out as the service does
+			if bytes.Contains(b, []byte(`"figures"`)) {
+				t.Fatal("test bug: pages 1-3 have figures")
+			}
 		case 2: // pages 7-8 have no table
 			b = bytes.Replace(b, []byte(`,"tables":[]`), nil, 1)
 		}
@@ -229,7 +251,7 @@ func TestArraysAbsentFromSomeParts(t *testing.T) {
 		t.Errorf("counts %v", st.Counts)
 	}
 	if order := memberOrder(t, out.Bytes()); order != "apiVersion modelId stringIndexType content "+
-		"pages paragraphs tables figures sections contentFormat" {
+		"pages tables paragraphs styles contentFormat sections figures" {
 		t.Errorf("member order %q", order)
 	}
 	sameBytes(t, out.Bytes(), whole)
@@ -243,14 +265,15 @@ func TestMemberFirstSeenLaterKeepsItsPlace(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		runs [][]int
-		drop map[int]string // the empty array each part leaves out
+		drop map[int]string // an empty array a part leaves out, besides figures, which docgen omits
 	}{
 		// Pages 1-3 have no figure; page 4 has one.
-		{"part 0 lacks figures", [][]int{{1, 2, 3}, {4, 5, 6}}, map[int]string{0: "figures"}},
-		// Page 3 has a table and no figure, page 4 a figure and no table, page 12 both. Part 1
-		// alone would put figures before tables; part 2 shows the order.
-		{"a later part settles the order", [][]int{{3}, {4}, {12}},
-			map[int]string{0: "figures", 1: "tables"}},
+		{"part 0 lacks figures", [][]int{{1, 2, 3}, {4, 5, 6}}, nil},
+		// Page 3 has a table and no figure, page 4 a figure and no table, page 12 both. Part 0
+		// alone has no figures, part 1 no tables; together with part 2 they settle the order.
+		{"a later part settles the order", [][]int{{3}, {4}, {12}}, map[int]string{1: "tables"}},
+		// The first part has neither: tables and figures each first appear in a later part.
+		{"members first seen in later parts", [][]int{{1}, {4}, {6}}, map[int]string{0: "tables", 1: "tables"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var parts []merge.Part
@@ -278,12 +301,13 @@ func TestMemberFirstSeenLaterKeepsItsPlace(t *testing.T) {
 
 func TestReadRoundTrip(t *testing.T) {
 	for _, n := range []int{1, 2, 6, 7, 11, 23} {
-		whole := docgen.Read(pageRange(1, n), docgen.Original)
+		ro := docgen.ReadOptions{Image: n == 1}
+		whole := docgen.Read(pageRange(1, n), docgen.Original, ro)
 		for name, numbering := range numberings {
 			t.Run(fmt.Sprintf("%d pages/%s", n, name), func(t *testing.T) {
 				var parts []merge.Part
 				for i, pages := range plan(n, 5) {
-					parts = append(parts, writePart(t, docgen.Read(pages, numbering(i)), pages, i%2 == 0))
+					parts = append(parts, writePart(t, docgen.Read(pages, numbering(i), ro), pages, i%2 == 0))
 				}
 				var out bytes.Buffer
 				st, err := merge.Read(&out, parts)

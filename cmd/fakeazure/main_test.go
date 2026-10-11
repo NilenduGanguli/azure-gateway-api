@@ -26,14 +26,21 @@ func TestParseFlags(t *testing.T) {
 		args []string
 		want settings
 	}{
-		{"DI only", []string{"-di", "127.0.0.1:5001"}, settings{di: "127.0.0.1:5001"}},
-		{"Read only", []string{"-read", ":5002"}, settings{read: ":5002"}},
+		{"DI only", []string{"-di", "127.0.0.1:5001"}, settings{di: "127.0.0.1:5001",
+			opts: mockazure.PagedOptions{Doc: docgen.Realistic(0)}}},
+		{"Read only", []string{"-read", ":5002"}, settings{read: ":5002",
+			opts: mockazure.PagedOptions{Doc: docgen.Realistic(0)}}},
+		{"the plain shape", []string{"-di", ":5001", "-plain"}, settings{di: ":5001"}},
 		{"everything", []string{
 			"-di", "127.0.0.1:5001", "-read", "127.0.0.1:5002",
 			"-hang", "7,9-10", "-hang-first", "3", "-fail-first", "3:2, 5:1",
 			"-title-first", "-latency", "250ms",
 		}, settings{di: "127.0.0.1:5001", read: "127.0.0.1:5002", opts: mockazure.PagedOptions{
-			Doc:       docgen.Options{TitleOnFirstPage: true},
+			Doc: func() docgen.Options {
+				o := docgen.Realistic(0)
+				o.TitleOnFirstPage = true
+				return o
+			}(),
 			Hang:      map[int]bool{7: true, 9: true, 10: true},
 			HangFirst: map[int]bool{3: true},
 			FailFirst: map[int]int{3: 2, 5: 1},

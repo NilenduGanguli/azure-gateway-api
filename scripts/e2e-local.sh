@@ -528,8 +528,9 @@ done
 end
 
 # The paged fake answers page i with "Heading P<i>", so the merged content names every page once,
-# in order, only when each part landed where it belongs.
-IN_ORDER='re.findall(r"Heading P(\d+)", d["analyzeResult"]["content"]) == [str(i) for i in range(1, 13)]'
+# in order, only when each part landed where it belongs. Page 7 is blank, as fakeazure's realistic
+# shape leaves every seventh page, so it has no heading.
+IN_ORDER='re.findall(r"Heading P(\d+)", d["analyzeResult"]["content"]) == [str(i) for i in range(1, 13) if i % 7]'
 
 begin "DI :analyze, 12-page PDF -> 12 pages in order, merged from 3 parts"
 req POST "$DIM:analyze?$DIQ" -H 'Content-Type: application/pdf' --data-binary "@$PDFS/pages-12.pdf"

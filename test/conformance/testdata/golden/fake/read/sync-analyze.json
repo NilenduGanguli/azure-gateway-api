@@ -9,7 +9,7 @@
   "response": {
     "status": 200,
     "headers": {
-      "Content-Length": "563",
+      "Content-Length": "970",
       "Content-Type": "application/json; charset=utf-8",
       "Server": "Kestrel"
     },
@@ -30,58 +30,113 @@
             "lines": [
               {
                 "boundingBox": [
-                  11,
-                  21,
-                  361,
-                  21,
-                  361,
-                  51,
-                  11,
-                  51
+                  506,
+                  754,
+                  2506,
+                  754,
+                  2506,
+                  859,
+                  506,
+                  859
                 ],
                 "text": "Read line 1",
+                "appearance": {
+                  "style": {
+                    "name": "other",
+                    "confidence": 0.813
+                  }
+                },
                 "words": [
                   {
                     "boundingBox": [
-                      11,
-                      21,
-                      111,
-                      21,
-                      111,
-                      51,
-                      11,
-                      51
+                      506,
+                      754,
+                      1056,
+                      754,
+                      1056,
+                      859,
+                      506,
+                      859
                     ],
                     "text": "Read",
-                    "confidence": 0.99
+                    "confidence": 0.953
                   },
                   {
                     "boundingBox": [
-                      131,
-                      21,
-                      231,
-                      21,
-                      231,
-                      51,
-                      131,
-                      51
+                      1131,
+                      754,
+                      1681,
+                      754,
+                      1681,
+                      859,
+                      1131,
+                      859
                     ],
                     "text": "line",
-                    "confidence": 0.99
+                    "confidence": 0.964
                   },
                   {
                     "boundingBox": [
-                      251,
-                      21,
-                      351,
-                      21,
-                      351,
-                      51,
-                      251,
-                      51
+                      1756,
+                      754,
+                      2306,
+                      754,
+                      2306,
+                      859,
+                      1756,
+                      859
                     ],
                     "text": "1",
-                    "confidence": 0.99
+                    "confidence": 0.975
+                  }
+                ]
+              },
+              {
+                "boundingBox": [
+                  506,
+                  954,
+                  2506,
+                  954,
+                  2506,
+                  1059,
+                  506,
+                  1059
+                ],
+                "text": "Total 7",
+                "appearance": {
+                  "style": {
+                    "name": "other",
+                    "confidence": 0.82
+                  }
+                },
+                "words": [
+                  {
+                    "boundingBox": [
+                      506,
+                      954,
+                      1056,
+                      954,
+                      1056,
+                      1059,
+                      506,
+                      1059
+                    ],
+                    "text": "Total",
+                    "confidence": 0.958
+                  },
+                  {
+                    "boundingBox": [
+                      1131,
+                      954,
+                      1681,
+                      954,
+                      1681,
+                      1059,
+                      1131,
+                      1059
+                    ],
+                    "text": "7",
+                    "confidence": 0.969
                   }
                 ]
               }

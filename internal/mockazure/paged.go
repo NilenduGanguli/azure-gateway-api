@@ -189,6 +189,8 @@ type analysis struct {
 	numbering docgen.Numbering
 	unit      textunit.Unit
 	split     bool // the document is a part cut from a larger one
+	image     bool // the document is not a PDF: Read measures it in pixels
+	legacy    bool // a /formrecognizer 2023-07-31 request, answered in that API's shape
 }
 
 // analyse works out what a request asks for. When the container would refuse it, analyse answers
@@ -217,8 +219,11 @@ func (p *paged) analyse(w http.ResponseWriter, r *http.Request, body []byte, di 
 	// Parsed whatever the client does meanwhile: pdfcpu stops on a cancelled context, and a body
 	// it stops on would be taken for one unreadable page, so a call abandoned mid-parse would be
 	// listed as page 1 and spend page 1's injected failures. serveSync drops such a call instead.
-	sent := identify(context.WithoutCancel(r.Context()), document(r, body))
+	doc := document(r, body)
+	sent := identify(context.WithoutCancel(r.Context()), doc)
 	a.pages, a.split = sent, !isOriginal(sent)
+	a.image = doc != nil && !pdfsplit.IsPDF(doc)
+	a.legacy = di && q.Get("api-version") == docgen.LegacyAPIVersion
 	a.numbering = docgen.Local
 	if !a.split {
 		a.numbering = docgen.Original
@@ -333,13 +338,16 @@ func (p *paged) bad(a analysis) bool {
 	return false
 }
 
-// result is docgen's analyzeResult for the analysis.
+// result is docgen's analyzeResult for the analysis, in the shape the request's API version has:
+// 2023-07-31 on /formrecognizer has no sections, figures or contentFormat. A Read result is in
+// inches for a PDF and in pixels for an image, as the service measures them.
 func (p *paged) result(a analysis, di bool) []byte {
 	if !di {
-		return docgen.Read(a.pages, a.numbering)
+		return docgen.Read(a.pages, a.numbering, docgen.ReadOptions{Image: a.image})
 	}
 	o := p.o.Doc
 	o.Unit = a.unit
+	o.Legacy = a.legacy
 	return docgen.DI(a.pages, a.numbering, o)
 }
 

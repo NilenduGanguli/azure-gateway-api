@@ -302,7 +302,7 @@ func TestRead(t *testing.T) {
 	in := pdfInput(t, "job-read", 12, nil)
 	in.ModelID, in.Query = "", nil
 	out := run(t, e, in)
-	if got, want := result(t, out), docgen.Read(seq(1, 12), docgen.Original); !bytes.Equal(got, want) {
+	if got, want := result(t, out), docgen.Read(seq(1, 12), docgen.Original, docgen.ReadOptions{}); !bytes.Equal(got, want) {
 		t.Fatalf("result differs from the whole document's:\n got %.300s\nwant %.300s", got, want)
 	}
 	if out.Parts != 3 {

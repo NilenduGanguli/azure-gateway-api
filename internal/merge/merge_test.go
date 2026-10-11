@@ -61,8 +61,8 @@ func rootSpansCase(name, spans, want string) diCheck {
 		return diParts(t, [][]int{{1, 2, 3}, {4, 5, 6}}, func(i int, b []byte) []byte {
 			if i == 1 {
 				return withRootSpans(t, b, func(n int) string {
-					if n != 158 {
-						t.Fatalf("test bug: part 1's root is %d long, not 158", n)
+					if n != 157 {
+						t.Fatalf("test bug: part 1's root is %d long, not 157", n)
 					}
 					return spans
 				})
@@ -156,13 +156,13 @@ func TestDIChecks(t *testing.T) {
 		}, 0, "result page 1 (numbered 7) is not planned page 4"},
 		{"unknown object member differs", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
-				return replace(t, b, `"contentFormat":"text"}`, fmt.Sprintf(`"contentFormat":"text","x":{"a":%d}}`, i))
+				return withMembers(t, b, fmt.Sprintf(`"x":{"a":%d}`, i))
 			})
 		}, 0, "part 1: member \"x\" differs"},
 		{"unknown member only in a later part", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
 				if i == 1 {
-					return replace(t, b, `"contentFormat":"text"}`, `"contentFormat":"text","x":true}`)
+					return withMembers(t, b, `"x":true`)
 				}
 				return b
 			})
@@ -173,7 +173,7 @@ func TestDIChecks(t *testing.T) {
 				if i == 1 {
 					v = `{}`
 				}
-				return replace(t, b, `"contentFormat":"text"}`, `"contentFormat":"text","x":`+v+`}`)
+				return withMembers(t, b, `"x":`+v)
 			})
 		}, 0, "part 1: member \"x\" differs"},
 		{"pointer past the part's paragraphs", func(t *testing.T) []merge.Part {
@@ -297,7 +297,7 @@ func TestDIChecks(t *testing.T) {
 		{"member that appears twice", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
 				if i == 1 {
-					return replace(t, b, `"contentFormat":"text"}`, `"contentFormat":"text","tables":[]}`)
+					return withMembers(t, b, `"tables":[]`)
 				}
 				return b
 			})
@@ -308,7 +308,7 @@ func TestDIChecks(t *testing.T) {
 				if i == 1 {
 					v = `"y":[],"x":[]`
 				}
-				return replace(t, b, `"contentFormat":"text"}`, `"contentFormat":"text",`+v+`}`)
+				return withMembers(t, b, v)
 			})
 		}, 0, "the parts give their members in conflicting orders"},
 		{"root sections with members in conflicting orders", func(t *testing.T) []merge.Part {
@@ -338,24 +338,24 @@ func TestDIChecks(t *testing.T) {
 		{"no parts", func(t *testing.T) []merge.Part { return nil }, 0, "no parts"},
 
 		// Root section spans are decoded strictly: the merge writes the merged root's span
-		// itself, so it must know exactly what each part's says. Part 1's root is 158 long.
-		rootSpansCase("root span member in another case", `[{"Offset":0,"length":158}]`,
+		// itself, so it must know exactly what each part's says. Part 1's root is 157 long.
+		rootSpansCase("root span member in another case", `[{"Offset":0,"length":157}]`,
 			`part 1: root section span 0 has "Offset", not only "offset" and "length"`),
-		rootSpansCase("root span with an extra member", `[{"offset":0,"length":158,"x":1}]`,
+		rootSpansCase("root span with an extra member", `[{"offset":0,"length":157,"x":1}]`,
 			`part 1: root section span 0 has "x", not only "offset" and "length"`),
-		rootSpansCase("root span with an empty object member", `[{"offset":0,"length":158,"x":{}}]`,
+		rootSpansCase("root span with an empty object member", `[{"offset":0,"length":157,"x":{}}]`,
 			`part 1: root section span 0 has "x", not only "offset" and "length"`),
-		rootSpansCase("root span member given twice", `[{"offset":0,"offset":0,"length":158}]`,
+		rootSpansCase("root span member given twice", `[{"offset":0,"offset":0,"length":157}]`,
 			`part 1: root section span 0 has "offset" twice`),
 		rootSpansCase("root span without a length", `[{"offset":0}]`,
 			`part 1: root section span 0 has no "length"`),
-		rootSpansCase("root span offset that is not canonical", `[{"offset":-0,"length":158}]`,
+		rootSpansCase("root span offset that is not canonical", `[{"offset":-0,"length":157}]`,
 			`part 1: root section span 0: offset -0 is not a non-negative integer`),
-		rootSpansCase("root span length that is a string", `[{"offset":0,"length":"158"}]`,
-			`part 1: root section span 0: length "158" is not a non-negative integer`),
-		rootSpansCase("root span that is not an object", `[[0,158]]`,
+		rootSpansCase("root span length that is a string", `[{"offset":0,"length":"157"}]`,
+			`part 1: root section span 0: length "157" is not a non-negative integer`),
+		rootSpansCase("root span that is not an object", `[[0,157]]`,
 			`part 1: root section span 0 is not an object`),
-		rootSpansCase("root spans that are not an array", `{"offset":0,"length":158}`,
+		rootSpansCase("root spans that are not an array", `{"offset":0,"length":157}`,
 			`part 1: root section spans are not an array`),
 		rootSpansCase("root without spans in a part with content", `[]`,
 			`part 1 has content but its root section has no span`),
@@ -370,11 +370,11 @@ func TestDIChecks(t *testing.T) {
 
 		// A root that reaches past its part's content cannot be the service's: it counts the unit
 		// differently from the gateway.
-		rootSpansCase("root span longer than the content", `[{"offset":0,"length":159}]`,
-			"part 1: the root section's spans reach 159 textElements, past the content's 158: "+
+		rootSpansCase("root span longer than the content", `[{"offset":0,"length":158}]`,
+			"part 1: the root section's spans reach 158 textElements, past the content's 157: "+
 				"the service counts textElements differently from the gateway"),
-		rootSpansCase("root span reaching past the content", `[{"offset":1,"length":158}]`,
-			"part 1: the root section's spans reach 159 textElements, past the content's 158: "+
+		rootSpansCase("root span reaching past the content", `[{"offset":1,"length":157}]`,
+			"part 1: the root section's spans reach 158 textElements, past the content's 157: "+
 				"the service counts textElements differently from the gateway"),
 
 		// The unit self-check: the end of a part's page spans is the service's own measure of its
@@ -390,8 +390,8 @@ func TestDIChecks(t *testing.T) {
 				parts = append(parts, writePart(t, b, pages, false))
 			}
 			return parts
-		}, textunit.UnicodeCodePoint, "part 1: its pages' spans end at 169 unicodeCodePoint, but the " +
-			"content is 170 long: the service counts unicodeCodePoint differently from the gateway"},
+		}, textunit.UnicodeCodePoint, "part 1: its pages' spans end at 168 unicodeCodePoint, but the " +
+			"content is 169 long: the service counts unicodeCodePoint differently from the gateway"},
 		{"pages end past the content", func(t *testing.T) []merge.Part {
 			return diParts(t, two, func(i int, b []byte) []byte {
 				if i == 0 {
@@ -450,15 +450,24 @@ func TestDIChecks(t *testing.T) {
 	}
 }
 
-// withoutSections drops the sections member and every pointer to a section from a docgen result.
+// withoutSections drops the sections member from a docgen result.
 func withoutSections(t *testing.T, b []byte) []byte {
 	t.Helper()
-	i := bytes.Index(b, []byte(`,"sections":[`))
-	j := bytes.Index(b, []byte(`,"contentFormat"`))
-	if i < 0 || j < i {
+	r, err := realcut.Parse(b)
+	if err != nil || r.Get("sections") == nil {
 		t.Fatal("test bug: no sections member")
 	}
-	return append(append([]byte(nil), b[:i]...), b[j:]...)
+	r.Del("sections")
+	return realcut.Encode(r)
+}
+
+// withMembers appends members, written out, at the end of a result.
+func withMembers(t *testing.T, b []byte, members string) []byte {
+	t.Helper()
+	if len(b) < 2 || b[len(b)-1] != '}' {
+		t.Fatal("test bug: not an object")
+	}
+	return append(append(append([]byte(nil), b[:len(b)-1]...), ","+members...), '}')
 }
 
 // rootSpan is the root section's spans member as docgen writes it.
@@ -550,7 +559,7 @@ func TestReadChecks(t *testing.T) {
 	read := func(t *testing.T, runs [][]int, edit func(i int, b []byte) []byte) []merge.Part {
 		var parts []merge.Part
 		for i, pages := range runs {
-			b := docgen.Read(pages, docgen.Local)
+			b := docgen.Read(pages, docgen.Local, docgen.ReadOptions{})
 			if edit != nil {
 				b = edit(i, b)
 			}
@@ -718,13 +727,12 @@ func TestUnknownArraysAreConcatenatedAndShifted(t *testing.T) {
 	parts := diParts(t, runs, func(i int, b []byte) []byte {
 		switch i {
 		case 0:
-			return replace(t, b, `"contentFormat":"text"}`,
-				`"contentFormat":"text","warnings":[{"code":"w0","spans":[{"offset":3,"length":1}]}]}`)
+			return withMembers(t, b, `"warnings":[{"code":"w0","spans":[{"offset":3,"length":1}]}]`)
 		case 2:
-			b = replace(t, b, `"contentFormat":"text"}`,
-				`"contentFormat":"text","warnings":[{"code":"w2a","span":{"offset":5,"length":1}},`+
-					`{"code":"w2b","boundingRegions":[{"pageNumber":2,"polygon":[]}]}]}`)
-			return replace(t, b, `"apiVersion"`, `"styles":[{"spans":[{"offset":0,"length":4}],"confidence":1},{"spans":[]}],"apiVersion"`)
+			b = withMembers(t, b, `"warnings":[{"code":"w2a","span":{"offset":5,"length":1}},`+
+				`{"code":"w2b","boundingRegions":[{"pageNumber":2,"polygon":[]}]}]`)
+			b = replace(t, b, `"styles":[]`, `"styles":[{"spans":[{"offset":0,"length":4}],"confidence":1},{"spans":[]}]`)
+			return replace(t, b, `{"apiVersion"`, `{"extras":[{"spans":[{"offset":0,"length":4}]}],"apiVersion"`)
 		}
 		return b
 	})
@@ -742,6 +750,7 @@ func TestUnknownArraysAreConcatenatedAndShifted(t *testing.T) {
 			BoundingRegions []struct{ PageNumber int }
 		}
 		Styles []struct{ Spans []struct{ Offset int } }
+		Extras []struct{ Spans []struct{ Offset int } }
 	}
 	if err := json.Unmarshal(out.Bytes(), &r); err != nil {
 		t.Fatal(err)
@@ -766,16 +775,21 @@ func TestUnknownArraysAreConcatenatedAndShifted(t *testing.T) {
 	if len(r.Styles) != 2 || r.Styles[0].Spans[0].Offset != shift {
 		t.Errorf("styles %+v, want the third part's two, shifted by %d", r.Styles, shift)
 	}
-	if st.Counts["warnings"] != 3 || st.Counts["styles"] != 2 {
+	if len(r.Extras) != 1 || r.Extras[0].Spans[0].Offset != shift {
+		t.Errorf("extras %+v, want the third part's, shifted by %d", r.Extras, shift)
+	}
+	if st.Counts["warnings"] != 3 || st.Counts["styles"] != 2 || st.Counts["extras"] != 1 {
 		t.Errorf("counts %v", st.Counts)
 	}
 	if r.Content != w.Content {
 		t.Errorf("content differs from the whole document's")
 	}
-	// warnings first appears in part 0, after contentFormat; styles only in part 2, where it is
-	// the first member, so it goes first.
+	// warnings first appears in part 0, after sections; figures only from part 1, after
+	// sections and before warnings in part 2; extras only in part 2, where it is the first
+	// member, so it goes first.
 	order := memberOrder(t, out.Bytes())
-	if want := "styles apiVersion modelId stringIndexType content pages paragraphs tables figures sections contentFormat warnings"; order != want {
+	if want := "extras apiVersion modelId stringIndexType content pages tables paragraphs styles " +
+		"contentFormat sections figures warnings"; order != want {
 		t.Errorf("member order %q, want %q", order, want)
 	}
 }
@@ -803,13 +817,13 @@ func memberOrder(t *testing.T, b []byte) string {
 
 func TestEqualUnknownObjectMemberIsKept(t *testing.T) {
 	parts := diParts(t, [][]int{{1, 2, 3}, {4, 5, 6}}, func(_ int, b []byte) []byte {
-		return replace(t, b, `"contentFormat":"text"}`, `"contentFormat":"text","x":{"a":[1, 2]}}`)
+		return withMembers(t, b, `"x":{"a":[1, 2]}`)
 	})
 	var out bytes.Buffer
 	if _, err := merge.DI(&out, parts, 0); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.HasSuffix(out.Bytes(), []byte(`"contentFormat":"text","x":{"a":[1, 2]}}`)) {
+	if !bytes.HasSuffix(out.Bytes(), []byte(`]}],"x":{"a":[1, 2]}}`)) {
 		t.Errorf("unknown member not kept verbatim: %s", out.Bytes()[len(out.Bytes())-60:])
 	}
 }

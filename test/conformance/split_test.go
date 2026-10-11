@@ -154,7 +154,7 @@ func TestSplitDocumentEqualsWhole(t *testing.T) {
 	t.Run("Read analyze and syncAnalyze", func(t *testing.T) {
 		t.Parallel()
 		h := newSplitHarness(t, splitPages, harnessOpts{})
-		want := docgen.Read(seq(1, 40), docgen.Original)
+		want := docgen.Read(seq(1, 40), docgen.Original, docgen.ReadOptions{})
 		assertEnvelopeAround(t, h.awaitSucceeded(h.submit(readAnalyze, doc)), want)
 		assertPartsCover(t, h.read, seq(1, 40))
 
