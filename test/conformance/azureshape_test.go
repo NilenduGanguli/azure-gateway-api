@@ -267,23 +267,50 @@ func realWhole(t *testing.T, rel string) []byte {
 	return realcut.Encode(r)
 }
 
+// composedWhole joins vendored real DI results into one notional multi-page document
+// (realcut.ComposeDI), so that real figures sit on pages after the first: no vendored recording
+// has one there. ComposeDI checks the figure ids against the inputs independently of the merge.
+func composedWhole(t *testing.T, names ...string) []byte {
+	t.Helper()
+	var results [][]byte
+	for _, name := range names {
+		results = append(results, realWhole(t, "real/di-layout-2024-11-30/"+name+".analyzeResult.json"))
+	}
+	whole, _, err := realcut.ComposeDI(t.TempDir(), results, textunit.TextElements)
+	if err != nil {
+		t.Fatalf("compose %v: %v", names, err)
+	}
+	return whole
+}
+
 // TestRealOutputThroughTheGateway replays recorded service output through the gateway end to
 // end: the fake answers each part the gateway sends with the real result cut to that part's pages
 // (internal/realcut), and the gateway's merged answer, polled and synchronous, must be the real
 // whole-document result byte for byte, and Azure-shaped. One page per part puts a cut at every
 // page boundary: a blank page, a root of two spans, a section and a table that continue onto the
-// next page.
+// next page, and — in the documents joined from real one-page results — figures on pages 2 to 5,
+// whose ids the gateway must give back on their pages in the whole document.
 func TestRealOutputThroughTheGateway(t *testing.T) {
 	for _, tc := range []struct {
-		rel    string
-		family azschema.Family
+		rel     string
+		family  azschema.Family
+		compose []string // when set, rel is a name and the whole is these results joined
 	}{
-		{"real/di-layout-2024-11-30/py_layout_multipage_table_span_pdf.analyzeResult.json", azschema.DocumentIntelligence},
-		{"real/di-layout-2024-11-30/py_layout_multipage_transform.analyzeResult.json", azschema.DocumentIntelligence},
-		{"real/di-layout-2024-11-30/java_layout_with_pages.analyzeResult.json", azschema.DocumentIntelligence},
-		{"specs/cv-v3.2/example.SuccessfulGetReadResult.envelope.json", azschema.Read},
+		{"real/di-layout-2024-11-30/py_layout_multipage_table_span_pdf.analyzeResult.json", azschema.DocumentIntelligence, nil},
+		{"real/di-layout-2024-11-30/py_layout_multipage_transform.analyzeResult.json", azschema.DocumentIntelligence, nil},
+		{"real/di-layout-2024-11-30/java_layout_with_pages.analyzeResult.json", azschema.DocumentIntelligence, nil},
+		{"composed/figures-on-pages-2-3-4", azschema.DocumentIntelligence,
+			[]string{"py_layout_stylefont", "py_layout_barcodes", "js_layout_selection_marks", "py_layout_figures"}},
+		{"composed/figures-after-a-blank-page", azschema.DocumentIntelligence,
+			[]string{"java_layout_with_pages", "py_layout_figures", "java_layout", "js_layout_selection_marks"}},
+		{"specs/cv-v3.2/example.SuccessfulGetReadResult.envelope.json", azschema.Read, nil},
 	} {
-		whole := realWhole(t, tc.rel)
+		var whole []byte
+		if tc.compose != nil {
+			whole = composedWhole(t, tc.compose...)
+		} else {
+			whole = realWhole(t, tc.rel)
+		}
 		di := tc.family == azschema.DocumentIntelligence
 		// replay runs on the fake's goroutine: it reports a cut it cannot make with t.Errorf
 		// (safe from any goroutine) and answers nothing, which the fake turns into a 500.
@@ -337,7 +364,7 @@ func TestRealOutputThroughTheGateway(t *testing.T) {
 							t.Errorf("the %s result does not parse: %v", what, err)
 							continue
 						}
-						w, _ := realcut.Parse(whole) // parsed by realWhole
+						w, _ := realcut.Parse(whole) // parsed by realWhole or ComposeDI
 						_, members, _, _ := realcut.CompareMembers(w, g)
 						var diffs []string
 						for _, m := range members {

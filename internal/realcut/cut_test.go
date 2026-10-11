@@ -201,6 +201,59 @@ func TestCutDIRefusesMalformedResults(t *testing.T) {
 	}
 }
 
+// TestCutMapsAFigureIDToItsPart: the cut inverts the merge's figure-id rule, so a figure's
+// "<page>.<n>" must name a page of the part the figure is cut into. validate already ties the id
+// to the figure's first region (TestCutDIRefusesMalformedResults); a figure with no region is
+// placed by its span, and its id is then the only page it names. An id on any page but one of its
+// own part's is an error, not a local number made up for it: localOf answers 0 for a page outside
+// the plan and another part's local number for a page of another part, so a merge that left such
+// an id unmapped would come back unchanged and pass.
+func TestCutMapsAFigureIDToItsPart(t *testing.T) {
+	noRegion := func(id string) string {
+		s := with(t, smallDI, `"figures":[{"id":"2.1","boundingRegions":[{"pageNumber":2,"polygon":[0,1,1,1,1,2,0,2]}],`,
+			`"figures":[{"id":"2.1",`)
+		return with(t, s, `"id":"2.1"`, `"id":"`+id+`"`)
+	}
+	for _, tc := range []struct {
+		name    string
+		result  string
+		plan    [][]int
+		wantID  string // the figure's id in the last part
+		wantErr string
+	}{
+		{"its page cut alone", smallDI, [][]int{{1}, {2}}, "1.1", ""},
+		{"one part", with(t, smallDI, `"id":"2.1"`, `"id":"2.3"`), [][]int{{1, 2}}, "2.3", ""},
+		{"a pages= selection", smallDI, [][]int{{2}}, "1.1", ""},
+		{"placed by its span", noRegion("2.1"), [][]int{{1}, {2}}, "1.1", ""},
+		{"placed by its span, its id on another part's page", noRegion("1.1"), [][]int{{1}, {2}}, "",
+			`part 1: figure id "1.1" names page 1, which is in part 0, not this part (pages [2])`},
+		{"placed by its span, its id on a page outside the plan", noRegion("1.1"), [][]int{{2}}, "",
+			`part 0: figure id "1.1" names page 1, which is in no part of the plan, not this part (pages [2])`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parts, _, err := realcut.CutDI([]byte(tc.result), tc.plan, textunit.TextElements)
+			if tc.wantErr != "" {
+				mustBeMalformed(t, parts, err, tc.wantErr)
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			last, err := realcut.Parse(parts[len(parts)-1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			figs := realcut.Items(last.Get("figures"))
+			if len(figs) != 1 {
+				t.Fatalf("the last part has %d figures, want 1", len(figs))
+			}
+			if got, _ := figs[0].Get("id").Str(); got != tc.wantID {
+				t.Errorf("cut id %q, want %q", got, tc.wantID)
+			}
+		})
+	}
+}
+
 func TestCutReadRefusesMalformedResults(t *testing.T) {
 	two := [][]int{{1}, {2}}
 	for _, tc := range []struct {

@@ -649,7 +649,15 @@ region on a page of the result, every pointer canonical and within its member, e
 `<page>.<n>` on its first region's page, the plan's pages in the result once each — and refuses
 anything else with `realcut.ErrMalformed` naming the paths. A merge that shifts offsets wrongly
 therefore fails the real-data tests with the offending span spelled out, and cannot panic in the
-cut and abort the rest of the merge suite (TESTING §10).
+cut and abort the rest of the merge suite (TESTING §10). The cut also refuses a figure id naming a
+page outside the part the figure is cut into, rather than inventing a local number for it.
+
+No recording has a figure after page 1, where the `figures[].id` rule first changes anything, so
+the tests also join genuine one-page results into notional multi-page documents with this merge
+(`realcut.ComposeDI`), checking every joined figure id against its input independently of the
+merge, and cut those at every set of page boundaries and send two through the gateway. With the
+figure-id rule disabled — the part's page written instead of the original — the real-data tests
+fail.
 
 ### 4.8 Engine observability
 

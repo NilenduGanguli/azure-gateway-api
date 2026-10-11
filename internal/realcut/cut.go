@@ -63,7 +63,8 @@ func (c *cutter) failf(format string, args ...any) {
 //
 // Input the cut cannot follow — a span past the content or not on a unit of the result's
 // stringIndexType, a region on a page the result does not have, a pointer past its member, a
-// malformed figure id, a plan naming pages the result does not have — is an error wrapping
+// malformed figure id or one naming a page outside its figure's part, a plan naming pages the
+// result does not have — is an error wrapping
 // ErrMalformed that names where, never a panic.
 func CutDI(whole []byte, plan [][]int, unit textunit.Unit) (parts [][]byte, notes []string, err error) {
 	defer func() {
@@ -593,10 +594,26 @@ func (c *cutter) scalar(v *Node, path []pe, k int) *Node {
 		}
 	case "id":
 		if n == 3 && path[0].key == "figures" && path[1].idx {
+			// The inverse of the merge's figure-id rule: "<page>.<n>" names an original page, which
+			// must be one of part k's. validate ties the id to the figure's first region, whose page
+			// put the figure in part k; a figure with no region is placed by its span, so its id is
+			// checked here. localOf would answer 0 for a page outside the plan and another part's
+			// local number for one of its pages, and a merge that left the id unmapped would then
+			// come back unchanged and pass.
 			s, _ := v.Str()
 			p, ok := figurePage(s)
 			if !ok {
-				c.failf("figure id %q is not <page>.<n>", s)
+				c.failf("part %d: figure id %q is not <page>.<n>", k, s)
+				return v
+			}
+			switch q := c.pagePart(p); {
+			case q < 0:
+				c.failf("part %d: figure id %q names page %d, which is in no part of the plan, not this part (pages %v)",
+					k, s, p, c.plan[k])
+				return v
+			case q != k:
+				c.failf("part %d: figure id %q names page %d, which is in part %d, not this part (pages %v)",
+					k, s, p, q, c.plan[k])
 				return v
 			}
 			return StrNode(strconv.Itoa(c.localOf[p]) + s[strings.IndexByte(s, '.'):])

@@ -35,6 +35,52 @@ var realDI = []string{
 	"thirdparty_docler_markdown_2page",   // markdown, 2 pages
 }
 
+// composedDI are notional multi-page documents joined from genuine one-page results by
+// realcut.ComposeDI. No vendored recording has a figure after page 1, so without them the
+// real-data tests would pass a merge that stopped renumbering figure ids. Every item is recorded
+// output; only the numbering is the merge's, and ComposeDI checks the figure ids against the
+// inputs independently of it. figureIDs are the ids the whole must carry, written out by hand.
+//
+// A root-only part placed after a part that leaves a section open is a continuation whose root
+// contributes no spans (continue.go), and realcut cannot cut such a whole back into parts the
+// merge accepts; TestContinuationOfARootOnlyPart covers that shape, so these orders avoid it.
+var composedDI = []struct {
+	results   []string
+	figureIDs []string
+}{
+	// Every figure after page 1; two on one page; a caption; barcodes; selection marks.
+	{[]string{"py_layout_stylefont", "py_layout_barcodes", "js_layout_selection_marks", "py_layout_figures"},
+		[]string{"2.1", "3.1", "3.2", "4.1"}},
+	// A real two-page document (a section and a table continuing onto page 2), then figures.
+	{[]string{"py_layout_multipage_table_span_pdf", "js_layout_selection_marks", "py_layout_figures"},
+		[]string{"3.1", "3.2", "4.1"}},
+	// A blank page before the first figure, and a page without figures between two with them.
+	{[]string{"java_layout_with_pages", "py_layout_figures", "java_layout", "js_layout_selection_marks"},
+		[]string{"3.1", "5.1", "5.2"}},
+	// A root of two spans around a blank page, then figures on pages 4 and 5.
+	{[]string{"py_layout_multipage_transform", "py_layout_barcodes", "js_layout_selection_marks"},
+		[]string{"4.1", "5.1", "5.2"}},
+}
+
+// composed joins the named real results into one whole, and returns it as loadReal does.
+func composed(t *testing.T, names []string) (*realcut.Node, []byte) {
+	t.Helper()
+	var results [][]byte
+	for _, name := range names {
+		_, b := loadReal(t, diPath(name))
+		results = append(results, b)
+	}
+	whole, _, err := realcut.ComposeDI(t.TempDir(), results, textunit.TextElements)
+	if err != nil {
+		t.Fatalf("compose %v: %v", names, err)
+	}
+	r, err := realcut.Parse(whole)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r, whole
+}
+
 // realRead are the vendored Read v3.2 results, and the spec's synthetic two-page example.
 var realRead = []string{
 	"real/read-3.2/net_ReadPdfFileInStreamTest.analyzeResult.json",
@@ -144,9 +190,26 @@ func differences(t *testing.T, want *realcut.Node, got []byte) []string {
 // Markdown is the exception, and the gateway refuses outputContentFormat=markdown: a real
 // markdown page's span runs over the page-break block that follows it, which a part analysed
 // alone does not have, so a merged markdown result is checked only for being accepted.
+//
+// The composed documents (composedDI) put real figures on pages after the first, so every cut
+// moves a figure to a part where its page is numbered differently.
 func TestMergeReproducesRealDIOutputs(t *testing.T) {
+	type input struct {
+		name  string
+		want  *realcut.Node
+		whole []byte
+	}
+	var inputs []input
 	for _, name := range realDI {
 		want, whole := loadReal(t, diPath(name))
+		inputs = append(inputs, input{name, want, whole})
+	}
+	for _, c := range composedDI {
+		want, whole := composed(t, c.results)
+		inputs = append(inputs, input{"composed:" + strings.Join(c.results, "+"), want, whole})
+	}
+	for _, in := range inputs {
+		name, want, whole := in.name, in.want, in.whole
 		pages := len(realcut.Items(want.Get("pages")))
 		markdown := bytes.Contains(whole, []byte(`"contentFormat":"markdown"`))
 		for _, plan := range compositions(pages) {
@@ -196,11 +259,12 @@ func TestMergeReproducesRealReadOutputs(t *testing.T) {
 }
 
 // TestRealResultsAsParts merges genuine one-page results as the parts of a notional document.
-// It is the only way to put real figures, captions, selection marks, barcodes, styles and
-// page-header, footer and number paragraphs through the renumbering, since no real multi-page
-// output has them all. Cut back at the same pages, every part must come back exactly — its root
-// section too, so the merged root keeps each part's own spans rather than one extent over the
-// furniture between them.
+// With composedDI, it is the only way to put real figures, captions, selection marks, barcodes,
+// styles and page-header, footer and number paragraphs through the renumbering, since no real
+// multi-page output has them all. Cut back at the same pages, every part must come back exactly —
+// its root section too, so the merged root keeps each part's own spans rather than one extent
+// over the furniture between them, and its figure ids, since realcut refuses an id whose page is
+// not in the figure's part.
 //
 // The exception is a part with no heading and no section but its root, whose content continues
 // the section the part before it left open (continue.go): realcut gives such a part back as one
@@ -244,6 +308,29 @@ func TestRealResultsAsParts(t *testing.T) {
 					t.Errorf("part %d (%s) does not come back from the merge:\n  %s",
 						k, name, strings.Join(diffs, "\n  "))
 				}
+			}
+		})
+	}
+}
+
+// TestRealFiguresAfterPageOne: in a document joined from real results, a figure's id names the
+// page it is on in the whole document, as the service numbers it ("<page>.<n>", the page of its
+// first region), and <n> is the figure's number on its own page.
+func TestRealFiguresAfterPageOne(t *testing.T) {
+	for _, c := range composedDI {
+		t.Run(strings.Join(c.results, "+"), func(t *testing.T) {
+			r, _ := composed(t, c.results)
+			var ids []string
+			for i, f := range realcut.Items(r.Get("figures")) {
+				id, _ := f.Get("id").Str()
+				ids = append(ids, id)
+				first, _ := realcut.Items(f.Get("boundingRegions"))[0].Get("pageNumber").Int()
+				if !strings.HasPrefix(id, fmt.Sprintf("%d.", first)) {
+					t.Errorf("figures[%d] id %q, its first region on page %d", i, id, first)
+				}
+			}
+			if fmt.Sprint(ids) != fmt.Sprint(c.figureIDs) {
+				t.Errorf("figure ids %v, want %v", ids, c.figureIDs)
 			}
 		})
 	}
