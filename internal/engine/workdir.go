@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,9 +19,16 @@ type workdir struct {
 	dir string
 }
 
-// newWorkdir creates the job's work folder, empty. A folder left by an earlier run of the same
-// job (a crash, then recovery) is removed first: its parts may be from a different plan.
-func newWorkdir(root, job string) (*workdir, error) {
+// newWorkdir creates the job's work folder, empty but for the job's input. Whatever an earlier run
+// of the same job left there (a crash, then recovery) is removed first: its parts may be from a
+// different plan.
+//
+// input is the job's stored document. A client's :syncAnalyze saves its body inside this very
+// folder before the engine runs (splitting spec §1), so emptying the folder must keep that one
+// file, or the document is deleted before it is read. An :analyze input lives in the blob store,
+// outside the folder, and is never touched here. The file is matched by identity rather than by
+// name, so a relative and an absolute DATA_DIR cannot disagree about it.
+func newWorkdir(root, job, input string) (*workdir, error) {
 	// The id becomes a path element, so anything that could leave the root is refused rather
 	// than cleaned: job ids are minted by the gateway and never look like this.
 	if job == "" || job == "." || job == ".." || strings.ContainsAny(job, `/\`) {
@@ -30,11 +38,27 @@ func newWorkdir(root, job string) (*workdir, error) {
 		return nil, fmt.Errorf("engine: create work root: %w", err)
 	}
 	dir := filepath.Join(root, job)
-	if err := os.RemoveAll(dir); err != nil {
-		return nil, fmt.Errorf("engine: remove stale work folder: %w", err)
+	err := os.Mkdir(dir, 0o750)
+	if err == nil {
+		return &workdir{dir: dir}, nil
 	}
-	if err := os.Mkdir(dir, 0o750); err != nil {
+	if !errors.Is(err, os.ErrExist) {
 		return nil, fmt.Errorf("engine: create work folder: %w", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("engine: read stale work folder: %w", err)
+	}
+	keep, _ := os.Stat(input) // a missing input is the engine's to report, when it reads it
+	for _, ent := range entries {
+		if keep != nil {
+			if info, err := ent.Info(); err == nil && os.SameFile(keep, info) {
+				continue
+			}
+		}
+		if err := os.RemoveAll(filepath.Join(dir, ent.Name())); err != nil {
+			return nil, fmt.Errorf("engine: remove stale work file: %w", err)
+		}
 	}
 	return &workdir{dir: dir}, nil
 }

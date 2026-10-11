@@ -669,3 +669,49 @@ func TestPagesParamFallback(t *testing.T) {
 		t.Errorf("%d calls, want the whole document once", got)
 	}
 }
+
+// TestInputInsideTheWorkFolder runs a document stored in its own job's work folder, as a client's
+// :syncAnalyze stores its body: creating the folder must keep that input, while still clearing
+// whatever an earlier run of the same job left there.
+func TestInputInsideTheWorkFolder(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		pages     int
+		wantSizes []int
+	}{
+		{"whole", 3, []int{3}},
+		{"split", 12, []int{4, 4, 4}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFake(t, mockazure.PagedOptions{})
+			e := newEngine(t, azerr.SurfaceDI, fake.URL(), 4)
+			const job = "sync-0000"
+			dir := filepath.Join(e.o.WorkRoot, job)
+			if err := os.MkdirAll(dir, 0o750); err != nil {
+				t.Fatal(err)
+			}
+			body := pdftest.Make(tc.pages)
+			in := Input{JobID: job, ContentType: "application/pdf",
+				Path: filepath.Join(dir, "input"), Size: int64(len(body)), ModelID: "prebuilt-layout",
+				Query: url.Values{"api-version": {apiVersion}}}
+			if err := os.WriteFile(in.Path, body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			stale := filepath.Join(dir, "part-1-4.json")
+			if err := os.WriteFile(stale, []byte("left by an earlier run"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			out := run(t, e, in)
+			wantDI(t, out, seq(1, tc.pages))
+			got := sizes(fake.Calls())
+			slices.Sort(got)
+			if !slices.Equal(got, tc.wantSizes) {
+				t.Errorf("call sizes %v, want %v", got, tc.wantSizes)
+			}
+			if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("stale part result survived: %v", err)
+			}
+		})
+	}
+}

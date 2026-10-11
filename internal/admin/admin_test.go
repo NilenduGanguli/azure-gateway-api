@@ -167,8 +167,6 @@ func TestJobViewShowsUpstreamCounts(t *testing.T) {
 
 // TestJobViewAfterASplitJob runs a document large enough to split and reads its view.
 func TestJobViewAfterASplitJob(t *testing.T) {
-	t.Skip("needs the full engine; enabled at integration")
-
 	paged := mockazure.NewPaged(mockazure.PagedOptions{})
 	t.Cleanup(paged.Close)
 	g := newGateway(t, paged.URL(), "", 5)

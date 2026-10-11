@@ -177,7 +177,7 @@ func (e *Engine) Run(ctx context.Context, in Input) (*Output, error) {
 	defer cancel()
 	log := e.log.With("job", in.JobID, "surface", e.o.Client.Surface().String())
 
-	work, err := newWorkdir(e.o.WorkRoot, in.JobID)
+	work, err := newWorkdir(e.o.WorkRoot, in.JobID, in.Path)
 	if err != nil {
 		log.Error("engine: no work folder", "err", err)
 		return nil, azerr.Internal(e.o.Client.Surface(), "")
