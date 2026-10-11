@@ -45,7 +45,7 @@ func (r *reporter) line(format string, args ...any) {
 	fmt.Fprintf(r.w, format+"\n", args...)
 }
 
-// Run probes both containers and writes a report.
+// Run probes each configured container and writes a report.
 func Run(ctx context.Context, cfg *config.Config, out io.Writer) error {
 	rep := &reporter{w: out}
 	client := &http.Client{
@@ -58,8 +58,13 @@ func Run(ctx context.Context, cfg *config.Config, out io.Writer) error {
 	rep.line("azure-gateway-api container probe")
 	rep.line("Analyze probes consume one transaction per container.")
 
-	probeDI(ctx, rep, client, cfg)
-	probeRead(ctx, rep, client, cfg)
+	// A surface with no upstream URL is disabled, and has no container to ask.
+	if cfg.DI.Enabled() {
+		probeDI(ctx, rep, client, cfg)
+	}
+	if cfg.Read.Enabled() {
+		probeRead(ctx, rep, client, cfg)
+	}
 
 	rep.section("What to do with this")
 	rep.line("- If DI :syncAnalyze answered 200 or 400, the route exists: leave DI_SYNC_ANALYZE=auto.")

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/NilenduGanguli/azure-gateway-api/internal/azerr"
+	"github.com/NilenduGanguli/azure-gateway-api/internal/config"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/ids"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/jobs"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/logging"
@@ -298,7 +299,7 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, surface aze
 
 	release, err := s.deps.Jobs.Admit(surfaceName)
 	if err != nil {
-		azerr.TooBusy(surface, s.deps.Config.BusyRetryAfter).WriteTo(w, surface)
+		azerr.TooBusy(surface, config.RetryAfterBusy).WriteTo(w, surface)
 		return
 	}
 	defer release()
@@ -307,7 +308,7 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, surface aze
 	// MaxInflight, so a synchronous call takes a container slot too.
 	releaseUpstream, err := s.deps.Jobs.AdmitUpstream(surfaceName)
 	if err != nil {
-		azerr.TooBusy(surface, s.deps.Config.BusyRetryAfter).WriteTo(w, surface)
+		azerr.TooBusy(surface, config.RetryAfterBusy).WriteTo(w, surface)
 		return
 	}
 	defer releaseUpstream()
@@ -447,7 +448,7 @@ func (s *Server) relaySync(w http.ResponseWriter, r *http.Request, surface azerr
 		// statuses where retrying is correct.
 		parsed.RetryAfter = 0
 		if retriableStatus(resp.StatusCode) {
-			parsed.RetryAfter = s.deps.Config.BusyRetryAfter
+			parsed.RetryAfter = config.RetryAfterBusy
 		}
 		parsed.WriteTo(w, surface)
 		return
@@ -485,7 +486,7 @@ func (s *Server) proxyGET(w http.ResponseWriter, r *http.Request, surface azerr.
 
 	release, err := s.deps.Jobs.AdmitMetadata(surfaceName)
 	if err != nil {
-		azerr.TooBusy(surface, s.deps.Config.BusyRetryAfter).WriteTo(w, surface)
+		azerr.TooBusy(surface, config.RetryAfterBusy).WriteTo(w, surface)
 		return
 	}
 	defer release()

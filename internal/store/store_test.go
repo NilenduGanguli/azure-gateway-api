@@ -12,12 +12,33 @@ import (
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
-	s, err := Open(Options{DataDir: t.TempDir(), AllowNetworkFS: true, ReadPoolSize: 4})
+	s, err := Open(Options{DataDir: t.TempDir(), ReadPoolSize: 4})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	return s
+}
+
+// TestOpenAlwaysRefusesANetworkFilesystem: WAL depends on shared memory and POSIX advisory locks
+// that NFS, CIFS and friends do not provide reliably. There is no override any more, because
+// silently corrupting the table that holds every promised 202 is worse than refusing to start.
+func TestOpenAlwaysRefusesANetworkFilesystem(t *testing.T) {
+	orig := detectNetworkFS
+	t.Cleanup(func() { detectNetworkFS = orig })
+	detectNetworkFS = func(string) (bool, string) { return true, "nfs" }
+
+	s, err := Open(Options{DataDir: t.TempDir()})
+	if err == nil {
+		_ = s.Close()
+		t.Fatal("Open accepted a network filesystem")
+	}
+	if !strings.Contains(err.Error(), "nfs") {
+		t.Errorf("error %q does not name the filesystem", err)
+	}
+	if strings.Contains(err.Error(), "ALLOW_NETWORK_FS") {
+		t.Errorf("error %q still offers the removed override", err)
+	}
 }
 
 // TestBlobWriteIsAtomic checks that an aborted write leaves nothing visible. A reader must never

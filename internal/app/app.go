@@ -53,14 +53,10 @@ func NewHandler(d Deps) http.Handler {
 
 	register := func(mux *http.ServeMux) {
 		surface.New(surface.Deps{
-			Config: d.Config,
-			Store:  d.Store,
-			Jobs:   d.Jobs,
-			BaseURL: httpx.BaseURLResolver{
-				Configured:     d.Config.PublicBaseURL,
-				TrustForwarded: d.Config.TrustForwardedHeaders,
-				AllowedHosts:   d.Config.TrustedForwardedHosts,
-			},
+			Config:  d.Config,
+			Store:   d.Store,
+			Jobs:    d.Jobs,
+			BaseURL: httpx.BaseURLResolver{Configured: d.Config.PublicBaseURL},
 		}).Register(mux)
 		admin.New(d.Config, d.Store, d.Jobs, d.Build, d.Started).Register(mux)
 	}
@@ -73,6 +69,8 @@ func NewHandler(d Deps) http.Handler {
 
 	return httpx.Chain(mux,
 		httpx.RequestID(d.Logger),
+		// Outside Recover, so the 500 a panicking handler is turned into still names Kestrel.
+		httpx.ServerHeader(),
 		httpx.AccessLog(),
 		httpx.Recover(onPanic),
 		httpx.NoCache(),

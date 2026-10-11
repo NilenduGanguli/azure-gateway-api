@@ -22,7 +22,6 @@ import (
 
 	"github.com/NilenduGanguli/azure-gateway-api/internal/admin"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/app"
-	"github.com/NilenduGanguli/azure-gateway-api/internal/azerr"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/config"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/jobs"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/logging"
@@ -80,21 +79,23 @@ func serve() error {
 	if err != nil {
 		return fmt.Errorf("configuration is invalid:\n%w", err)
 	}
+	// The configuration accepts a gateway in front of one kind of container, but the job manager
+	// still builds a runner and an upstream client for both surfaces. Serving a surface with no
+	// container behind it would answer 202 for work that can never run, so refuse instead, until
+	// the runners are built for configured surfaces only.
+	if !cfg.DI.Enabled() || !cfg.Read.Enabled() {
+		return errors.New("this build still needs both DI_UPSTREAM_URL and READ_UPSTREAM_URL")
+	}
 	log := logging.New(cfg.LogLevel, cfg.LogFormat)
 	started := time.Now()
-
-	if cfg.ErrorCompat == "documented" {
-		azerr.SetCompat(azerr.CompatDocumented)
-	}
 
 	for _, warning := range cfg.Warnings() {
 		log.Warn(warning)
 	}
 
 	st, err := store.Open(store.Options{
-		DataDir:        cfg.DataDir,
-		AllowNetworkFS: cfg.AllowNetworkFS,
-		ReadPoolSize:   cfg.DI.MaxInflight + cfg.Read.MaxInflight + 8,
+		DataDir:      cfg.DataDir,
+		ReadPoolSize: cfg.DI.MaxInflight + cfg.Read.MaxInflight + 8,
 	})
 	if err != nil {
 		return err
@@ -164,6 +165,7 @@ func serve() error {
 			"dataDir", cfg.DataDir,
 			"diMaxInflight", cfg.DI.MaxInflight,
 			"readMaxInflight", cfg.Read.MaxInflight,
+			"splitPages", cfg.SplitPages,
 			"resultTtl", cfg.ResultTTL.String(),
 		)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

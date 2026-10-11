@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NilenduGanguli/azure-gateway-api/internal/azerr"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/config"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/ids"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/mockazure"
@@ -200,33 +199,6 @@ func TestUnknownIDMatchesTheContainersNotTheSpec(t *testing.T) {
 			t.Errorf("code is %v, want BadArgument", inner["code"])
 		}
 	})
-}
-
-// TestDocumentedCompatRestoresTheSpecShapes covers ERROR_COMPAT=documented, for a client written
-// against the published SDK models rather than against these containers.
-func TestDocumentedCompatRestoresTheSpecShapes(t *testing.T) {
-	azerr.SetCompat(azerr.CompatDocumented)
-	t.Cleanup(func() { azerr.SetCompat(azerr.CompatObserved) })
-
-	h := newHarness(t, harnessOpts{})
-
-	resp := h.get("/documentintelligence/documentModels/prebuilt-layout/analyzeResults/" +
-		"00000000-0000-4000-8000-000000000000?api-version=" + apiVersion)
-	di := decode(t, resp)
-	_ = resp.Body.Close()
-	if _, wrapped := di["error"]; !wrapped {
-		t.Errorf("documented mode must wrap Document Intelligence errors, got %v", di)
-	}
-
-	resp = h.get("/vision/v3.2/read/analyzeResults/00000000-0000-4000-8000-000000000000")
-	rd := decode(t, resp)
-	_ = resp.Body.Close()
-	if _, wrapped := rd["error"]; wrapped {
-		t.Errorf("documented mode must leave Read errors flat, got %v", rd)
-	}
-	if rd["code"] == nil {
-		t.Errorf("documented Read error needs a top-level code, got %v", rd)
-	}
 }
 
 // TestReadOperationLocationIsBare covers the Read SDK's lack of a poller: callers follow

@@ -9,8 +9,11 @@
 // from that: Read wraps everything, and Document Intelligence wraps everything except an unknown
 // or expired result id, which it returns flat.
 //
-// So the shape is chosen per response, not per surface, and Compat decides whether to follow the
-// containers or their documentation. See Compat.
+// So the shape is chosen per response, not per surface, and it always follows the containers rather
+// than their documentation: the gateway's whole purpose is that a client cannot tell it from the
+// container it fronts. Microsoft has acknowledged the Document Intelligence divergence as "a valid
+// difference between documentation and Service side". For Read, four distinct cases were checked —
+// unknown id, malformed id, bad readingOrder, unparseable image — and all four were wrapped.
 package azerr
 
 import (
@@ -21,51 +24,13 @@ import (
 	"strconv"
 )
 
-// Compat selects whether errors are rendered the way the containers actually behave or the way
-// their published contracts describe.
-//
-// The two differ, and a probe against real containers settled which is which:
-//
-//	Document Intelligence wraps every error except an unknown or expired result id, which comes
-//	back flat as {"code":"NotFound","message":"Analyze result does not exist."} — the divergence
-//	Microsoft has acknowledged as "a valid difference between documentation and Service side".
-//
-//	Computer Vision Read wraps every error, including the ones its own Ocr.json models as flat.
-//	Four distinct cases were checked — unknown id, malformed id, bad readingOrder, unparseable
-//	image — and all four were wrapped.
-//
-// CompatObserved is the default because the gateway's whole purpose is that a client cannot tell
-// it from the container it fronts. CompatDocumented exists for a client written against the
-// published SDK models instead.
-type Compat int
-
-const (
-	// CompatObserved renders errors as the on-prem containers actually emit them.
-	CompatObserved Compat = iota
-	// CompatDocumented renders errors as the swagger definitions and generated SDK models describe.
-	CompatDocumented
-)
-
-var compat = CompatObserved
-
-// SetCompat selects the error rendering mode. It is set once at startup, before serving.
-func SetCompat(c Compat) { compat = c }
-
-// CompatMode reports the active mode, for the admin surface.
-func CompatMode() string {
-	if compat == CompatDocumented {
-		return "documented"
-	}
-	return "observed"
-}
-
 // Surface selects which wire contract an error is rendered in.
 type Surface int
 
 const (
-	// SurfaceDI is Document Intelligence: the wrapped shape.
+	// SurfaceDI is Document Intelligence: wrapped, except an unknown or expired result id.
 	SurfaceDI Surface = iota
-	// SurfaceRead is Computer Vision Read v3.2: the flat shape.
+	// SurfaceRead is Computer Vision Read v3.2: always wrapped, whatever Ocr.json models.
 	SurfaceRead
 )
 
@@ -212,8 +177,9 @@ type Response struct {
 	Error Error `json:"error"`
 }
 
-// ReadError is ComputerVisionOcrError — the flat Read error body. No wrapper, no target,
-// no details, no innererror.
+// ReadError is the flat error body: ComputerVisionOcrError's shape, which the Document Intelligence
+// container uses for an unknown or expired result id. No wrapper, no target, no details, no
+// innererror.
 type ReadError struct {
 	Code      string `json:"code"`
 	Message   string `json:"message"`
@@ -288,19 +254,12 @@ func retriable(status int) bool {
 	return false
 }
 
-// useFlat reports whether this error renders unwrapped.
-func (e *APIError) useFlat(s Surface) bool {
-	if compat == CompatDocumented {
-		// The published contracts: Read is flat, Document Intelligence is wrapped.
-		return s == SurfaceRead
-	}
-	// Observed: both containers wrap, except the one Document Intelligence case that does not.
-	return e.flat
-}
-
 // Body renders the error in the wire shape of the given surface.
+//
+// Both containers wrap every error, except the one Document Intelligence case that does not; see
+// NotFound. The surface still picks the vocabulary, which the constructors have already chosen.
 func (e *APIError) Body(s Surface) any {
-	if e.useFlat(s) {
+	if e.flat {
 		return ReadError{Code: e.Code, Message: e.Message, RequestID: e.RequestID}
 	}
 	out := Response{Error: Error{
@@ -332,7 +291,7 @@ func (e *APIError) WriteTo(w http.ResponseWriter, s Surface) {
 	body, err := json.Marshal(e.Body(s))
 	if err != nil { // unreachable for these types, but never emit a bodyless error
 		body = []byte(`{"error":{"code":"InternalServerError","message":"An unexpected error occurred."}}`)
-		if e.useFlat(s) {
+		if e.flat {
 			body = []byte(`{"code":"InternalServerError","message":"An unexpected error occurred."}`)
 		}
 	}

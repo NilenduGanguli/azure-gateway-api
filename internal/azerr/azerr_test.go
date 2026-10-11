@@ -62,25 +62,6 @@ func TestObservedShapesMatchTheContainers(t *testing.T) {
 	})
 }
 
-// TestDocumentedCompatFollowsTheSpecs covers the opt-out for a client written against the
-// published SDK models rather than against these containers.
-func TestDocumentedCompatFollowsTheSpecs(t *testing.T) {
-	SetCompat(CompatDocumented)
-	defer SetCompat(CompatObserved)
-
-	rec := httptest.NewRecorder()
-	NotFound(SurfaceDI).WriteTo(rec, SurfaceDI)
-	if !strings.Contains(rec.Body.String(), `"error"`) {
-		t.Errorf("documented mode must wrap Document Intelligence: %s", rec.Body.String())
-	}
-
-	rec = httptest.NewRecorder()
-	NotFound(SurfaceRead).WriteTo(rec, SurfaceRead)
-	if strings.Contains(rec.Body.String(), `"error"`) {
-		t.Errorf("documented mode must leave Read flat: %s", rec.Body.String())
-	}
-}
-
 // TestUnroutedIsBodyless matches the containers, which answer a path they do not serve with an
 // empty 404. No SDK parses an unrouted response as operation state, so this is safe; routed
 // endpoints always carry a body.

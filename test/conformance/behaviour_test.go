@@ -370,15 +370,14 @@ func TestCrashRecoveryResumesAcceptedJobs(t *testing.T) {
 	defer readC.Close()
 
 	cfg := &config.Config{
-		DataDir: dir, AllowNetworkFS: true, DISyncMode: config.SyncAuto, DIBlindPollBudget: 5, DISyncProbeTimeout: 30 * time.Second,
-		ResultTTL: time.Hour, GCInterval: time.Hour, DiskHighWatermark: 0.99,
-		MaxRequestBytes: 1 << 20, PollRetryAfter: 1, BusyRetryAfter: 5,
+		DataDir: dir, DISyncMode: config.SyncAuto, DIBlindPollBudget: 5, DISyncProbeTimeout: 30 * time.Second,
+		ResultTTL: time.Hour, GCInterval: time.Hour, DiskHighWatermark: 0.99, MaxRequestBytes: 1 << 20,
 		DI:   config.Upstream{BaseURL: diC.URL(), MaxInflight: 2, Timeout: 20 * time.Second},
 		Read: config.Upstream{BaseURL: readC.URL(), MaxInflight: 2, Timeout: 20 * time.Second},
 	}
 
 	// First process: commit a job exactly as the submit path would, then die before running it.
-	st, err := store.Open(store.Options{DataDir: dir, AllowNetworkFS: true})
+	st, err := store.Open(store.Options{DataDir: dir})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -400,7 +399,7 @@ func TestCrashRecoveryResumesAcceptedJobs(t *testing.T) {
 	_ = st.Close()
 
 	// Second process: a fresh store and manager over the same volume.
-	st2, err := store.Open(store.Options{DataDir: dir, AllowNetworkFS: true})
+	st2, err := store.Open(store.Options{DataDir: dir})
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
 	}

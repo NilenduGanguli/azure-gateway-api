@@ -152,6 +152,9 @@ func TestSyncPassthroughNormalisesUpstreamErrors(t *testing.T) {
 
 // TestClientRequestIDIsEchoed checks the correlation header round-trips, which is the first thing
 // anyone debugging a stuck operation reaches for.
+//
+// apim-request-id is a cloud front-door header the containers are not known to send, so the
+// gateway does not send it either; its own request id stays in its logs.
 func TestClientRequestIDIsEchoed(t *testing.T) {
 	h := newHarness(t, harnessOpts{})
 	const cid = "11111111-2222-4333-8444-555555555555"
@@ -162,8 +165,59 @@ func TestClientRequestIDIsEchoed(t *testing.T) {
 	if got := resp.Header.Get("x-ms-client-request-id"); got != cid {
 		t.Errorf("x-ms-client-request-id echoed as %q, want %q", got, cid)
 	}
-	if resp.Header.Get("apim-request-id") == "" {
-		t.Error("apim-request-id is missing")
+	if v := resp.Header.Get("apim-request-id"); v != "" {
+		t.Errorf("apim-request-id is %q; the containers do not send it", v)
+	}
+}
+
+// TestServerHeaderMatchesTheContainers: the containers' web server, Kestrel, names itself on every
+// response, including an error and an unrouted path. A client must not be able to tell the gateway
+// from a pod by that header. The gateway's own /_gw/ surface does not pretend to be a container.
+func TestServerHeaderMatchesTheContainers(t *testing.T) {
+	h := newHarness(t, harnessOpts{})
+
+	for _, tc := range []struct {
+		name string
+		do   func() *http.Response
+		want string
+	}{
+		{"DI submit", func() *http.Response { return h.post(diAnalyze, "%PDF-1.7 fake") }, "Kestrel"},
+		{"Read submit", func() *http.Response { return h.post(readAnalyze, "fake-image") }, "Kestrel"},
+		{"DI unknown result", func() *http.Response {
+			return h.get("/documentintelligence/documentModels/prebuilt-layout/analyzeResults/" +
+				"00000000-0000-4000-8000-000000000000?api-version=" + apiVersion)
+		}, "Kestrel"},
+		{"unrouted path", func() *http.Response { return h.get("/no/such/route") }, "Kestrel"},
+		{"container status", func() *http.Response { return h.get("/status") }, "Kestrel"},
+		{"gateway health", func() *http.Response { return h.get("/_gw/health") }, ""},
+		{"gateway config", func() *http.Response { return h.get("/_gw/config") }, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := tc.do()
+			_ = resp.Body.Close()
+			if got := resp.Header.Get("Server"); got != tc.want {
+				t.Errorf("Server is %q, want %q (status %d)", got, tc.want, resp.StatusCode)
+			}
+		})
+	}
+}
+
+// TestForwardedHeadersCannotMoveTheOperation: with PUBLIC_BASE_URL unset the gateway advertises
+// the request's own Host, as the container does. Forwarded headers are never honoured, because a
+// caller that could set X-Forwarded-Host would have its SDK send the operation id to a host of its
+// choosing.
+func TestForwardedHeadersCannotMoveTheOperation(t *testing.T) {
+	h := newHarness(t, harnessOpts{})
+
+	resp := h.post(diAnalyze, "%PDF-1.7 fake",
+		"X-Forwarded-Host", "collector.attacker.net", "X-Forwarded-Proto", "https")
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status %d, want 202", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Operation-Location"); !strings.HasPrefix(loc, h.gateway.URL+"/") {
+		t.Errorf("Operation-Location is %q, want it under the request's own host %s",
+			loc, h.gateway.URL)
 	}
 }
 
