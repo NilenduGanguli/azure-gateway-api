@@ -3,38 +3,38 @@
 This document describes how `azure-gateway-api` is tested and how to verify a change before you
 commit it. It is written for someone who has not seen the repository before: it explains what each
 layer of the test suite exists for, why the fakes in `internal/mockazure` model failure rather than
-success, why most conformance tests exist because a named Azure SDK breaks otherwise, and what is
-deliberately left untested. Companion documents: [`README.md`](../README.md),
-[`docs/ARCHITECTURE.md`](ARCHITECTURE.md), [`docs/OPERATIONS.md`](OPERATIONS.md),
-[`docs/CONTAINER-BEHAVIOUR.md`](CONTAINER-BEHAVIOUR.md), [`docs/HANDOFF.md`](HANDOFF.md),
-[`docs/api-surface.md`](api-surface.md), and the approved
-[design spec](superpowers/specs/2026-09-08-azure-gateway-api-design.md).
+success, why most conformance tests exist because a named Azure SDK breaks otherwise, how splitting
+is proven page-exact without real containers, and what is deliberately left untested. Companion
+documents: [`README.md`](../README.md), [`docs/ARCHITECTURE.md`](ARCHITECTURE.md),
+[`docs/OPERATIONS.md`](OPERATIONS.md), [`docs/CONTAINER-BEHAVIOUR.md`](CONTAINER-BEHAVIOUR.md),
+[`docs/HANDOFF.md`](HANDOFF.md), [`docs/api-surface.md`](api-surface.md), and the
+[sync-only](superpowers/specs/2026-10-10-sync-only-upstream-design.md) and
+[splitting](superpowers/specs/2026-10-10-large-document-splitting-design.md) designs, whose §11 and
+§10 list the required tests.
 
 ---
 
 ## 1. The layers
 
-The gateway has to be wire-identical to two Azure containers it cannot reach from a laptop, and it
-has to survive those containers misbehaving. Those are different problems, and they are tested at
-different layers.
+The gateway has to be wire-identical to two Azure containers it cannot reach from a laptop, it has
+to survive those containers and their load balancer misbehaving, and its merged results have to
+equal what Azure would have produced for the whole document. Those are different problems, tested
+at different layers.
 
 | Layer | Where | What it is for |
 |---|---|---|
-| Unit tests | `internal/<pkg>/*_test.go` | One package at a time, with no HTTP surface: parsing, validation, storage semantics, error rendering, ID shape, memory behaviour. |
-| Fakes | `internal/mockazure` | Not tests. In-process HTTP servers that impersonate both containers *including their failure modes*, so every other layer can drive the real code paths. |
-| Conformance suite | `test/conformance` | A fully wired gateway — surfaces, admin, job manager, SQLite store, upstream clients — driven over real HTTP against the fakes. Asserts what unmodified Azure SDK clients depend on. |
-| Real-SDK harness | `test/sdk` | The official Python Azure client libraries pointed at a running gateway. Asserts the SDKs *accept* what the gateway emits. Has never been run against a live gateway (§5). |
+| Unit tests | `internal/<pkg>/*_test.go` | One package at a time: parsing, validation, migrations, the attempt classifier, the scheduler, the splitter, the rewriter, the merge, error rendering. Table-driven. |
+| Round-trip tests | `internal/merge/roundtrip_test.go` | A whole-document result from `docgen`, cut into parts, merged back: **byte for byte** equal, for both surfaces and all three `stringIndexType` units. |
+| Engine tests | `internal/engine/engine_test.go` | The whole/split decision, retries, hedges, halving, re-checks, fallbacks, fairness and cancellation, against the paged fake with real PDFs. |
+| Fakes | `internal/mockazure`, `cmd/fakeazure` | Not tests. HTTP servers that impersonate both containers *including their failure modes and HAProxy's*, and a paged fake that answers per original page. |
+| Conformance suite | `test/conformance` | A fully wired gateway — built by the same `app.NewHandler` and `app.NewEngines` as the binary — driven over real HTTP against the fakes. Every endpoint; what unmodified Azure SDK clients depend on. |
+| Live end to end | `scripts/e2e-local.sh` | The built gateway binary against `cmd/fakeazure` on real ports: every route by `curl`, the real-SDK suite, and `gateway probe --compare-split`. |
+| Real-SDK harness | `test/sdk` | The official Python Azure client libraries pointed at a running gateway, including 23-page PDFs that are split and merged. |
 
-Counted today: **63 unit test functions** across the `internal` packages that have test files
-(one of them, `TestLiveMocks`, is gated off by default) and **46 conformance test functions**.
-
-Five packages have no test file of their own: `cmd/gateway`, `internal/surface`, `internal/admin`,
-`internal/logging` and `internal/probe`. `internal/surface` — the client-facing handlers, and by far
-the largest of the five at 931 lines, covered to 68.2% — is deliberate: the surfaces are almost
-entirely about wire shape, and a handler test driven by a synthetic `httptest.ResponseRecorder`
-would assert the shape the handler was written to produce rather than the shape a client receives,
-so it is exercised end to end through `test/conformance` instead. The other four are discussed in
-§6.
+`internal/surface` is tested both through `test/conformance` and with its own handler tests for the
+parameter policy, the sync route, the artifact 404s and the relays. Wire shape is still asserted
+end to end, because a handler test asserts the shape the handler was written to produce rather
+than the shape a client receives.
 
 ### How the conformance harness is wired
 
@@ -43,32 +43,31 @@ the whole system in-process, once per test, on a `t.TempDir()` volume:
 
 ```mermaid
 flowchart LR
-  C["test client<br/>(noRedirect http.Client)"] -->|real HTTP| G["httptest gateway<br/>httpx.Chain(RequestID, Recover)"]
-  G --> S["surface.New(...).Register(mux)<br/>admin.New(...).Register(mux)"]
+  C["test client<br/>(noRedirect http.Client)"] -->|real HTTP| G["httptest gateway<br/>app.NewHandler"]
+  G --> S["surfaces + admin<br/>(configured surfaces only)"]
   S --> J["jobs.Manager<br/>Start + Recover"]
-  J --> U["upstream.NewDI / NewRead"]
-  S --> ST["store.Open(t.TempDir())<br/>SQLite + blobs"]
+  J --> E["app.NewEngines:<br/>scheduler, splitter, client, engine"]
+  S --> ST["store.Open(t.TempDir())<br/>SQLite + migrations + blobs"]
   J --> ST
-  U -->|real HTTP| M["mockazure.NewDI<br/>mockazure.NewRead"]
+  E -->|real HTTP| M["mockazure.NewDI / NewRead<br/>or NewPaged"]
 ```
 
-Two details of the harness carry meaning:
+Details that carry meaning:
 
 - `noRedirect()` builds every test client with
-  `CheckRedirect: func(...) error { return http.ErrUseLastResponse }`. That mirrors the .NET
-  pipeline, which sets `AllowAutoRedirect = false` and treats any 3xx as terminal. Following
-  redirects in tests would hide a gateway that emits one.
+  `CheckRedirect: func(...) error { return http.ErrUseLastResponse }`, mirroring the .NET
+  pipeline, which treats any 3xx as terminal.
+- Engines come from `app.NewEngines`, exactly as in `cmd/gateway/main.go`. The two once built
+  different gateways and the suite could not see the difference; never build engines by hand in a
+  test.
+- `harnessOpts` selects the world: `di` / `read` (`mockazure.Options`), `paged` (use
+  `mockazure.NewPaged` for both surfaces), `diOnly` / `readOnly` (leave the other upstream unset),
+  `splitPages`, and `tweak`, which overrides one `config.Config` field on top of the harness
+  baseline.
 - The harness config is a hand-written `config.Config` literal, not `config.Load()`, so it inherits
-  no defaults at all. Most of its values are deliberately test-sized: `DIBlindPollBudget` 10
-  (shipped default 60), `MaxInflight` 2 (4), the upstream timeouts 30 s (15 m for DI, 10 m for
-  Read), `ResultTTL` 1 h (24 h), `GCInterval` 1 h (5 m), `DiskHighWatermark` 0.99 (0.90),
-  `MaxRequestBytes` 16 MiB (500 MiB), `ShutdownGrace` 5 s (30 s), `AllowNetworkFS` true (false).
-  Only a few fields coincide with what an operator gets — `TrustForwardedHeaders: false`,
-  `DISyncMode: config.SyncAuto`, `QueueDepth: 0`, `PollRetryAfter: 1`, `BusyRetryAfter: 5` — and
-  `DISyncProbeTimeout` is left at zero, so `NewDI` clamps it to `DI.Timeout`. `harnessOpts.tweak`
-  lets an individual test override one field on top of that literal, which keeps every other test
-  honest about the *harness* baseline. It is not a check on `internal/config/config.go`'s
-  defaults; `TestLoadDefaults` is.
+  no defaults. Its values are deliberately test-sized (small `MaxInflight`, 30 s upstream timeouts,
+  a 1 h TTL, 16 MiB uploads, a 5 s shutdown grace). It is not a check on the shipped defaults;
+  `TestLoadDefaults` in `internal/config` is.
 
 ---
 
@@ -76,59 +75,92 @@ Two details of the harness carry meaning:
 
 The package doc states the reason plainly: the failure modes *are* what the gateway exists to
 absorb, so "code that is never exercised against those cases is code that has not been tested."
-`NewDI(Options)` and `NewRead(Options)` each start an `httptest.Server` with the routes the
-corresponding container serves; `Options` selects which reality you get.
+There are two kinds of fake.
 
-Three accessors make assertions about *which route was taken* possible, which is most of what the
-upstream state machine needs proved:
+### `NewDI(Options)` / `NewRead(Options)` — one container, one behaviour
+
+Each starts an `httptest.Server` with the routes the corresponding container serves. The DI fake
+serves a Layout body; the Read fake serves a **real Read v3.2 body** (`version`, `modelVersion`,
+`readResults[]` with `lines`, `boundingBox`, `text`, `words`). Both send `Server: Kestrel` unless
+`NoServerHeader` is set. Accessors:
 
 | Method | Use |
 |---|---|
 | `Hits() int64` | How many analyze calls were served. |
-| `Requests() []string` | Every path served, in order. |
-| `Called(substr string) bool` | Whether any served path contains `substr` — e.g. `h.di.Called(":syncAnalyze")`. |
+| `SyncCalls() int64` | How many synchronous analyze requests were received, failures included. |
+| `Requests() []string` | Every path served, in order — e.g. to prove a 202 was never polled. |
+| `Called(substr string) bool` | Whether any served path contains `substr`. |
 
-### `SyncBehavior` — how the synchronous analyze route answers
+**`SyncBehavior`** — how the synchronous route answers, and the attempt outcome each one produces
+(ARCHITECTURE §4.1):
 
-Applied in `serveSync`, which backs `POST …:syncAnalyze` on the DI and `/formrecognizer` families
-and `POST /vision/v3.2/read/syncAnalyze` on Read.
-
-| Value | Fake response | Real-world condition it reproduces |
+| Value | Fake response | Outcome |
 |---|---|---|
-| `Sync200` | `200` with a succeeded operation envelope | The documented Read behaviour, and the best case for DI: fully stateless, load-balances correctly, nothing pinned to a replica. |
-| `Sync202` | `202` + `Operation-Location` naming a freshly minted operation that only this fake knows | The DI container degrading to async under memory pressure. Microsoft has described a 202 on this route as "not standard or documented behavior". The operation now lives on one replica only, so affinity matters from here on. |
-| `Sync404` | Bare `404`, **no body at all** | An image build that does not serve the route. Kestrel answers an unrouted path with a bodyless 404, not with a Document Intelligence error object — and that absence is exactly what distinguishes "this build lacks the route" from "this build has it and your model does not exist". |
-| `Sync500Unhandled` | `500` `{"error":{"code":"InternalServerError","message":"UnhandledEndpointException: no candidates found for the request path."}}` | Older builds that answer a missing endpoint with a 500 rather than a 404. `looksLikeMissingEndpoint` in `internal/upstream/di.go` matches on `unhandledendpointexception`, `no candidates found for the request path` and `request did not match any endpoints`. |
-| `SyncModelNotFound` | `404` wrapped, with `innererror.code = "ModelNotFound"` | The route exists; the *model* does not. This is request-scoped and must **not** latch the capability off — `resourceScoped404` returns true for `InnerModelNotFound` / `InnerOperationNotFound` and for a well-formed `NotFound` carrying a message. |
-| `SyncHang` | Accepts the request and blocks on `<-r.Context().Done()`; never answers | The worst case a live probe found: a `layout-4.0` build declares `:syncAnalyze` in its own swagger and then holds the connection past five minutes on a blank 200×120 image. This is why `DI_SYNC_PROBE_TIMEOUT` (default `60s`) exists as a bound separate from `DI_UPSTREAM_TIMEOUT` (default `15m`) — without it, every job in `auto` mode would burn the whole upstream timeout here before falling back to the route that works. |
+| `Sync200` | `200` with a succeeded operation envelope (or a bare result with `SyncBodyBare`) | `Success` |
+| `Sync202` | `202` + `Operation-Location` — the container degrading under memory pressure | `Retry` (`degraded_202`); the body is drained and **no poll is made** |
+| `Sync404` | bare `404`, no body — a build that does not serve the route | `RouteMissing` |
+| `Sync500Unhandled` | `500` `UnhandledEndpointException` — older builds' missing route | `RouteMissing` |
+| `SyncModelNotFound` | wrapped `404` with `innererror.code = "ModelNotFound"` | `Terminal`, relayed |
+| `SyncHang` | accepts and never answers — a build that declares the route and hangs | the attempt deadline: `RetryOnce` (`timeout`) |
 
-How each maps onto a gateway branch:
+**HAProxy and pod failure modes** — the `Options` fields added for the sync-only design. Each mode
+applies to synchronous analyze calls only, and HAProxy's modes answer **before** the API-key check,
+because HAProxy answers before any pod sees the request.
 
-```mermaid
-flowchart TD
-  A["DIClient.trySync"] --> B{"status"}
-  B -->|200| C["ModeSync — done, nothing pinned"]
-  B -->|202| D["ModeDegraded — poll with affinity<br/>under ctx, not probeCtx"]
-  B -->|404 bodyless / 500 UnhandledEndpoint / probe deadline| E["ErrSyncUnavailable → latch capability off<br/>→ analyzeAsync (ModeAsyncFallback)"]
-  B -->|404 with ModelNotFound| F["request-scoped error — capability untouched"]
+| Field | Behaviour | What it models |
+|---|---|---|
+| `BusyFirst int` | 503 + `Retry-After: 1` for the first *n* calls | every pod at its connection cap, or no ready pod |
+| `StatusFirst int`, `StatusFirstCode int` | that status with a container-shaped error for the first *n* calls (502, 504, 500, 408, 429) | gateway errors, timeouts and throttling between HAProxy and the pods |
+| `ResetMidBody bool` | writes half the 200 body, then closes the connection | a pod killed mid-response by scale-in |
+| `Capacity int` | 503 while more than *k* calls are in flight; 0 = unlimited | `haproxy.router.openshift.io/pod-concurrent-connections` |
+| `Latency time.Duration` | delays each synchronous call | real analysis time, and work in flight at shutdown |
+| `FailAnalysis`, `FailSyncBare` | `200` with `status: failed` (wrapped error, or Read's bare `{"status":"Failed"}`) | the dominant failure mode on both surfaces: `AnalysisFailed` |
+| `PadResultBytes int` | inflates the result | the streaming paths, far beyond any buffer |
+| `RequireAPIKey string` | `401` without `Ocp-Apim-Subscription-Key` on analyze routes | the gateway injecting its own credential |
+| `MetadataMissing bool` | bodyless 404 on `/info` and `/documentModels` | a probed build; the relay must not invent a body |
+| `SyncErrorStatus int` | that status with an **HTML** body and `Retry-After: 120` | an nginx sidecar's error page, unparseable by any SDK |
+| `StatusUnhealthy bool` | `/status` reports `apiStatus: Invalid` | a rejected subscription key |
+
+### `NewPaged(PagedOptions)` — the paged fake
+
+The splitting tests need a container that answers correctly for *whatever pages it is sent*. Test
+PDFs come from `internal/pdftest`: `pdftest.Make(n)` builds a valid `n`-page PDF whose page *i* has
+a MediaBox width of `600+i`. A part carries the original page objects, so the paged fake parses the
+body with pdfcpu, maps each page width back to its original page number (`pdftest.PageOf`), and
+answers with `docgen`'s result for exactly those pages — without trusting anything the gateway sends
+alongside the document.
+
+- **Numbering.** A body whose pages are `1..n` is taken for an original document, with or without
+  `pages=`, and answered in original numbering (honouring `pages=` by selecting those pages). A part
+  is answered with local numbering `1..k`, as the real container numbers a physically split file.
+- **Routes.** `:syncAnalyze` and Read `syncAnalyze`, plus `:analyze` + poll (so the probe's
+  sync-versus-async comparisons work), `/status`, `/ready`, `/`, `/swagger` and
+  `/swagger/v1/swagger.json`, `/records/usage-logs`, and the DI metadata and `operations` routes.
+- **`Calls() [][]int`** returns, for every synchronous analyze served, the original pages it
+  covered, in order — so a test can assert exactly which parts, halves, hedges and re-checks were
+  sent.
+
+| `PagedOptions` field | Behaviour |
+|---|---|
+| `Surface` | `DI` or `Read`; DI serves both API families |
+| `Doc docgen.Options` | `Unit` (the `stringIndexType` a request naming none is answered in) and `TitleOnFirstPage` (the first analysed page's heading becomes `title` — a document-level judgement, so `--compare-split` has a difference to report) |
+| `Hang map[int]bool` | any call covering one of these pages hangs until its client gives up |
+| `HangFirst map[int]bool` | only the **first** call covering the page hangs; a retry or a hedge is answered even while the first is still held |
+| `FailFirst map[int]int` | page → how many calls covering it answer 503 first. A call fails while any page it covers has failures left, and uses one of each |
+| `BadContent map[int]bool` | calls covering the page answer a terminal 400: `InvalidContent` (DI) or `InvalidImageFormat` (Read) |
+| `BadOnlyWhenSplit bool` | limits `BadContent` to split parts, modelling a page that fails only when cut out of its document. A part holding the first pages `1..k` is indistinguishable from an original and never bad, so give a later page |
+| `Latency`, `APIKey`, `SyncBodyBare`, `Capacity`, `BusyFirst`, `StatusFirst`, `StatusFirstCode`, `ResetMidBody`, `NoServerHeader` | as in `Options` |
+
+### `cmd/fakeazure` — the paged fakes on real ports
+
+```bash
+go run ./cmd/fakeazure -di 127.0.0.1:5001 -read 127.0.0.1:5002 -hang 7 -fail-first 3:2 -title-first
 ```
 
-### `Options` — every field
-
-| Field | Where it applies | Condition it reproduces |
-|---|---|---|
-| `Sync SyncBehavior` | `serveSync` | See the table above. |
-| `SyncBodyBare bool` | `serveSync`, `Sync200` path | Returns a bare `AnalyzeResult` rather than the `{"status","createdDateTime","lastUpdatedDateTime","analyzeResult"}` envelope. Which shape the real DI synchronous route returns is question **Q-A2** in the design spec and remains unverified, so the adapter must handle both. |
-| `PollsBeforeSuccess int` | `servePoll` | How many polls report `running` before the operation completes — i.e. an analysis that takes real time, so the gateway's poll loop, `Retry-After` emission and status vocabulary are exercised rather than short-circuited. |
-| `WrongReplicaEvery int` | `servePoll` | Every Nth poll answers as an unknown id. This is the core problem the gateway exists for: the containers' async result store is instance-local by default, so a round-robin route lands a poll on a replica that never saw the operation. Zero disables it. |
-| `FailAnalysis bool` | `serveSync` (`Sync200` path) and `servePoll` | The operation terminates `failed` at **HTTP 200**, carrying a wrapped `error` with `innererror.code = "InvalidContent"`. This is the dominant failure mode on both surfaces. |
-| `FailSyncBare bool` | `serveSync`, `Sync200` path | `200 {"status":"Failed"}` — capital F, no code, no message. It is the only error form Microsoft documents for CV `syncAnalyze`, it is unactionable as-is, and `"Failed"` is outside the four status strings every SDK accepts. |
-| `PadResultBytes int` | `analyzeResult()`, so both sync and poll bodies | Inflates the result with a `padding` string so the streaming and byte-range composition paths run against a body far larger than any buffer. |
-| `Latency time.Duration` | `serveSync` only | Delays the synchronous call. Used to hold an admission slot open (the 429 test) and to have work genuinely in flight when a shutdown signal arrives. |
-| `StatusUnhealthy bool` | `GET /status` | Makes the container report `{"apiStatus":"Invalid","apiStatusMessage":"Subscription validation failed."}` instead of `Valid`, i.e. a container whose subscription key was rejected. **No test currently sets this field.** |
-| `RequireAPIKey string` | `authorized`, on the analyze POST routes only (not polls, not `/status`, not `/ready`) | A container that rejects a call without `Ocp-Apim-Subscription-Key`, answering `401 Unauthorized`. Proves the gateway injects its own upstream credential while requiring nothing from the client. |
-| `MetadataMissing bool` | `GET /documentintelligence/info` and `GET /documentintelligence/documentModels` | A probed layout-4.0 build declares neither metadata route in its swagger and answers both with a bodyless 404. `TestProxyPreservesUpstreamStatus` is built on it: the metadata proxy must relay that status and must not invent a body. |
-| `SyncErrorStatus int` | `serveSync`, checked **before** `Sync` | When non-zero, answers with that status, `Content-Type: text/html`, an HTML body (`<html>…413 Request Entity Too Large…</html>`) *and* `Retry-After: 120`. This is the unschematized error class — HTML from an nginx sidecar — that no client SDK can parse, plus a `Retry-After` that azure-core would replay ten times if it were relayed onto a non-retriable status. |
+It serves a paged fake per surface until interrupted, and prints one `NAME=URL` line per fake in
+the form the gateway's settings take. The page flags apply to both fakes and accept ranges, bounded
+so a typo like `1-1000000` is refused rather than expanded. It is a development tool: the image
+builds only `cmd/gateway`.
 
 ### The error bodies the fakes emit
 
@@ -145,27 +177,24 @@ they do not know, which is **not** what either published contract says:
  matching this operationId have been deleted."}}
 ```
 
-`SyncModelNotFound` emits the wrapped DI shape with an `innererror`; `Sync500Unhandled` and the
-`401` from `authorized` use `writeDIError`, the plain wrapped shape. A path the fake does not route
-at all falls through to `http.ServeMux`'s own `NotFoundHandler`, which — unlike Kestrel — writes a
-short `text/plain` body. Kestrel's genuinely bodyless 404 is modelled explicitly, by `Sync404`; the
-gateway's own unrouted 404 is bodyless because `azerr.Unrouted` sets `bare`, which makes `WriteTo`
-send `Content-Length: 0` and no body.
+A path the fake does not route falls through to `http.ServeMux`'s own `NotFoundHandler`, which —
+unlike Kestrel — writes a short `text/plain` body. Kestrel's genuinely bodyless 404 is modelled
+explicitly, by `Sync404`; the gateway's own unrouted 404 is bodyless because `azerr.Unrouted` sets
+`bare`.
 
 ### Driving the shell probe against the fakes
 
 `internal/mockazure/live_test.go` holds both fakes open so
-[`scripts/probe-containers.sh`](../scripts/probe-containers.sh) can be exercised without a cluster.
-It is skipped unless `MOCKAZURE_LIVE` is set:
+[`scripts/probe-containers.sh`](../scripts/probe-containers.sh) can be exercised without a cluster:
 
 ```bash
 MOCKAZURE_LIVE=1 go test ./internal/mockazure -run TestLiveMocks &
 set -a; . /tmp/mockurls.env; set +a && ./scripts/probe-containers.sh
 ```
 
-`MOCK_DI_SYNC` selects the DI behaviour by ordinal (`0` available, `1` degrades to 202, `2` absent
-404, `3` absent 500, `4` model not found — the `SyncBehavior` iota order) and `MOCK_HOLD_SECONDS`
-controls how long the fakes stay up, default 120.
+`MOCK_DI_SYNC` selects the DI behaviour by ordinal (the `SyncBehavior` iota order) and
+`MOCK_HOLD_SECONDS` how long the fakes stay up, default 120. For the Go probe, `cmd/fakeazure` is
+simpler.
 
 ---
 
@@ -179,38 +208,46 @@ SDKs whose pollers make assumptions no published contract records — a hard-cod
 `Operation-Location`, a backwards segment count, a `Retry-After` run through an integer
 deserialiser. Break one and the failure is remote, opaque and blamed on the wrong component.
 
+### The files
+
+| File | What it covers |
+|---|---|
+| `endpoints_test.go` | **One table-driven test over every route**: method, path, headers, body, expected status, required and forbidden headers, and a body assertion. DI `:analyze` on both families, poll `GET`/`HEAD` while running and after success, `DELETE`, `:syncAnalyze`, the artifact 404s for known and unknown ids, every relayed GET (`info`, `documentModels`, `operations`, `/`, `swagger`, `records/usage-logs` and its month/year guard), `:analyzeBatch`, an unknown verb, Read `analyze`/`analyzeResults`/`syncAnalyze`, `/ready`, `/status`, every `/_gw/*` endpoint, an unrouted path, a wrong method, a missing `api-version`, unknown result ids on both surfaces, and `x-ms-client-request-id` echo. Every Azure route asserts `Server: Kestrel` and no `apim-request-id`; every `/_gw/*` route asserts no `Server: Kestrel`. |
+| `params_test.go` | Each rejected parameter (`output=pdf`, `output=figures`, `outputContentFormat=markdown`, `features=…`, `queryFields`) on `:analyze` and `:syncAnalyze` → 400 `InvalidArgument` naming it, **with no job row and no blob afterwards**; `outputContentFormat=text` and an empty `features` → accepted. |
+| `split_test.go` | Against the paged fake with `splitPages 5`: a 40-page PDF through `:analyze` equals the envelope around `docgen.DI(1..40)`; the same through `:syncAnalyze`; Read 40 pages; `pages=10-25`; a page that hangs on its first call (hedge or retry); bad content only when split (re-check, success); an unparseable PDF (whole); `splitPages 0` (one call); 50 submits against `Capacity(4)` with `MaxInflight 16` (all succeed); `/_gw/jobs` showing `upstreamParts`. |
+| `single_surface_test.go` | A DI-only gateway serves DI and answers every Read route with the bodyless 404; Read-only the reverse; `/_gw/health` lists one upstream; `/_gw/config` reports the disabled surface's inflight as 0. |
+| `parity_test.go` | Replays every golden case under `testdata/golden/<surface>/<tag>/` against a harness whose fakes serve the recorded bodies, comparing status, header names and shapes, and body keys, order and types, under the probe's masks. Skips with a message when no goldens exist for a real tag; `testdata/golden/fake/` holds one set generated from the paged fake, so the replay path itself is always exercised. |
+| `admin_test.go` | The metric families after a split job, with `# HELP`/`# TYPE` and monotonic histogram buckets; health and config shapes. |
+| `fidelity_test.go` | Wire-shape rules an SDK depends on — the examples below. |
+| `behaviour_test.go`, `sync_test.go` | Lifecycle, retries from the stored input, recovery, admission, TTL. The async-upstream, degraded-202 poll-out and artifact-capture cases were deleted with that code. |
+| `method_test.go` | `405` + `Allow` for a routed path with the wrong verb. |
+| `legacy_family_test.go` | The `/formrecognizer` family: served, and served identically. |
+| `shutdown_test.go` | Durability across a process boundary or a signal. |
+
 ### Examples, and the client each one protects
 
 | Test | File | Client it protects, and how it breaks |
 |---|---|---|
-| `TestDIOperationLocationShape` | `fidelity_test.go` | Checks every constraint at once. Python `_patch.py`, .NET `OperationWithId.cs`, Java `PollingUtils` and JS `pollingHelper` all hard-code `[^:]+://[^/]+/documentintelligence/.+/([^?/]+)` to derive the operation id, so the literal `/documentintelligence/` segment must be present. `Azure.AI.FormRecognizer` 4.x discards the URL and counts backwards after `Split('/','?')`, so `analyzeResults` must be second-from-last and `documentModels` fourth-from-last. `?api-version=` must be emitted because Python never re-appends it. And the URL must contain none of `{`, `}`, `|`, space or `^` — a literal brace raises inside Python's `str.format`, and any of them makes Java's `new URI(path)` throw and silently demote polling. |
-| `TestDISubmitOmitsLocationHeader` | `fidelity_test.go` | Python's `get_final_get_url` and JS's `operation.ts` both issue an extra final `GET` to a `Location` header captured from the 202 and then parse *that* response as the analyze result. A `Location` header does not fail the call; it silently returns the wrong body. |
-| `TestRetryAfterIsIntegerSeconds` | `fidelity_test.go` | The Python Document Intelligence client runs `Retry-After` through `_deserialize("int", …)`, so an HTTP-date raises `DeserializationError` and fails the call outright. The same helper also asserts the header is *present*: without it azure-core falls back to a 30-second default polling interval, making a sub-second gateway look thirty times slower. |
-| `TestNoRetryAfterOnNonRetriableErrors` | `fidelity_test.go` | azure-core's `RetryPolicy.is_retry` retries *any* response ≥ 400 that carries `Retry-After`, bypassing its own method allowlist, up to ten times. A 404 with the header turns one client call into eleven. Checked on three paths: an unknown DI result id, an unknown Read operation id, and an unrouted path. |
-| `TestUnknownIDMatchesTheContainersNotTheSpec` | `fidelity_test.go` | Not an SDK rule — a probe finding. DI answers this one error *flat* (`{"code":"NotFound","message":"Analyze result does not exist."}`) while wrapping everything else; Read wraps this one (`BadArgument`) although its own `Ocr.json` models it flat. The gateway reproduces both, because a client being unable to tell the gateway from the container is the entire product. |
-| `TestDocumentedCompatRestoresTheSpecShapes` | `fidelity_test.go` | The opt-out: `ERROR_COMPAT=documented` (`azerr.SetCompat(azerr.CompatDocumented)`) restores the published shapes for a client written against the generated SDK models instead of against these containers. |
-| `TestReadOperationLocationIsBare` | `fidelity_test.go` | The Computer Vision Read SDK has no poller, so callers follow Microsoft's canonical samples: `location.split("/")[-1]` in Python and `Substring(len-36)` + `Guid.Parse` in .NET. A query string, a trailing slash or a fragment makes the derived id junk, which the SDK then percent-encodes into the path and 404s on. The test asserts the trailing segment is exactly `ids.Len` characters and passes `ids.Valid`. |
-| `TestSucceededEnvelopeNestsAnalyzeResult` | `fidelity_test.go` | .NET's `AnalyzeResult.FromLroResponse` calls `GetProperty("analyzeResult")` on the terminal body and throws if it is absent. The same test asserts `resourceLocation` is *not* present, because Python, Java and JS would issue a bogus extra GET to it and parse that as the result. |
-| `TestStatusStringsAreExact` | `fidelity_test.go` | Only `notStarted`, `running`, `succeeded`, `failed` are terminal-safe across all four SDK families. `cancelled` is terminal in JS alone; `skipped` in none. |
-| `TestPollBodyIsAlwaysJSONWithStatus` | `fidelity_test.go` | Python raises `BadResponse` on an empty body, .NET treats a zero-length stream as failure, Java NPEs. Also asserts `Content-Type: application/json` and a present `Content-Length`. |
-| `TestNeverRedirects` / `TestNeverCompressesUnlessAsked` | `fidelity_test.go` | .NET builds its handler with `AllowAutoRedirect = false` and surfaces any 3xx as terminal; it also sends no `Accept-Encoding` at all and cannot decompress. The compression test sets `Accept-Encoding: identity` explicitly, because Go's transport otherwise adds gzip on its own. |
-| `TestPollSurvivesWrongReplica404` | `behaviour_test.go` | The core resilience case, driven by `WrongReplicaEvery: 2` — every other poll lands on a replica with no record. The gateway must absorb that and keep trying, because a 404 on a live operation kills Java clients with an opaque `NullPointerException` and marks the operation terminally failed in .NET and JS. |
-| `TestBlindPollBudgetIsBounded` | `behaviour_test.go` | The other side of the same tolerance: with `WrongReplicaEvery: 1` the owning replica is genuinely gone, and the operation must fail once `DI_BLIND_POLL_BUDGET` is spent rather than poll forever. |
-| `TestReadBareFailedStatusIsTranslated` | `behaviour_test.go` | The bare `{"status":"Failed"}` from CV `syncAnalyze` must be translated to lowercase `failed` with a real error object; capital-F `Failed` is outside every SDK's closed status enum. |
-| `TestArtifactsAreCapturedEagerly` | `behaviour_test.go` | `output=pdf` must force the asynchronous upstream path, because result files are addressed by the *container's* operation id and a synchronous call never mints one. Asserts the container's `/pdf` route was called and the stored artifact is then servable from the gateway. |
-| `TestLegacyFormRecognizerPrefixIsServed` | `sync_test.go` | A probe found the layout-4.0 build declaring the `/formrecognizer` family alongside `/documentintelligence`, so clients on `azure-ai-formrecognizer` reach the container today. The `Operation-Location` must echo the family the caller arrived on, because every SDK's id-deriving regex hard-codes its own. |
-| `TestHungSyncRouteFallsBackQuickly` | `sync_test.go` | Drives `SyncHang` with `DISyncProbeTimeout: 2s` against `DI.Timeout: 60s` and asserts the job still completes promptly, falls back to `:analyze` (`assertJobMode(…, "async-fallback")`), and that a second job does not pay the probe again. |
-| `TestSyncPassthroughResolvesADegraded202` | `sync_test.go` | Regression test for the worst client-visible defect the review found: the passthrough relayed the container's 202, handing the caller an empty body and no operation id for an analysis already paid for. The gateway now polls it out and answers 200. |
-| `TestPollNeverReturnsABodyWithoutStatus` | `sync_test.go` | Regression test: a succeeded row whose result blob has gone used to answer a bare 500. Java's poller never checks the poll status code — it deserialises, finds no `status`, and throws an opaque `NullPointerException`. The test deletes the blob out from under a completed job and asserts a `200` with `status: "failed"`. |
-| `TestResourceScoped404DoesNotDisableTheSyncRoute` | `sync_test.go` | Regression test: latching `:syncAnalyze` off is process-wide and permanent, so treating every 404 as "route absent" meant one request naming a missing model disabled the fast path for every later job until the pod restarted. |
-| `TestSignalDoesNotAbortInFlightRequests` | `shutdown_test.go` | Regression test for a graceful shutdown that was not graceful. Request contexts were derived from the signal context, so SIGTERM cancelled every in-flight handler instantly and `Shutdown` returned in about a millisecond. The test builds an `http.Server` with a `BaseContext` distinct from the signal context, fires the signal mid-request, and asserts both that the request completes with 200 *and* that `Shutdown` took longer than 500 ms. |
-| `TestBootRecoveryReclaimsJobsWithUnexpiredLeases` | `shutdown_test.go` | Regression test: the boot pass filtered `running` jobs on lease expiry, which is exactly backwards for a crash — the process dies holding a lease minutes in the *future*, so the scan skipped precisely the jobs it existed to rescue. Two `store.Open` calls over one `t.TempDir()` simulate the process boundary. |
+| `TestDIOperationLocationShape` | `fidelity_test.go` | Python `_patch.py`, .NET `OperationWithId.cs`, Java `PollingUtils` and JS `pollingHelper` all hard-code `[^:]+://[^/]+/documentintelligence/.+/([^?/]+)` to derive the operation id, so the literal `/documentintelligence/` segment must be present. `Azure.AI.FormRecognizer` 4.x counts backwards after `Split('/','?')`, so `analyzeResults` must be second-from-last and `documentModels` fourth-from-last. `?api-version=` must be emitted because Python never re-appends it. |
+| `TestDISubmitOmitsLocationHeader` | `fidelity_test.go` | Python's `get_final_get_url` and JS's `operation.ts` issue an extra final `GET` to a `Location` header and parse *that* response as the result. |
+| `TestRetryAfterIsIntegerSeconds` | `fidelity_test.go` | The Python DI client runs `Retry-After` through `_deserialize("int", …)`, so an HTTP-date raises. Without the header azure-core falls back to a 30-second polling interval. |
+| `TestNoRetryAfterOnNonRetriableErrors` | `fidelity_test.go` | azure-core retries *any* response ≥ 400 that carries `Retry-After`, up to ten times. |
+| `TestUnknownIDMatchesTheContainersNotTheSpec` | `fidelity_test.go` | A probe finding: DI answers this one error flat while wrapping everything else; Read wraps it although its own `Ocr.json` models it flat. There is no longer a mode that restores the published shapes. |
+| `TestReadOperationLocationIsBare` | `fidelity_test.go` | The Read SDK has no poller; the canonical samples do `split("/")[-1]` and `Substring(len-36)`. |
+| `TestSucceededEnvelopeNestsAnalyzeResult` | `fidelity_test.go` | .NET's `AnalyzeResult.FromLroResponse` throws without `analyzeResult`; `resourceLocation` triggers a bogus extra GET in Python, Java and JS. |
+| `TestStatusStringsAreExact` | `fidelity_test.go` | Only `notStarted`, `running`, `succeeded`, `failed` are terminal-safe across all four SDK families. |
+| `TestPollBodyIsAlwaysJSONWithStatus` | `fidelity_test.go` | Python raises on an empty body, .NET treats it as failure, Java NPEs. |
+| `TestNeverRedirects` / `TestNeverCompressesUnlessAsked` | `fidelity_test.go` | .NET sets `AllowAutoRedirect = false` and sends no `Accept-Encoding`. |
+| `TestReadBareFailedStatusIsTranslated` | `behaviour_test.go` | Read's bare `{"status":"Failed"}` must become lowercase `failed` with a real error object. |
+| `TestLegacyFormRecognizerPrefixIsServed` | `legacy_family_test.go` | `Operation-Location` must echo the family the caller arrived on. |
+| `TestPollNeverReturnsABodyWithoutStatus` | `sync_test.go` | A succeeded row whose result blob has gone must answer `200 failed`, never a bare 500 that Java deserialises into an NPE. |
+| `TestSignalDoesNotAbortInFlightRequests` | `shutdown_test.go` | SIGTERM must not cancel in-flight handlers; `Shutdown` must actually wait. |
+| `TestBootRecoveryReclaimsJobsWithUnexpiredLeases` | `shutdown_test.go` | The boot pass must ignore leases, which a crash leaves minutes in the future. |
 
-Several tests assert the recorded `upstream_mode` rather than only the client-visible result, via
-`assertJobMode(t, h, want)` reading `store.Recent`. The three values come from
-`internal/store/db.go`: `sync`, `degraded-202`, `async-fallback`. Asserting the mode is what stops
-a test from passing for the wrong reason — a correct answer reached down the slow path is a
-regression, not a success.
+Tests assert the job's recorded counts, not only the client-visible result:
+`upstreamAttempts` and `upstreamParts` on `/_gw/jobs`, and the fake's `Calls()` or `SyncCalls()`.
+A correct answer reached by the wrong route — split when it should have gone whole, or retried
+when it should have failed — is a regression, not a success.
 
 ### Adding a new fidelity test
 
@@ -221,7 +258,7 @@ regression, not a success.
    [`docs/CONTAINER-BEHAVIOUR.md`](CONTAINER-BEHAVIOUR.md) carries the probe observations.
 
 2. **Teach the fake the behaviour, if it does not know it yet.** New container behaviour goes in
-   `internal/mockazure` as either a new `SyncBehavior` value or a new `Options` field, with a doc
+   `internal/mockazure` as a new `SyncBehavior` value, an `Options` field or a `PagedOptions` field, with a doc
    comment naming the real-world condition it reproduces. Keep the default zero value equal to the
    healthy case, so existing tests are unaffected.
 
@@ -229,9 +266,13 @@ regression, not a success.
 
    | File | Kind |
    |---|---|
+   | `endpoints_test.go` | A new route, or a new header or status rule that applies across routes: add a row. |
    | `fidelity_test.go` | A wire-shape rule an SDK depends on: headers, status codes, body shape, status vocabulary. |
-   | `behaviour_test.go` | Upstream strategy and lifecycle: which route was used, TTL, artifacts, recovery, admission. |
-   | `sync_test.go` | Regressions in the synchronous path and the upstream state machine. |
+   | `params_test.go` | The parameter policy. |
+   | `split_test.go` | Splitting and merging, end to end against the paged fake. |
+   | `behaviour_test.go` | Lifecycle: retries from the stored input, TTL, recovery, admission. |
+   | `sync_test.go` | Regressions in the synchronous route. |
+   | `single_surface_test.go` | A gateway with one upstream. |
    | `shutdown_test.go` | Durability across a process boundary or a signal. |
    | `legacy_family_test.go` | The `/formrecognizer` family: that it is served, and served identically. |
 
@@ -252,25 +293,46 @@ regression, not a success.
 
 ---
 
-## 4. Running things
+## 4. The unit suites
+
+The sync-only and splitting work is mostly new packages, each test-first. What each suite pins:
+
+| Package | Tests | What they pin |
+|---|---|---|
+| `internal/store` (`migrate_test.go`) | fresh volume reaches the latest version with no backup; a legacy (pre-versioning) database is version 1 and keeps its rows, including one that lost an index or lacks `prefix`; an equal-version start writes nothing (mtime and size unchanged); a newer schema is refused naming the backup; a failing migration leaves the database and `user_version` unchanged; the backup is taken before migrating, only when there is something to migrate, atomically (no `.partial` left as a backup), replacing older ones and sparing an operator's own copies; 0002 keeps v1 rows with the new columns at 0; `TestSchemaFromScratchEqualsMigrated`; `TestReleasedMigrationsAreUnchanged` | the migration contract of ARCHITECTURE §5. The last two guard every **future** migration: the schema from scratch must equal the migrated one, and a released file may never change — its sha256 is pinned, and an unpinned file fails |
+| `internal/pdfsplit` | `IsPDF` within 1024 bytes; `ParsePages` accepted and rejected forms; `Select` de-duplication and range; `FormatPages`; `Plan` for 1–2,000 pages, the part-size bounds, non-contiguous selections; `Halve`; a 12-page split re-parsed by MediaBox width; `Recut`; garbage → `ErrUnparseable`; encrypted (user and owner-only) → `ErrEncrypted`; a 1 ns budget → `ErrBudget`; a recovered panic → `ErrPanic`; a third `Open` blocks until a `Close`; a waiting `Open` returns `ctx.Err()` | splitting design §2 |
+| `internal/sched` | the limit; round-robin rotation (job A queues three, job B one: A1, B1, A2, A3); FIFO within a job; a cancelled waiter leaves the queue; cancel racing a grant returns the slot (1,000 iterations under `-race`); `TryAcquireIdle` fails while anyone waits; idempotent release; a 50-goroutine stress test that never exceeds the limit | fairness and no slot leaks |
+| `internal/textunit` | `abc`, decomposed `é`, a ZWJ family emoji, a flag, `\n`, in all three units | offsets are counted as Azure counts them |
+| `internal/jsonx` | `Rewrite` identity over escapes, nested arrays, `-0.0`, `1e-07` and 20-digit integers; targeted replacements change only their bytes; visitor paths; long strings copied unvisited; truncated input and trailing garbage are errors; `ArrayItems`, `Members`, `CountItems`; an allocation bound on a 10 MB input | the merge copies what it does not rewrite byte for byte, in bounded memory |
+| `internal/docgen` | valid JSON; spans inside content in the unit; pointers resolve; deterministic bytes | the reference results the fakes and the round trip use |
+| `internal/merge` | **round trip**: for `n ∈ {1, 2, 6, 7, 11, 23}`, each unit, parts numbered locally, originally, and mixed, merging `docgen` parts reproduces the whole result **byte for byte**, DI and Read; every safety check (`stringIndexType` mismatch, missing, duplicated or out-of-order pages, a differing unknown member, contradictory member orders, a root span that disagrees with the unit); the markdown separator and its escaping; unknown arrays shifted; a memory bound on a 60 MB result | merge rules of ARCHITECTURE §4.7 |
+| `internal/upstream` (`attempt_test.go`) | the outcome table row by row against `mockazure` and `httptest` edge cases; a 202 is never polled; cancellation wins over a transport error; a new connection per attempt (`ConnState` sees one `StateNew` per attempt); `Backoff` with jitter 0 and 1, `Retry-After` override and caps | sync-only design §1 |
+| `internal/engine` | whole for a 3-page PDF, a JPEG and `urlSource`; split for 23 pages (parts 5,5,5,4,4) equal to `docgen.DI(1..23)`; `pages=3-14`; `base64Source`; `SPLIT_PAGES=0`; a page that always hangs is halved down to itself and fails with a timeout; a first-call hang is hedged and the hedge wins; `FailFirst` retried; bad content re-checked (success when only split; the container's error otherwise); unparseable → whole; a failed merge check → whole; fairness (a 1-page job finishes before a 30-page job's third part); cancellation mid-split returns `context.Canceled`, leaks no goroutine and removes the work folder; Read 12 pages | splitting design §3–§5, §9 |
+| `internal/config` | `SPLIT_PAGES` default, `0`, `-1`, `off`; DI-only and Read-only valid, neither invalid; a removed setting warns and does not fail; `Redacted` has no removed keys and has `splitPages`, `diEnabled`, `readEnabled`; `TestRedactedCoversEveryField` | the 22 settings |
+| `internal/httpx` | `Resolve` from `PUBLIC_BASE_URL` and from `Host` (http and https); forwarded headers ignored; `ServerHeader` on Azure paths and not on `/_gw/`; no `apim-request-id` | header rules |
+| `internal/jobs` | a job survives *n* < 5 transient failures; exhaustion fails it with an Azure-shaped error; a shutdown during a backoff leaves it `running` and recovery completes it; crash reclaim; a deleted row discards its result; work folders swept after a simulated crash | sync-only design §10 invariants |
+| `internal/probe` | `diff` on hand-built pairs (identical, a document-level role difference, a page-level offset difference); golden masking; `--record` against the paged fake writes the expected files; `--compare-split` reports `paragraphs[*].role` as document-level with `TitleOnFirstPage` and exits 0, and a page-level difference exits 1 | the go-live tooling |
+
+---
+
+## 5. Running things
 
 ### Commands
 
 | Command | What it does |
 |---|---|
-| `go test ./...` | The whole suite, no race detector. ~35 s on an M-series laptop, of which `test/conformance` is ~35 s — the rest run in parallel behind it. |
-| `go test -race ./...` (= `make test`) | The same suite with the race detector. ~41 s. This is the gate. |
-| `make test-short` | `go test ./...`. Note the name: it drops the race detector, it does not pass Go's `-short` flag. |
-| `make lint` | `gofmt -l .` (fails on any output), `go vet ./...`, then `staticcheck ./...` **if it is on `PATH`** — otherwise it prints `staticcheck not installed, skipped` and `make check` still passes. Install it if you want that gate to mean anything. |
-| `make check` | `lint` then `test`. Everything CI would run. |
-| `make cover` | Coverage, see below. |
-| `go test -run TestName ./test/conformance` | One test. Add `-v` for the harness's log lines and `-count=1` to defeat the test cache. |
+| `go test ./...` | The whole suite, no race detector. |
+| `go test -race ./...` (= `make test`) | The same with the race detector. **This is the gate.** |
+| `go test -race -count=1 ./internal/<pkg>/` | One package, defeating the test cache. |
+| `make lint` | `gofmt -l .` (fails on any output), `go vet ./...`, then `staticcheck ./...` **if it is on `PATH`**. |
+| `make check` | `lint` then `test`. |
+| `make cover` | Coverage over `./internal/...`; see below. |
+| `scripts/e2e-local.sh` | The live end-to-end run of §6. |
+| `make sdk-test` | The real-SDK harness of §7, against a running gateway. |
 
-The conformance suite dominates the wall time because several tests are about real elapsed time:
-`TestExpiredOperationReturns404` sleeps past a 2 s TTL, `TestAdmissionReturns429WithRetryAfter`
-holds a slot with a 2 s upstream latency, `TestHungSyncRouteFallsBackQuickly` waits out a 2 s probe
-timeout, and `TestSignalDoesNotAbortInFlightRequests` needs a 1.5 s request genuinely in flight
-when the signal fires. Those numbers are the point of the tests and should not be tuned down.
+Several conformance tests are about real elapsed time — an expiring TTL, an upstream latency that
+holds a slot, a request genuinely in flight when a signal fires, a hung part waiting out an
+overridden part timeout. Those durations are the point of the tests and should not be tuned down.
 
 ### Coverage
 
@@ -281,42 +343,11 @@ make cover
 ```
 
 `-coverpkg=./internal/...` is what makes the number meaningful: without it, `test/conformance`
-would report its own (empty) coverage and the packages it actually exercises would report nothing.
-`cmd/gateway` is outside `-coverpkg` and so is excluded from the total entirely.
-
-Measured on the current tree, `total: (statements) 65.4%`. Per package, from the same profile:
-
-| Package | Statement coverage | Note |
-|---|---|---|
-| `internal/ids` | 97.4% | |
-| `internal/app` | 93.3% | The handler assembly the binary and the suite share. |
-| `internal/httpx` | 89.1% | |
-| `internal/mockazure` | 83.0% | The fakes are themselves covered by the suite that uses them. |
-| `internal/azerr` | 82.7% | |
-| `internal/jsonx` | 76.6% | |
-| `internal/config` | 76.3% | |
-| `internal/store` | 74.9% | |
-| `internal/surface` | 71.3% | No unit tests beyond `relay_test.go`; otherwise via `test/conformance`. |
-| `internal/jobs` | 69.4% | |
-| `internal/upstream` | 66.5% | |
-| `internal/logging` | 20.0% | Only the context pair every request touches; see §6. |
-| `internal/admin` | 10.0% | Registered by the conformance harness, almost never called by it. |
-| `internal/probe` | 0.0% | See §6. |
-| **total** | **67.7%** | Below the 80% bar the README's *Status* section names. |
-
-Expect the total and the three approximate rows to move a fraction of a point between runs. The
-blocks that come and go are all teardown races: `base.unreachable`'s "the context was cancelled,
-not the container" branch, the `<-ctx.Done()` arms of the recovery pass's admission and queue
-selects, `run`'s *job vanished before it ran*, and `store.Get`'s `ErrNoJob`. Whether a test's
-cleanup cancels its context while something is still in flight is a matter of scheduling, so a
-number that moves by half a point is variance rather than a regression. The other rows reproduce
-exactly.
-
-The design spec's *Coverage* section quotes slightly different figures (`ids` 98%, `jsonx` 86%,
-`azerr` 80%, `store` 75%, `surface` 70%, `jobs` 70%, ~60% overall). The table above is what the
-current tree measures; the spec's numbers predate later commits and should be treated as stale.
-
-To reproduce the per-package breakdown, which `go tool cover -func` does not print:
+would report its own empty coverage and the packages it exercises would report nothing.
+`cmd/gateway` and `cmd/fakeazure` are outside it. The per-package table this section used to carry
+predates the sync-only branch; the branch's final gate (plan T17) re-measures it, and the total
+must not fall below the 67.7% measured before the branch. To print the per-package breakdown,
+which `go tool cover -func` does not:
 
 ```bash
 go test -coverprofile=coverage.out -coverpkg=./internal/... ./...
@@ -325,9 +356,6 @@ awk 'NR>1{s[$1]=$2; if($3>0) h[$1]=1}
        for(i=1;i<n;i++) d=d p[i] "/"; t[d]+=s[k]; if(k in h) c[d]+=s[k]}
        for(d in t) printf "%6.1f%%  %s\n", 100*c[d]/t[d], d}' coverage.out | sort -k2
 ```
-
-(The profile contains one block set per test binary, so the counts must be merged by block key
-before they are summed — that is what the `s[$1]` / `h[$1]` maps do.)
 
 ### The Dockerfile's in-image test stage
 
@@ -372,22 +400,59 @@ is the whole reason the stage exists.
 
 ---
 
-## 5. `test/sdk` — the real Azure SDK harness
+## 6. Live end to end: `scripts/e2e-local.sh`
+
+The conformance suite runs the gateway in-process. The script runs the **built binaries** on real
+ports, which is the closest a laptop gets to a cluster:
+
+1. `go build` the gateway and `cmd/fakeazure`;
+2. start `fakeazure -di 127.0.0.1:5001 -read 127.0.0.1:5002`;
+3. start the gateway with `DATA_DIR=$(mktemp -d)`, both upstream URLs, `SPLIT_PAGES=5`,
+   `PUBLIC_BASE_URL=http://127.0.0.1:18080` and `GATEWAY_ADDR=127.0.0.1:18080`;
+4. wait for `/_gw/live`;
+5. `curl` every route of the conformance endpoint table, checking each status;
+6. run `test/sdk/run.sh` with `GATEWAY_URL` pointing at it;
+7. run `gateway probe --compare-split` on a folder of generated PDFs against the fakes;
+8. stop both processes and print a pass/fail summary.
+
+It exits non-zero on any failure. It needs Go, `curl` and Python 3 (for step 6), and touches nothing
+outside its temp directories — no Docker, no compose stack.
+
+### The probe's two modes, without a cluster
+
+Both modes exist to be run against the **real** containers (OPERATIONS §10), but both are tested
+against the fakes, so the code path is proven before anyone needs it:
+
+- **`gateway probe --record <dir>`** runs the fixed case list and writes
+  `<dir>/<surface>/<case>.json`: the request (method, path template, query, `Content-Type`), the
+  response status, every header except `Date`, and the body — parsed JSON where possible — with
+  GUIDs masked as `<guid>` and timestamps as `<datetime:<layout>>`. One set recorded from the paged
+  fake is committed under `test/conformance/testdata/golden/fake/`, and `parity_test.go` replays it,
+  so the replay is exercised before real goldens exist.
+- **`gateway probe --compare-split <dir>`** analyses each `*.pdf` whole (`Client.Do`, timeout
+  `PROBE_TIMEOUT`) and split (a probe-local engine with a scheduler of 4 and a splitter of 2), then
+  diffs them structurally into `path pattern → count, up to 3 examples`, with indices written
+  `[*]`, labelled page-level or document-level. It writes `<dir>/compare-report.json` and a text
+  summary, and exits non-zero on any page-level difference. Against `fakeazure -title-first` it
+  must report exactly one document-level pattern, `paragraphs[*].role`, and exit 0.
+
+---
+
+## 7. `test/sdk` — the real Azure SDK harness
 
 ### What it proves that nothing else does
 
 `test/conformance` asserts what the gateway **emits**. `test/sdk` asserts that the official client
 libraries **accept** it. Those are different questions, because the parts that break a proxy live
-inside SDK poller internals rather than in any published contract — a regex in `_patch.py`, a
-backwards segment count in `OperationWithId.cs`, an integer deserialiser applied to `Retry-After`.
-Every rule in the conformance suite is a reading of those internals. This harness is the only place
-the reading itself is checked.
+inside SDK poller internals rather than in any published contract. Every rule in the conformance
+suite is a reading of those internals; this harness is the only place the reading itself is
+checked.
 
 ### How to run it
 
 ```bash
-# terminal 1 — a gateway pointed at real containers (or at the fakes)
-DI_UPSTREAM_URL=http://layout:5000 READ_UPSTREAM_URL=http://read:5000 DATA_DIR=./data make run
+# terminal 1 — a gateway pointed at real containers, or at cmd/fakeazure
+DI_UPSTREAM_URL=http://127.0.0.1:5001 READ_UPSTREAM_URL=http://127.0.0.1:5002 DATA_DIR=./data make run
 
 # terminal 2
 make sdk-test           # == cd test/sdk && ./run.sh
@@ -395,139 +460,86 @@ make sdk-test           # == cd test/sdk && ./run.sh
 
 `run.sh` refuses to start unless `GET ${GATEWAY_URL}/_gw/live` succeeds; `GATEWAY_URL` defaults to
 `http://localhost:8080`. It creates `test/sdk/.venv` on first use and installs
-`azure-ai-documentintelligence>=1.0.0`, `azure-cognitiveservices-vision-computervision>=0.9.0` and
-`pillow>=10.0.0` from `requirements.txt`. The gateway requires no client credential, so
-`sdk_test.py` passes the placeholder key `"not-required-by-this-gateway"` that the SDK constructors
-insist on. The sample document is a white 200×120 PNG — above Azure's 50×50 minimum — built with
-Pillow, falling back to a base64-embedded 100×100 PNG so Pillow stays optional.
+`azure-ai-documentintelligence`, `azure-cognitiveservices-vision-computervision` and `pillow` from
+`requirements.txt`. The gateway requires no client credential, so `sdk_test.py` passes a
+placeholder key the SDK constructors insist on. `scripts/e2e-local.sh` runs it for you against the
+fakes.
 
 ### What each check maps to
 
 | Check in `sdk_test.py` | Gateway property it exercises |
 |---|---|
-| `begin_analyze_document` returns without raising | The submit answered **exactly** 202. Python's `_analyze_document_initial`, .NET's `StatusCodeClassifier{202}`, Java's `@ExpectedResponses({202})` and JS's `isUnexpected` all reject 200 and 201. |
-| `poller.details["operation_id"]` parses as a UUID | `Operation-Location` matches `[^:]+://[^/]+/documentintelligence/.+/([^?/]+)`. A wrong shape raises `AttributeError` rather than returning anything. |
-| `poller.result()` completes | The terminal body nests `analyzeResult`, and no `Location` header or `resourceLocation` member triggered a bogus final GET. |
-| `result.model_id` is set | The stored envelope deserialises into the SDK's own model. |
-| The operation finished in under 25 s | `Retry-After` was present and parseable; otherwise azure-core falls back to a 30 s default polling interval and the elapsed time gives it away. |
-| `Operation-Location.split("/")[-1]` parses as a UUID | The Read header is bare — no query string, no trailing slash, no fragment. This is literally the line Microsoft's canonical sample runs. |
-| `get_read_result` reaches `succeeded`, and the status is inside `{notStarted, running, failed, succeeded}` | The Read status enum is `modelAsString: false`, so an unrecognised value degrades to a raw string and the canonical sample's `while` loop never terminates. |
+| `begin_analyze_document` returns without raising | The submit answered **exactly** 202. Python, .NET, Java and JS all reject 200 and 201. |
+| `poller.details["operation_id"]` parses as a UUID | `Operation-Location` matches `[^:]+://[^/]+/documentintelligence/.+/([^?/]+)`. |
+| `poller.result()` completes | The terminal body nests `analyzeResult`; no `Location` header or `resourceLocation` triggered a bogus final GET. |
+| The operation finished quickly | `Retry-After` was present and parseable; otherwise azure-core polls every 30 s. |
+| `Operation-Location.split("/")[-1]` parses as a UUID | The Read header is bare — literally the line Microsoft's canonical sample runs. |
+| `get_read_result` reaches `succeeded` inside the closed status enum | Read's status enum is `modelAsString: false`. |
 | Unknown ids 404 with a parseable body and no `Retry-After` | The 404 policy and the per-surface error shapes. |
+| `test_document_intelligence_large_pdf`: a 23-page PDF built with Pillow, `len(result.pages) == 23`, page numbers 1..23 | Splitting and the merge, through the real DI SDK's models. |
+| `test_read_large_pdf` | The same through the Read client. |
+| `test_sync_analyze_large_pdf`: a raw `urllib` POST to `:syncAnalyze` → 200, 23 pages | The engine-backed sync route. |
 
-### It has not been run
+### Real containers
 
-**`make sdk-test` has never been executed against a live gateway.** The README says so under
-*Status*, and it is the acceptance test that matters: everything else in this repository is the
-gateway being marked by its own homework. Until it runs, treat "wire-identical" as designed and
-argued rather than demonstrated.
-
-One thing to fix before or while running it, found by reading the harness against the current
-code: `test_unknown_operation_is_a_clean_404` in `sdk_test.py` encodes the **observed** error
-shapes — flat for Document Intelligence, wrapped for Read — which is what the gateway's default
-`ERROR_COMPAT=observed` emits, and the inverse of what each service's published reference shows
-(see §2 and `internal/azerr/azerr.go`). It therefore passes against a default gateway and matches
-`TestUnknownIDMatchesTheContainersNotTheSpec` in `test/conformance/fidelity_test.go`.
-
-Run it against a gateway started with `ERROR_COMPAT=documented` and those two checks will fail,
-correctly: that mode exists only for a client written against the published reference, and the
-harness asserts the default.
+The harness has run against the fakes (through `scripts/e2e-local.sh`); it has **not** run
+against the real containers. Until it does, against a gateway in front of them, treat
+"wire-identical" as designed and argued rather than demonstrated. It is go-live gate 5.
 
 ---
 
-## 6. What is deliberately not tested
+## 8. What is deliberately not tested
 
-Two packages are deliberately untested, for the same reason: everything they do is real I/O against
-things that do not exist on a laptop, and a test with those dependencies faked would assert only
-that the fake was called.
-
-**`cmd/gateway`** (250 lines) is wiring and process lifecycle: parse the subcommand, load config,
-build the logger, open the store, construct the manager and surfaces, install signal handling, run
-`http.Server`, drain on SIGTERM. It is excluded from the coverage profile by `-coverpkg=./internal/...`.
-What it wires is covered elsewhere — `config.Load` in `internal/config/config_test.go`, the
-handler chain and the whole request path in `test/conformance`, and its most load-bearing decision,
-the separation of the signal context from the request `BaseContext`, is reproduced deliberately in
-`TestSignalDoesNotAbortInFlightRequests`. The residue that is genuinely untested is argument
-parsing and exit codes, verified by hand.
-
-**`internal/probe`** (273 lines, 0.0% covered) exists to interrogate live containers: it GETs each
-container's `/status`, `/ready` and whichever of its candidate `/swagger` paths answers — four for
-Document Intelligence, two for Read — POSTs a generated blank PNG to `:syncAnalyze` and `:analyze`
-on both surfaces, GETs `analyzeResults/` with a zero GUID to capture the unknown-id error shape,
-and reports what came back. Its entire value is that it talks to something the repository cannot
-simulate — a test against `mockazure` would prove only that the probe agrees with a fake written
-from the same assumptions the probe exists to check. It is exercised by running it: `make probe`
-(the shell script) or `make probe-go` (`./bin/gateway probe`), and against the fakes via the
-`MOCKAZURE_LIVE` recipe in §2, which is how both were debugged.
-
-Three smaller gaps, stated rather than hidden:
-
-- `internal/logging` (20.0%) — the constructor is the part that never runs. `logging.New` and its
-  helper `parseLevel` measure 0%: they are reached only from `cmd/gateway/main.go`, and every test
-  builds its own logger with `slog.New(slog.NewTextHandler(io.Discard, nil))`. The covered fifth is
-  the context pair `WithLogger`/`From`, which `internal/httpx` and `internal/surface` call on every
-  request and the conformance suite therefore exercises throughout.
-- `internal/admin` (10.0%) has no tests of its own. `/_gw/live`, `/_gw/ready`, `/_gw/health`,
-  `/_gw/version`, `/_gw/config`, `/_gw/jobs`, `/_gw/jobs/{id}` and `/_gw/metrics` — plus the
-  gateway's own root `/ready` and `/status`, which it serves rather than proxying because both
-  containers claim those paths (design decision D8) — are all registered by the conformance harness
-  but almost never called by it. `/_gw/config` is the exception, because what it renders is
-  `Config.Redacted()` and both halves of that are covered in `internal/config/config_test.go`,
-  which is where the handling actually lives: `TestRedactedHidesEverySecret` checks that neither an
-  API key nor userinfo embedded in an upstream URL survives, while the host stays legible, and
-  `TestRedactedCoversEveryField` walks the `Config` struct by reflection so a field added and not
-  surfaced fails the suite rather than quietly disappearing from the operator's only view of
-  effective configuration.
-- `mockazure.Options.StatusUnhealthy` — a container reporting an invalid subscription key — is
-  implemented in the fake and used by no test.
+- **`cmd/gateway`** is wiring and process lifecycle, outside the coverage profile. What it wires is
+  covered elsewhere — `config.Load`, the whole request path through `app.NewHandler` and
+  `app.NewEngines` in `test/conformance`, and its most load-bearing decision, the separation of the
+  signal context from the request `BaseContext`, reproduced in
+  `TestSignalDoesNotAbortInFlightRequests`. Its residue — argument parsing, the migration log
+  line, exit codes — is exercised by `scripts/e2e-local.sh` and by hand.
+- **`cmd/fakeazure`** is a test tool; its flag parsing has tests, the rest is `mockazure`.
+- **The real containers' document-level judgements.** No fake can say which heading Azure marks
+  `title` across a split point. That is measured, not tested: `gateway probe --compare-split` on a
+  real corpus, and a merge rule plus a regression test built from that document for each pattern
+  it finds (go-live gate 3).
+- **`internal/logging`'s constructor**, reached only from `cmd/gateway`; every test builds its own
+  logger.
+- `mockazure.Options.StatusUnhealthy` is implemented and used by no test.
 
 ---
 
-## 7. Verifying a change before you commit
+## 9. Verifying a change before you commit
 
-In order. Each step is cheap relative to the one after it, so stopping early costs nothing.
+In order. Each step is cheap relative to the one after it.
 
 1. **`gofmt -l .`** — must print nothing.
-
 2. **`go vet ./...`** — must be silent.
-
-3. **`go test ./...`** — fast feedback, ~35 s. Fix anything red here before going further.
-
-4. **`go test -race ./...`** (`make test`) — the actual gate, ~41 s. This suite has real
-   concurrency in it: a worker pool, a lease/heartbeat, a TTL sweeper, a recovery pass and a
-   graceful drain, all touching one SQLite store. Never commit on the strength of the non-race run.
-
-5. **`make cover`, and read the number.** It should not go down. If you added a branch in
-   `internal/upstream`, `internal/jobs` or `internal/store`, it should go up.
-
+3. **`go build ./...`**.
+4. **`go test -race -count=1 ./<the packages you touched>/...`**, then **`go test -race ./...`**.
+   This suite has real concurrency in it: a worker pool, a fair scheduler, hedged calls, a
+   lease/heartbeat, a sweeper, a recovery pass and a graceful drain, all touching one SQLite store.
+   Never commit on the strength of a non-race run.
+5. **`make cover`, and read the number.** It should not go down.
 6. **Did you change wire-visible behaviour?** Headers, status codes, body shape, status strings,
-   `Operation-Location`, `Retry-After`, error shapes, the 404 policy. If so there must be a
-   conformance test naming the client or the probe observation that motivates it — see §3, *Adding
-   a new fidelity test* — and you must have watched it fail before your change.
-
-7. **Did you change container-facing behaviour?** The upstream state machine, the sync capability
-   latch, the poll loop, artifact fetching. If so, `internal/mockazure` must model the case, and the
-   test should assert the recorded mode with `assertJobMode` — `sync`, `degraded-202` or
-   `async-fallback` — not only the client-visible result. A correct answer reached down the wrong
-   path is a regression.
-
-8. **Did you change a default?** Env var defaults live in `internal/config/config.go`, not in the
-   README. Update `TestLoadDefaults` in `internal/config/config_test.go`, then the README and
-   [`docs/OPERATIONS.md`](OPERATIONS.md). If you added a *field* rather than changed a value,
-   `TestRedactedCoversEveryField` will fail until you also surface it in `Config.Redacted()`, which
-   is what `/_gw/config` renders.
-
-9. **`make image`** — builds `linux/amd64` and runs the whole suite inside the image. Slower, and
-   worth it: this stage has caught two ordering bugs a green local run missed (§4). Do not skip it
-   for a change that touches `internal/jobs`, `internal/store` or anything else with concurrent
-   access to the store.
-
-10. **`make check`** as the final sweep — lint plus the race suite in one command. If
-    `staticcheck` is not installed it is silently skipped, so install it if you want that gate.
-
-11. **If a gateway or a container is reachable to you, run `make sdk-test`.** It is the only check
-    that proves a real Azure SDK accepts what the gateway emits, and it has never been run (§5).
-    Note the `ERROR_COMPAT` caveat in §5 before reading its 404 results.
+   `Operation-Location`, `Retry-After`, error shapes, the 404 policy, the parameter policy. Then a
+   conformance test must name the client or the probe observation that motivates it, and you must
+   have watched it fail before your change. If a recorded golden exists, the parity test must still
+   pass.
+7. **Did you change container-facing behaviour?** The attempt classifier, the retry rules, the part
+   rules, the merge. Then `internal/mockazure` (or the paged fake) must model the case, and the test
+   should assert *how* the result was reached — `Calls()`, `SyncCalls()`, `upstreamAttempts`,
+   `upstreamParts`, the fallback reason — not only the client-visible result.
+8. **Did you change the merge?** The round trip must still be byte for byte for every unit, and a
+   new rule needs a regression test built from the document `--compare-split` found it on.
+9. **Did you change the schema?** Add a **new** migration file and its sha256 to
+   `TestReleasedMigrationsAreUnchanged`; never edit a released one. `TestSchemaFromScratchEqualsMigrated`
+   must pass.
+10. **Did you change a setting?** Defaults live in `internal/config/config.go`. Update
+    `TestLoadDefaults`, `Config.Redacted()` (`TestRedactedCoversEveryField` fails until you do),
+    the README table, `OPERATIONS.md` and `HANDOFF.md`. A setting you remove goes into
+    `removedSettings`, so old manifests still start.
+11. **`scripts/e2e-local.sh`** for anything that touches the binary's wiring, the engine or a route.
+12. **`make image`** — builds `linux/amd64` and runs the suite inside the image (§5). Do not skip it
+    for a change to `internal/jobs`, `internal/store`, `internal/sched` or `internal/engine`.
 
 Finally, the repository's own convention, visible in every commit body: state what you verified,
-by name. `gofmt`, `go vet`, `go test -race`, `docker build linux/amd64` — and say which of them
-actually surfaced the defect you fixed.
+by name — and say which step surfaced the defect you fixed.

@@ -1,11 +1,27 @@
 # Sync-only upstream, single gateway pod — design
 
 **Date:** 2026-10-10
-**Status:** approved in conversation, revised after review (migrations, exact parity, settings),
-spec awaiting review
+**Status:** implemented on branch `feat/sync-only-upstream` (plan
+`docs/superpowers/plans/2026-10-10-sync-only-and-splitting.md`), together with the
+[splitting design](2026-10-10-large-document-splitting-design.md). The operator-facing documents
+(`README.md`, `docs/ARCHITECTURE.md`, `docs/OPERATIONS.md`, `docs/TESTING.md`, `docs/HANDOFF.md`,
+`docs/api-surface.md` §0) describe the result.
 **Changes:** the upstream strategy of the [2026-09-08 design](2026-09-08-azure-gateway-api-design.md)
 (its "Upstream decision tree"), the store's schema handling, and the configuration surface. The
 client-facing contract is unchanged except where this document says otherwise.
+
+**Implementation notes.** Where the implementation is shaped differently from the text below,
+the behaviour is the same:
+- §1's attempt loop lives in `internal/engine`, not in `DIClient.Analyze` / `ReadClient.Analyze`:
+  `upstream.Client.Do` makes **one** attempt and returns its outcome class, and the engine applies
+  the attempt limits, backoff and slot rules for whole documents and for parts alike. The old
+  clients were deleted. A client's `:syncAnalyze` also runs through the engine (splitting design
+  §1), replacing §3's single-attempt passthrough.
+- Exhaustion extends the last attempt's message with the count, *"… (after 5 attempts)"*.
+- `Result` carries no `Attempts` field; the engine's output does, and the job row stores it as
+  `upstream_attempts`.
+- The probe's per-parameter verdict and the golden case list are as in §2 and §3; the readiness
+  verdict is as in §8.
 
 ## Problem
 

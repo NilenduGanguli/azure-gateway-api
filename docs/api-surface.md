@@ -6,6 +6,11 @@ image `mcr.microsoft.com/azure-cognitive-services/form-recognizer/layout-4.0:202
 **Surface B** — Computer Vision Read v3.2, `model-version=2022-04-30`
 image `mcr.microsoft.com/azure-cognitive-services/vision/read:3.2-model-2022-04-30`, listens `:5000`
 
+> **What the gateway itself serves** — its routes, parameter policy and header rules — is in
+> [§0](#0-what-the-gateway-serves). Sections 1–11 are the containers' contract and the research
+> behind it; their "Gateway" columns and recommendations predate the sync-only design where §0
+> says otherwise.
+
 ### Evidence grades used throughout
 
 | Tag | Meaning |
@@ -39,16 +44,128 @@ worth stating rather than silently editing away.
 | CV Read errors are flat: `{"code":...,"message":...}` (§6.2) | **Wrapped**: `{"error":{"code":"BadArgument","message":...}}` |
 
 The two surfaces' shapes are **the inverse** of their references — the mistake this table exists to
-stop a future reader making. The gateway emits the observed shapes by default and can be switched
-back to the documented ones with `ERROR_COMPAT=documented`, which exists only so a client that was
-written against the published reference is not stranded.
+stop a future reader making. The gateway emits the observed shapes, always: the `ERROR_COMPAT=documented` switch was removed
+by the sync-only design.
 
 Also observed, and material to §7: DI's `:syncAnalyze` **is routed but never answers** on this
 image. It accepts the request and then hangs until the client's timeout rather than returning 200,
-202, 404, or 405. `DI_SYNC_ANALYZE=auto` latches this on first use and falls back to `:analyze`
-plus polling; `DI_SYNC_ANALYZE=off` skips the attempt entirely. A route that is present in the
+202, 404, or 405. The gateway no longer has a fallback (`DI_SYNC_ANALYZE` was removed): a build that does this
+cannot run behind it, and `gateway probe` says so before go-live. A route that is present in the
 image's routing table is therefore **not** evidence that it works — correction 1 above is true
 about the image and false about the behaviour.
+
+---
+
+## 0. What the gateway serves
+
+This section is the gateway's own policy, as implemented by the
+[sync-only upstream design](superpowers/specs/2026-10-10-sync-only-upstream-design.md) and the
+[splitting design](superpowers/specs/2026-10-10-large-document-splitting-design.md). The rest of
+this document is the **container** contract it is measured against; where §1–§11 say what "the
+gateway" must do about async fallbacks, affinity, artifacts or `ERROR_COMPAT`, this section
+supersedes them.
+
+**Goal: indistinguishable from a real pod.** An Azure SDK client, or any client written for the
+containers, must not be able to tell the gateway from a real DI or Read pod: the same routes,
+status codes, headers and body shapes. The gateway may serve extra endpoints under `/_gw/*`, which
+no Azure route can collide with. The documented exceptions are the parameter rejections below, the
+gateway's own 429 under overload, and the routes it does not serve.
+
+**Upstream.** Every analysis is one synchronous call through the HAProxy Route in front of the
+pods: `POST {fam}/documentModels/{modelId}:syncAnalyze` (DI) or
+`POST /vision/v3.2/read/syncAnalyze` (Read), on a fresh connection, retried from the stored input
+on transient failures; large PDFs are split into parts, each its own call. A container's `202` is
+retried, never polled, and no container operation id is ever stored, followed or relayed. Apart
+from that, the gateway sends the pods only small synchronous GETs: `/status` and the relays below.
+
+### 0.1 Routes
+
+`{fam}` is `/documentintelligence` and `/formrecognizer`. Routes are registered **only for the
+configured surfaces**; an unconfigured surface's routes answer the bodyless 404, as a pod of the
+other kind would.
+
+| Route | Real pod | Gateway |
+|---|---|---|
+| `POST {fam}/documentModels/{modelId}:analyze` | 202 + `Operation-Location` | **owned**: 202 after the input is durable; the result comes from sync upstream calls |
+| `GET`/`HEAD {fam}/documentModels/{modelId}/analyzeResults/{resultId}` | operation status | **owned**: served from the PVC |
+| `DELETE` same | 204 | **owned**: 204 |
+| `POST {fam}/documentModels/{modelId}:syncAnalyze` | 200 + result | **owned**: the body is saved, run through the engine (retries, splitting), and answered with the 200 the container's sync route would give — bare result or envelope, as the container returned |
+| `GET …/analyzeResults/{resultId}/pdf`, `…/figures/{figureId}` | the file | **owned**: always 404 in the DI error shape for a missing result file, because no job ever has these files; an unknown id gets the ordinary unknown-id 404 |
+| `GET {fam}/info`, `/documentModels`, `/documentModels/{modelId}` | metadata | **relayed** |
+| `GET {fam}/operations`, `/operations/{operationId}` | model-lifecycle operations, empty for layout | **relayed** |
+| `POST /vision/v3.2/read/analyze` | 202 + `Operation-Location` | **owned** |
+| `GET`/`HEAD /vision/v3.2/read/analyzeResults/{operationId}` | operation status | **owned** |
+| `POST /vision/v3.2/read/syncAnalyze` | 200 + result | **owned**, as for DI `:syncAnalyze` |
+| `GET /ready`, `/status` | container health | **owned**: container-shaped, aggregated over the configured upstreams |
+| `GET /`, `/swagger`, `/swagger/{rest...}`, `/records/usage-logs`, `/records/usage-logs/{month}/{year}` | home page, swagger, usage records | **relayed** to the configured container, DI when both are configured. Usage records come from whichever pod HAProxy picks. `{month}`/`{year}` must be digits |
+| `:analyzeBatch`, `analyzeBatchResults…`, model build/compose/copy, `documentClassifiers…`, `:syncAnalyze/upstreamResult` | Azure-Blob-bound, n/a to layout, or container-internal | **not served** (documented exception) |
+| `/_gw/*` | — | gateway admin, extra |
+| anything else | Kestrel: bodyless 404, or 405 + `Allow` for a known path with the wrong method | the same |
+
+Relayed GETs are bounded by a 10-second timeout on a 4-slot lane, and pass the container's own
+response headers through, minus hop-by-hop headers, `Operation-Location`, `Location` and
+`Set-Cookie`. Error bodies on relays are normalised to the surface's shape at the container's own
+status; a bodyless error stays bodyless.
+
+### 0.2 Parameter policy (DI analyze routes)
+
+Applied identically on `:analyze` and `:syncAnalyze`, **before admission**, so a rejected request
+leaves no job row and no blob. Each rejection is **400 `InvalidArgument`**, inner
+`InvalidParameter`, with a message naming the parameter.
+
+| Parameter | Policy | Why |
+|---|---|---|
+| `api-version`, `pages`, `locale`, `stringIndexType` | forwarded | declared by `:syncAnalyze` in the container's own swagger |
+| `outputContentFormat` absent or `text` | forwarded | `text` is the default |
+| `outputContentFormat=markdown` | **rejected** until proven | whether the sync route honours it is unknown (Q-A2); ASP.NET silently ignores parameters an action does not bind, so forwarding it could return a result that silently lacks what was asked for |
+| `features` absent or empty | forwarded | |
+| `features` with any value | **rejected** until proven | as above |
+| `queryFields` | **rejected** until proven | as above |
+| `output` containing `pdf` or `figures` (comma-separated or repeated, any case) | **always rejected** | these files are fetched by an operation id, which a sync call never creates |
+| `_overload` and any other unknown parameter | forwarded | as before |
+
+**Proving a parameter.** `gateway probe` runs the same document through the container's
+`:syncAnalyze` and `:analyze` with the parameter set and compares the two `analyzeResult`s. Equal
+means honoured; moving it to the forwarded list is then a one-line change citing that output.
+
+**Read** forwards `language`, `pages`, `readingOrder` and `model-version`.
+
+**Splitting and parameters.** Part calls carry the forwarded parameters **minus `pages`**; the
+client's `pages=` decides which pages are split. A `pages=` that does not parse, or names pages the
+document does not have, sends the document whole with the client's query unchanged, so Azure
+answers with its own error.
+
+### 0.3 Headers
+
+| Header | Rule |
+|---|---|
+| `Server` | `Kestrel` on every response outside `/_gw/`, as the containers' web server sends |
+| `apim-request-id` | **never minted by the gateway**: the containers are not known to send it (Q-A7). The request id stays in the gateway's logs. A relayed GET passes through whatever the container sent |
+| `Operation-Location` | the exact shapes of §4, built from `PUBLIC_BASE_URL`, or else the request's `Host` header, as the container does. Forwarded headers are never consulted |
+| `Retry-After` | integer seconds: **1** on the 202 and on in-progress polls, **5** on the gateway's 429 and its disk-pressure 503, and only ever on retriable statuses. Where a recorded golden response shows the container doing otherwise, the gateway follows the recording |
+| `x-ms-client-request-id` | echoed |
+
+### 0.4 Bodies
+
+- Errors always use the shapes the real containers produce (the old "observed" mode): DI wrapped,
+  except the flat unknown-result-id 404; Read wrapped everywhere. There is no documented-shape mode
+  any more.
+- Poll envelopes keep their member order and status vocabulary.
+- The `analyzeResult` is the container's own bytes from the sync answer, copied verbatim — or, for
+  a split document, the parts' bytes merged page-exactly, with only offsets, page numbers, figure
+  ids and element pointers rewritten.
+- `HEAD`, timestamp format and `Retry-After` keep today's behaviour until a recorded golden
+  response shows the container doing something else.
+
+**Load shedding.** When `*_MAX_INFLIGHT + QUEUE_DEPTH` jobs are already accepted, the gateway
+answers 429 + `Retry-After: 5` in each surface's own error shape (`ServiceUnavailable` on DI,
+`InvalidRequest` on Read). Real pods never send 429; this is the one deliberate behavioural
+difference under overload. Every SDK retries it.
+
+**Golden recordings.** `gateway probe --record` captures the real containers' responses for a
+fixed case list, and the conformance parity test replays them against the gateway. Until real
+recordings exist, the suite checks the documented reference in this file. Go-live requires them
+([`OPERATIONS.md` §10](OPERATIONS.md#10-go-live-gates)).
 
 ---
 
@@ -714,6 +831,12 @@ The only real bounds on a sync call:
 **Practical rule:** keep sync calls to small single images and short page ranges; use page-range fan-out for documents (§9.4).
 
 ### 7.3 Therefore: what "call the container synchronously" MUST mean in the gateway
+
+> **Superseded for the gateway** by the sync-only design ([§0](#0-what-the-gateway-serves)). The
+> research below assumed a mandatory async fallback with instance affinity. With autoscaled pods
+> reachable only through HAProxy, the gateway instead makes only synchronous calls and retries a
+> `202`, a missing answer or a dead pod from the stored input. The text is kept as the reasoning
+> that led there.
 
 **Surface B (CV Read) — a native synchronous call.**
 ```

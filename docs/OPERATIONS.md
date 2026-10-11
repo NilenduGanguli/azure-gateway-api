@@ -1,90 +1,66 @@
 # Operations
 
 This is the runbook for deploying and running `azure-gateway-api`: what to check before you
-deploy, how to configure it, what to watch, and what to do when something breaks. Every default
-and every behaviour described here was read out of the source — env var defaults come from
+deploy, how to configure and size it, how to upgrade and roll back across a schema migration, what
+to watch, what to do when something breaks, and the gates that must pass before go-live. Every
+default described here comes from the source — settings from
 [`internal/config/config.go`](../internal/config/config.go), metric names from
-[`internal/admin/admin.go`](../internal/admin/admin.go), and so on — so where this document and a
-blog post disagree, this document is describing the binary you are actually running. For what the
-gateway *is* and why, start at [`../README.md`](../README.md); for how it works inside, see
+[`internal/admin/admin.go`](../internal/admin/admin.go) and the engine — so where this document and
+a blog post disagree, this document is describing the binary you are running. For what the gateway
+*is* and why, start at [`../README.md`](../README.md); for how it works inside, see
 [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
+The deployment this targets: **one gateway pod** per cluster, in front of an Azure Document
+Intelligence `prebuilt-layout` deployment, a Computer Vision Read 3.2 deployment, or both. The
+Azure deployments **autoscale to at most 8 pods** each, and the gateway reaches them **only through
+their HAProxy Route**, with synchronous calls only.
 
 ---
 
 ## 1. Before you deploy: probe the containers
 
-The gateway's fast path depends on `POST /documentintelligence/documentModels/{modelId}:syncAnalyze`,
-a route that exists in the container image's routing table and in no Microsoft documentation.
-Some builds serve it, some 404 it, some declare it in their own swagger and then never answer it.
-The probe tells you which one you have before you tune anything.
+Every analysis the gateway makes is one `:syncAnalyze` call. For Document Intelligence that route
+is undocumented: some builds serve it, some 404 it, and one probed build declared it in its own
+swagger and then never answered it. A build that cannot answer it **cannot run behind this
+gateway** — there is no fallback any more — so probe first.
 
 ```sh
-DI_UPSTREAM_URL=http://layout.ai.svc.cluster.local:5000 \
-READ_UPSTREAM_URL=http://ocr-read.ai.svc.cluster.local:5000 \
+DI_UPSTREAM_URL=https://layout.apps.example.com \
+READ_UPSTREAM_URL=https://ocr-read.apps.example.com \
 DI_UPSTREAM_API_KEY=… READ_UPSTREAM_API_KEY=… \
-./scripts/probe-containers.sh
+PROBE_DOCUMENT=./representative-20-pages.pdf \
+gateway probe
 ```
 
-It needs `sh` and `curl` and nothing else, so it runs from a jump host or a debug pod in the
-namespace without building anything. `make probe` is the same script;
-`make probe-go` runs the equivalent built into the binary (`gateway probe`, bounded at three
-minutes overall by [`cmd/gateway/main.go`](../cmd/gateway/main.go)). The script sends a blank
-200×120 white PNG, never one of your documents, prints no API key, and writes nothing outside a
-temp directory. It costs roughly ten analyses per container, billed like any other query.
+- It probes only the surfaces whose upstream URL is set.
+- `PROBE_DOCUMENT` sends that document instead of the default blank PNG. Use a representative
+  multi-page PDF: a blank image proves the route answers, not that it answers your documents in
+  time. `PROBE_TIMEOUT` (default `10m`) bounds each call. Both are probe inputs, not gateway
+  settings.
+- It runs from anywhere that reaches the Routes: a jump host or a debug pod with the `bin/gateway`
+  binary from `make build`, or `oc exec deploy/azure-gateway-api -- /usr/local/bin/gateway probe`
+  inside the running gateway pod, which already has the settings in its environment.
 
-Useful knobs: `SYNC_MAX_SECONDS` (default `300`) is the per-request ceiling on an analyze,
-`POLL_SECONDS` (default `90`) how long it waits for an async round trip, `MODEL_ID` (default
-`prebuilt-layout`) and `API_VERSION` (default `2024-11-30`).
+**The verdict, per surface:**
 
-### A sample verdict
-
-This is the shape the script ends with. The values below are the ones one real deployment
-produced — a container that declares `:syncAnalyze` in its own swagger and then holds the
-connection open past five minutes on a blank image:
-
-```
------------------------------------------------------------------------------
-VERDICT
------------------------------------------------------------------------------
-  DI   :syncAnalyze     NO ANSWER: TIMED OUT after 300s
-  DI   in swagger       declared
-  DI   :analyze         202
-  DI   result-file /pdf  200
-  DI   error shape      flat
-  READ syncAnalyze      AVAILABLE
-  READ /read/analyze    202
-  READ error shape      wrapped
-  READ operations alias 404   (not served, as expected)
-  READ host has "vision" no
-
-  -> inconclusive. If the swagger declares it, the route exists and is
-     slow; re-run with SYNC_MAX_SECONDS=600 before deciding.
-  -> DI errors are flat, not the wrapped shape its SDK models expect.
-  -> READ errors are wrapped, not the flat shape its SDK models expect.
-```
-
-### What each line means for your configuration
-
-| Verdict line | Value | What to do |
+| `:syncAnalyze` answered | Meaning | Do |
 |---|---|---|
-| `DI :syncAnalyze` | `AVAILABLE` | Leave `DI_SYNC_ANALYZE=auto`. Most jobs then run stateless with nothing pinned to a replica — but a submit asking for `output=pdf` or `output=figures` still skips the synchronous route entirely, because those artifacts are addressed by an operation id that only `:analyze` produces, and it runs the affinity-pinned poll path. |
-| | `DEGRADES TO 202` | Leave `auto`. The gateway polls the operation out with connection and cookie affinity; expect `upstreamMode: degraded-202` on `/_gw/jobs`. |
-| | `ABSENT (404)` / `ABSENT (500)` | Set `DI_SYNC_ANALYZE=off`. The gateway would latch it off by itself after the first job; setting it saves one wasted round trip on that job and makes the intent explicit. |
-| | `NO ANSWER: TIMED OUT …` | The route exists and hangs. In `auto` mode the capability latches off process-wide, but only once a probe has *returned* — so every job that starts before the first one finishes pays the 60s too, up to `DI_MAX_INFLIGHT` of them, and the whole first recovery batch pays it again after a restart. Set `DI_SYNC_ANALYZE=off` once you have confirmed it. |
-| `DI in swagger` | `declared` / `not declared` | On its own, decides nothing. A build can declare the route and never answer it, and DI's route is undocumented, so its absence here proves nothing either. Read it together with the line above. |
-| `DI 200 body shape` | `envelope (.analyzeResult present)` or `bare AnalyzeResult (no envelope)` | No configuration. `inspectOperation` in [`internal/upstream/poll.go`](../internal/upstream/poll.go) handles both: an object with no `status` member is treated as a bare result. |
-| `DI :analyze` | `202` | Expected. Anything else means the fallback path is broken too, and no DI job will complete. |
-| `DI result-file /pdf` | HTTP status | Anything but `200` means `output=pdf` submissions will store nothing and the gateway will 404 `.../pdf`. A probed container answered `200` with `application/json`; the gateway checks the media type and refuses to store a non-PDF, logging `result-file endpoint did not return a pdf`. |
-| `DI error shape` | `flat` | Matches the default `ERROR_COMPAT=observed`: DI drops its wrapper for exactly one response, the unknown or expired result id. |
-| | `wrapped` | Your build follows the published contract. Consider `ERROR_COMPAT=documented`, and re-check with a real client. |
-| `READ syncAnalyze` | `AVAILABLE` | Expected — it is documented for every 3.2 build. The gateway uses it for every Read job. |
-| | anything else | The gateway falls back to `/read/analyze` plus polling on its own, but this means a misconfigured upstream rather than an image difference. Check the URL. |
-| `READ /read/analyze` | `202` | Expected. |
-| `READ error shape` | `wrapped` | Matches `ERROR_COMPAT=observed`: Read wraps every error, including the ones its own `Ocr.json` models as flat. |
-| `READ operations alias` | `404` | Expected. `/read/operations/{id}` is stale text in an old install article; only `analyzeResults` is served. |
-| `READ host has "vision"` | `yes` | Rename the Service. See [§3](#3-two-openshift-constraints-microsofts-docs-do-not-mention). |
+| **200** | ready | Deploy. |
+| a timeout | the route exists and hangs (or the pods are starved) | Give the pods their resources (§8) and re-probe with a longer `PROBE_TIMEOUT`. If it still hangs, this build cannot run behind the gateway. |
+| 404, 405, 501, or `500 UnhandledEndpointException` | the build does not serve the route | Use a build that does. The gateway would fail every job with *"The … container does not serve the synchronous analyze route."* |
 
-`docs/CONTAINER-BEHAVIOUR.md` goes into what the containers do versus what they document;
+It also reports, for each parameter the gateway rejects until proven (`features`, `queryFields`,
+`outputContentFormat=markdown`), whether the container's `:syncAnalyze` result equals its
+`:analyze` result with that parameter set: `honoured` or `ignored`. A parameter shown `honoured`
+can be moved to the forwarded list in `internal/surface/params.go`, citing the probe output.
+
+`scripts/probe-containers.sh` (`make probe`) does the same interrogation in plain `sh` and `curl`,
+for a host with nothing else on it. Its useful knobs are `SYNC_MAX_SECONDS`, `MODEL_ID` (default
+`prebuilt-layout`) and `API_VERSION` (default `2024-11-30`). Neither tool prints an API key, and an
+analysis costs what any other analysis costs.
+
+The probe's two other modes, `--record` and `--compare-split`, are go-live gates (§10).
+[`CONTAINER-BEHAVIOUR.md`](CONTAINER-BEHAVIOUR.md) records what the probed containers did;
 [`api-surface.md`](api-surface.md) carries the citations.
 
 ---
@@ -94,68 +70,56 @@ VERDICT
 ### The image
 
 `make image` builds `linux/amd64` explicitly, because an Apple Silicon build defaults to `arm64`
-and will not run on the cluster. The [`Dockerfile`](../Dockerfile) is multi-stage: `golang:1.26-bookworm`
-builds with `CGO_ENABLED=0` and runs `go test ./...` inside the build stage, then the binary is
-copied into `gcr.io/distroless/static-debian12:nonroot`. `CGO_ENABLED=0` is possible because the
-SQLite driver is pure Go (`modernc.org/sqlite`), which is also why a static distroless base works
-at all.
+and will not run on the cluster. The [`Dockerfile`](../Dockerfile) is multi-stage:
+`golang:1.26-bookworm` builds with `CGO_ENABLED=0` and runs `go test ./...` inside the build stage,
+then the binary is copied into `gcr.io/distroless/static-debian12:nonroot`. `CGO_ENABLED=0` works
+because every dependency is pure Go: SQLite (`modernc.org/sqlite`), pdfcpu and uniseg.
 
 The runtime image runs as `nonroot`, **uid 65532**, declares `VOLUME ["/data"]`, exposes `8080`,
 and presets `DATA_DIR=/data`, `GATEWAY_ADDR=:8080`, `LOG_FORMAT=json`. Its entrypoint is
-`gateway serve`; `gateway probe` and `gateway version` are the other subcommands.
+`gateway serve`; `gateway probe` and `gateway version` are the other subcommands. `cmd/fakeazure`
+is a development tool and is not in the image.
 
 ### The volume, and why it must be block-backed
 
-`DATA_DIR` holds a SQLite database in WAL mode plus the blob store. Both make demands a network
-filesystem does not reliably meet:
+`DATA_DIR` holds a SQLite database in WAL mode, the blob store and the engine's work folders. They
+make demands a network filesystem does not reliably meet:
 
-- **WAL needs shared memory and POSIX advisory locks.** `store.Open` in
-  [`internal/store/db.go`](../internal/store/db.go) calls `networkFS()` and refuses to start with
-  a message naming the filesystem it found. [`internal/store/fs_linux.go`](../internal/store/fs_linux.go)
-  detects, by `statfs` magic number: `nfs`, `smb`, `cifs`, `ceph`, `fuse`, `gfs2`, `ocfs2`.
-- **Durability rests on `fsync` of the file and then of the directory after a rename.** `Writer.Commit`
-  in [`internal/store/blob.go`](../internal/store/blob.go) does exactly that, and the client-facing
-  `202` is a promise that rests on it.
+- **WAL needs shared memory and POSIX advisory locks.** `store.Open` calls `networkFS()` and
+  refuses to start with a message naming the filesystem it found:
+  `nfs`, `smb`, `cifs`, `ceph`, `fuse`, `gfs2`, `ocfs2` (by `statfs` magic on Linux). **There is
+  no override**; `ALLOW_NETWORK_FS` was removed.
+- **Durability rests on `fsync` of the file and then of the directory after a rename.** The
+  client-facing `202` is a promise that rests on it.
 
-The check is on the *mounted filesystem type*, so a block volume — RBD, iSCSI, EBS, a cloud PD —
-formatted `ext4` or `xfs` passes, while a CephFS or NFS mount does not. Note that `fuse` is on the
-list, so a CSI driver that presents a FUSE mount will also be refused. `ALLOW_NETWORK_FS=true`
-overrides the refusal; the consequence is silent database corruption under contention, so treat it
-as a last resort and not a default.
-
-`fsGroup: 65532` in the pod spec is what makes the volume writable by the image's non-root uid.
-Without it the gateway fails at startup on `os.MkdirAll` of `DATA_DIR` or of `DATA_DIR/blobs`.
+A block volume — RBD, iSCSI, EBS, a cloud PD — formatted `ext4` or `xfs` passes; CephFS, NFS and a
+FUSE-presenting CSI driver do not. `fsGroup: 65532` in the pod spec makes the volume writable by
+the image's non-root uid.
 
 ### One replica, `Recreate`
 
-This is not a scaling preference; two replicas are actively wrong, for two independent reasons.
+Two replicas are actively wrong, for two independent reasons.
 
 1. **Operation ids are pod-local by construction.** The gateway mints its own GUID, commits a row
    for it, and serves every later poll from its own store. A second replica with its own volume
    404s every id the first one minted. With an RWO volume it cannot even start.
-2. **Boot recovery ignores leases.** `store.Abandoned` (in `db.go`) deliberately selects every
-   `notStarted` and `running` row without checking `lease_until`, because a process that has just
-   booted holds no leases, so anything still marked running was abandoned by whatever died. That
-   is only correct for a single pod. A second replica starting up would treat the first replica's
-   *actively running* jobs as abandoned and re-run them against the container — a second billed
-   analysis whose result only one of them stores.
+2. **Boot recovery ignores leases.** `store.Abandoned` deliberately selects every `notStarted` and
+   `running` row without checking `lease_until`, because a process that has just booted holds no
+   leases. That is only correct for a single pod: a second replica would re-run the first one's
+   *active* jobs against the pods.
 
-So: `replicas: 1`, `strategy.type: Recreate`. A `RollingUpdate` would violate both properties for
-the length of the rollout.
+So: `replicas: 1`, `strategy.type: Recreate`. A `RollingUpdate` would violate both for the length
+of the rollout, and would also let two processes migrate the same database.
 
 ### A complete manifest
 
-The repository deliberately ships no `k8s/` directory — Kubernetes and Helm manifests are an
-explicit non-goal in the [design spec](superpowers/specs/2026-09-08-azure-gateway-api-design.md),
-because a manifest that is not applied by CI rots. What follows is documentation: a working
-starting point to copy into whatever actually manages your cluster state. The Wega pipeline
-deploys from its own manifests instead, kept in the orchestrator repository; see
-[`HANDOFF.md` § Wega](HANDOFF.md#wega-build-and-deploy-facts).
+The repository ships no `k8s/` directory, by design. What follows is documentation to copy into
+whatever manages your cluster state. The Wega pipeline deploys from its own manifests in the
+orchestrator repository; see [`HANDOFF.md` § Wega](HANDOFF.md#wega-build-and-deploy-facts).
 
-The pods are labelled `app.kubernetes.io/name: azure-gateway-api`, which is the label Wega's
-NetworkPolicies select. Earlier revisions of this sample used `app: azure-gateway-api`. A
-Deployment's `spec.selector` is immutable, so a Deployment created from the old sample has to
-be deleted and re-created to change it, not patched.
+The pods are labelled `app.kubernetes.io/name: azure-gateway-api`, the label Wega's
+NetworkPolicies select. A Deployment's `spec.selector` is immutable, so a Deployment created with
+another label has to be deleted and re-created to change it.
 
 ```yaml
 apiVersion: v1
@@ -164,10 +128,8 @@ metadata:
   name: azure-gateway-api
 type: Opaque
 stringData:
-  # The only two secrets. Empty is legal — the gateway logs a warning and calls the containers
-  # unauthenticated. Keep credentials here rather than embedding them in the upstream URLs: URL
-  # userinfo is redacted to user:xxxxx on /_gw/config, /_gw/health and the startup log, but it
-  # sitting in a ConfigMap rather than a Secret.
+  # The only two secrets. Empty is legal — the gateway warns and calls the pods unauthenticated.
+  # Keep credentials here rather than in the upstream URLs.
   DI_UPSTREAM_API_KEY: "replace-me"
   READ_UPSTREAM_API_KEY: "replace-me"
 ---
@@ -179,28 +141,27 @@ data:
   GATEWAY_ADDR: ":8080"
   DATA_DIR: "/data"
 
-  # The recommended addressing setting: correct behind any proxy topology, and it removes the
-  # question of which headers to trust. Scheme and authority only — a path here shifts the
-  # segment positions Azure.AI.FormRecognizer counts backwards from, and startup rejects it.
+  # Recommended. Scheme and authority only — a path shifts the segment positions
+  # Azure.AI.FormRecognizer counts backwards from, and startup rejects it. Unset, the request's
+  # Host header is used, as the container does.
   PUBLIC_BASE_URL: "https://gateway.apps.example.com"
 
-  DI_UPSTREAM_URL: "http://layout.ai.svc.cluster.local:5000"
-  DI_MAX_INFLIGHT: "4"
-  DI_UPSTREAM_TIMEOUT: "15m"
-  DI_SYNC_ANALYZE: "auto"
-  DI_SYNC_PROBE_TIMEOUT: "60s"
+  # The HAProxy Route in front of the Layout pods (§3). Leave unset to serve Read only.
+  DI_UPSTREAM_URL: "https://layout.apps.example.com"
+  DI_MAX_INFLIGHT: "16"          # 8 pods x 2 concurrent analyses per pod (§8)
+  DI_UPSTREAM_TIMEOUT: "15m"     # one whole-document attempt; the Route timeout must exceed it
 
-  # No "vision" anywhere in this hostname. See §3.
-  READ_UPSTREAM_URL: "http://ocr-read.ai.svc.cluster.local:5000"
-  READ_MAX_INFLIGHT: "4"
+  # No "vision" anywhere in this hostname (§3). Leave unset to serve DI only.
+  READ_UPSTREAM_URL: "https://ocr-read.apps.example.com"
+  READ_MAX_INFLIGHT: "16"
   READ_SYNC_TIMEOUT: "10m"
 
-  QUEUE_DEPTH: "0"
+  SPLIT_PAGES: "5"               # 0 turns splitting off
+  QUEUE_DEPTH: "200"             # accepted jobs waiting on the PVC, per surface
   RESULT_TTL: "24h"
   GC_INTERVAL: "5m"
   DISK_HIGH_WATERMARK: "0.90"
   SHUTDOWN_GRACE: "30s"
-  ERROR_COMPAT: "observed"
   LOG_LEVEL: "info"
   LOG_FORMAT: "json"
 ---
@@ -235,7 +196,7 @@ kind: Deployment
 metadata:
   name: azure-gateway-api
 spec:
-  replicas: 1              # see "One replica, Recreate" above — 2 is a correctness bug
+  replicas: 1              # see "One replica, Recreate" — 2 is a correctness bug
   strategy:
     type: Recreate         # never RollingUpdate: two pods must not share this volume
   selector:
@@ -244,7 +205,6 @@ spec:
   template:
     metadata:
       labels:
-        # Wega's NetworkPolicies select exactly this label; keep it if Wega calls this gateway.
         app.kubernetes.io/name: azure-gateway-api
     spec:
       # Must exceed SHUTDOWN_GRACE, which bounds connection draining *and* job draining.
@@ -257,7 +217,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: gateway
-          image: your-registry/azure-gateway-api:1.0.0
+          image: your-registry/azure-gateway-api:2.0.0
           imagePullPolicy: IfNotPresent
           args: ["serve"]
           ports:
@@ -268,283 +228,253 @@ spec:
                 name: azure-gateway-api
             - secretRef:
                 name: azure-gateway-api
-          # Liveness never touches a dependency, so a stalled container cannot restart the
-          # gateway and strand every stored result.
+          # Only if the Azure Routes are https with an internal CA:
+          # env:
+          #   - name: SSL_CERT_FILE
+          #     value: /etc/pki/internal-ca/ca-bundle.crt
           livenessProbe:
-            httpGet:
-              path: /_gw/live
-              port: http
+            httpGet: {path: /_gw/live, port: http}
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 3
-          # Readiness depends only on the job store. Upstream reachability is deliberately
-          # excluded — a container that is briefly down should fail individual jobs, not take
-          # the gateway out of service.
           readinessProbe:
-            httpGet:
-              path: /_gw/ready
-              port: http
+            httpGet: {path: /_gw/ready, port: http}
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
+          # The listener opens only after the schema migration and boot recovery. A migration
+          # takes seconds, but allow minutes: a startup probe that kills the pod mid-migration
+          # just makes it start again from the same place (§9).
           startupProbe:
-            httpGet:
-              path: /_gw/live
-              port: http
-            periodSeconds: 2
-            failureThreshold: 30
+            httpGet: {path: /_gw/live, port: http}
+            periodSeconds: 5
+            failureThreshold: 60
           resources:
             requests:
-              cpu: "250m"
-              memory: "256Mi"
+              cpu: "500m"
+              memory: "512Mi"
             limits:
               cpu: "2"
-              memory: "1Gi"
+              memory: "2Gi"        # two concurrent splits of your largest PDF (§8)
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
           volumeMounts:
-            - name: data
-              mountPath: /data
+            - {name: data, mountPath: /data}
+            - {name: tmp, mountPath: /tmp}
       volumes:
         - name: data
           persistentVolumeClaim:
             claimName: azure-gateway-api-data
+        - name: tmp
+          emptyDir: {sizeLimit: 64Mi}
 ```
 
-Two things about the probes that are easy to get wrong:
+Things about this manifest that are easy to get wrong:
 
 - **Do not point liveness at `/_gw/health`.** It answers `503` when the store is unreachable, and
-  it calls each container's `/status` on every request with a six-second budget. As a liveness
-  probe it turns a slow container into a restart loop, and a restart is exactly what this gateway
-  exists to survive.
-- **`readOnlyRootFilesystem: true` works** because every write the gateway itself makes — the
-  database, the blobs, and every scratch file — lands under `DATA_DIR`. `upstream.tempFile` creates
-  its temporary files inside the blob root, not `/tmp`, precisely so the existing sweeper reclaims
-  them. Mount an `emptyDir` at `/tmp` anyway as cheap insurance: nothing in this repository writes
-  there, but a library falling back to the system temp directory under an unusual condition would
-  otherwise fail hard.
-
-On OpenShift, an SCC may assign its own uid and `fsGroup` from the namespace's allocated range and
-override `runAsUser`/`fsGroup` above; that behaviour is a cluster property and is **not verified in
-this repository**. If the pod fails at startup with a permission error on `/data`, that is the
-first thing to check.
+  it calls each configured container's `/status` on every request with a six-second budget. As a
+  liveness probe it turns a slow container into a restart loop.
+- **`readOnlyRootFilesystem: true` works** because every write the gateway makes — the database,
+  its backups, the blobs, the work folders, the upstream temp files — lands under `DATA_DIR`.
+  pdfcpu runs with its stateless configuration precisely so it never tries to create a config file
+  in the home directory. The `/tmp` `emptyDir` is insurance only.
+- **An SCC may assign its own uid and `fsGroup`** on OpenShift and override `runAsUser`/`fsGroup`
+  above. That is a cluster property and is **not verified in this repository**; a permission error
+  on `/data` at startup points there first.
 
 ### First five minutes after it starts
 
 ```sh
-kubectl exec deploy/azure-gateway-api -- /usr/local/bin/gateway version   # build metadata
-curl -s http://gateway:8080/_gw/live                                     # {"status":"ok"}
-curl -s http://gateway:8080/_gw/ready                                    # {"status":"ready"}
-curl -s http://gateway:8080/_gw/health | jq '.warnings, .upstreams, .store'
+oc logs deploy/azure-gateway-api | grep -m1 schema        # the migration line (§9)
+oc exec deploy/azure-gateway-api -- /usr/local/bin/gateway version
+curl -s http://gateway:8080/_gw/ready                     # {"status":"ready"}
+curl -s http://gateway:8080/_gw/health | jq '.warnings, .upstreams, .capacity'
+curl -s http://gateway:8080/_gw/config | jq '{diEnabled, readEnabled, diMaxInflight, readMaxInflight, queueDepth, splitPages}'
 ```
 
-Read the `warnings` array. It is generated by `Config.Warnings()` and carries the four things that
-are legal but probably wrong: a `vision` substring in the Read hostname, an empty API key on either
-upstream, `TRUST_FORWARDED_HEADERS` on with no `PUBLIC_BASE_URL` and no allowlist, and
-`PUBLIC_BASE_URL` unset with forwarded headers untrusted. The same strings are logged at `WARN` at
-startup.
+Read the `warnings` array. It carries what is legal but probably wrong: a **removed setting** that
+is still set (`<NAME> is no longer used`), a `vision` substring in the Read hostname, an empty API
+key on a configured upstream, and `PUBLIC_BASE_URL` unset. The same strings are logged at `WARN` at
+startup. `upstreams[]` lists only the configured surfaces.
 
 ---
 
-## 3. Two OpenShift constraints Microsoft's docs do not mention
+## 3. The HAProxy Route in front of the Azure pods
 
-### The 30-second Route timeout against calls that run for minutes
-
-An OpenShift Route defaults to a 30-second HAProxy timeout. The gateway has three kinds of request
-that routinely run longer:
-
-- `POST …/{modelId}:syncAnalyze` and `POST /vision/v3.2/read/syncAnalyze`, which hold the
-  connection open for the whole analysis by design — bounded by `DI_UPSTREAM_TIMEOUT` (15m) and
-  `READ_SYNC_TIMEOUT` (10m) respectively;
-- any large upload, because the client streams up to `MAX_REQUEST_BYTES` (500 MB) before the
-  gateway answers — bounded by `UPLOAD_TIMEOUT` (10m);
-- streaming a large result back out on a poll, which for Document Intelligence can reach hundreds
-  of megabytes.
-
-Set the annotation to at least the largest of your upstream timeouts:
+The gateway cannot address or count the Azure pods; every call goes through the Route, so the
+Route's settings are part of the gateway's behaviour.
 
 ```yaml
 apiVersion: route.openshift.io/v1
 kind: Route
 metadata:
-  name: azure-gateway-api
+  name: layout
   annotations:
-    haproxy.router.openshift.io/timeout: 15m
+    # Longer than the gateway's per-attempt timeout (DI_UPSTREAM_TIMEOUT 15m). The 30-second
+    # default turns every longer analysis into a 504.
+    haproxy.router.openshift.io/timeout: 16m
+    # Per-pod concurrency divided by the number of router replicas, rounded down, minimum 1.
+    # The cap applies per router replica.
+    haproxy.router.openshift.io/pod-concurrent-connections: "1"
+    haproxy.router.openshift.io/balance: leastconn
 spec:
   to:
     kind: Service
-    name: azure-gateway-api
-  port:
-    targetPort: http
-  tls:
-    termination: edge
+    name: layout
 ```
 
-The failure is quiet and easy to misattribute, because the gateway never sees it: the router closes
-the client's connection while the handler keeps running. The giveaway is in the access log — the
-gateway logs `"request"` with a `durationMs` far past 30000 and a `200`, for a call the client
-reported as failing at almost exactly 30 seconds. See the playbook in
-[§6](#synchronous-calls-fail-at-about-30-seconds).
+- **`timeout`** must exceed the per-attempt timeout of whole documents and re-checks:
+  `DI_UPSTREAM_TIMEOUT` (`15m` → `16m`) for Layout, `READ_SYNC_TIMEOUT` (`10m` → `11m`) for Read.
+  Part attempts are 60 seconds and fit either way. Too short, and every analysis longer than it
+  becomes a 504 that the gateway retries once (`status_504`) and then fails.
+- **`pod-concurrent-connections`** is enforced by each router replica on its own. With pods that
+  take 2 analyses at a time and 2 router replicas, set `1`: each replica sends a pod at most one
+  call, so the pod sees at most two. Calls over the cap wait in HAProxy's queue and then get a
+  503, which the gateway retries with backoff (`status_503`) **while keeping its slot**, so an
+  overloaded deployment slows the gateway down instead of being hammered.
+- **`balance: leastconn`** sends each call to the pod with the fewest open calls. Analyses vary from
+  2 seconds to many minutes, so round-robin would stack calls behind one slow document.
+- **The Azure pods** need `terminationGracePeriodSeconds` at least as long as the slowest
+  analysis, so scale-in does not cut work short. Work that is cut short anyway is retried from
+  the stored input (`connection` or `status_502`).
+- **TLS.** If the Route is `https` with an internal CA, mount the CA bundle into the gateway and
+  set `SSL_CERT_FILE` (commented out in the manifest above).
 
-The async path is unaffected: `POST …:analyze` returns its `202` as soon as the input is committed,
-and each poll is a short request.
+### The gateway's own Route, if clients reach it through one
+
+The same 30-second default bites on the client side. Raise
+`haproxy.router.openshift.io/timeout` on the gateway's Route to cover the longest of:
+
+- a client `:syncAnalyze`, which now runs through the engine with retries and splitting and can
+  legitimately take up to the **60-minute job deadline**;
+- a large upload, bounded by `UPLOAD_TIMEOUT` (10m);
+- streaming a large result back out on a poll.
+
+If clients only use `:analyze` + poll, `15m` is plenty; if they use `:syncAnalyze`, use `61m` or
+move them to `:analyze`, which returns its 202 immediately. In-cluster clients calling the Service
+directly (as Wega does) pass through no router at all.
 
 ### The `vision` substring bug in the Read container
 
 When the inbound authority contains the substring `vision`, the Read container rebuilds its own
-callback URL with a naive string operation and strips both the port and the `/vision` path segment:
+callback URL with a naive string operation and strips both the port and the `/vision` path
+segment:
 
 ```
 POST http://azure-vision:5000/vision/v3.2/read/analyze
   → Operation-Location: http://azure-vision/v3.2/read/analyzeResults/…
 ```
 
-**The naming rule: no `vision` anywhere in the hostname of `READ_UPSTREAM_URL`** — which in
-practice means the Kubernetes Service name, since that is what the authority resolves to. Call it
-`ocr-read`, `cv-read`, `read-ocr`; anything without those six letters.
-
-The gateway itself is immune. It extracts the trailing operation id from the header
-(`operationIDFrom` in `poll.go`), discards the rest, and rebuilds every poll URL against the
-configured `READ_UPSTREAM_URL`. But the constraint is real for anything that calls the container
-directly — a debug `curl`, a legacy client, your own troubleshooting — and it is invisible in
-Microsoft's documentation. `Config.Warnings()` flags it at startup, the probe script reports it as
-`READ host has "vision" yes`, and `config.ErrReadHostContainsVision` carries the full explanation.
+**No `vision` anywhere in the hostname of `READ_UPSTREAM_URL`.** The gateway itself is immune — it
+only ever calls `syncAnalyze` and never follows a container's `Operation-Location` — but anything
+calling the container directly is not. `Config.Warnings()` flags it at startup.
 
 ---
 
-## 4. Configuration recipes
+## 4. Configuration
 
-Everything is an environment variable; nothing is read from disk. A few parsing behaviours matter
-before the tables:
+Everything is an environment variable; nothing is read from disk. There are **22 settings**.
 
-- An **empty value counts as unset** and the default applies (`env()` checks for a non-empty value).
-- A malformed **number is fatal**. `DI_MAX_INFLIGHT=four` fails startup with
-  `DI_MAX_INFLIGHT is not a valid integer`. Byte sizes are plain integers, so `500Mi` is rejected
-  too. A disabled surface's own settings are not checked.
-- A malformed **duration is fatal**. `RESULT_TTL=24` (no unit) fails startup with
-  `RESULT_TTL is not a valid duration`. Durations are Go syntax: `30s`, `10m`, `24h`, `1h30m`.
-- Validation is fail-fast and reports *every* problem at once, because a gateway that starts with a
-  bad upstream URL accepts work it can never complete after having already promised a `202`.
+Parsing rules, before the tables:
 
-### Required
+- An **empty value counts as unset** and the default applies.
+- A malformed **number or duration is fatal**. `SPLIT_PAGES=off` fails startup with
+  `SPLIT_PAGES is not a valid integer`, rather than silently leaving splitting on at its default of
+  5; `RESULT_TTL=24` (no unit) fails with `RESULT_TTL is not a valid duration`. Byte sizes are plain
+  integers, so `500Mi` is rejected. Durations are Go syntax: `30s`, `10m`, `24h`.
+- **At least one upstream URL must be set.** A surface whose URL is empty is disabled: no routes,
+  no worker, no scheduler, no entry in `/_gw/health` `upstreams[]`, `/status` or the metrics. Its
+  own settings — `*_MAX_INFLIGHT`, its timeout, its API key — are neither validated nor warned
+  about, so a stale value in the manifest of a single-surface gateway cannot stop it starting.
+- Validation reports **every** problem at once, because a gateway that starts with a bad upstream
+  URL accepts work it can never complete after having already promised a `202`.
+
+### Upstreams
 
 | Variable | Default | Notes |
 |---|---|---|
-| `DI_UPSTREAM_URL` | *(none — must be set)* | Document Intelligence container root, e.g. `http://layout.ai.svc.cluster.local:5000`. Must parse, must be `http` or `https`, must have a host. Trailing `/` is stripped. |
-| `READ_UPSTREAM_URL` | *(none — must be set)* | Read container root. **No `vision` in the hostname.** |
+| `DI_UPSTREAM_URL` | — | The HAProxy Route in front of the Layout pods, e.g. `https://layout.apps.example.com`. Must be `http` or `https` with a host; a trailing `/` is stripped. Empty disables DI. |
+| `READ_UPSTREAM_URL` | — | The Route in front of the Read pods. **No `vision` in the hostname.** Empty disables Read. |
+| `DI_UPSTREAM_API_KEY` / `READ_UPSTREAM_API_KEY` | — | Sent as `Ocp-Apim-Subscription-Key`. Empty means no header at all, and a startup warning for a configured surface. The gateway requires no credential *from* clients. |
 
-The API keys are *not* required: `DI_UPSTREAM_API_KEY` and `READ_UPSTREAM_API_KEY` default to
-empty, and an empty key means the upstream call carries no `Ocp-Apim-Subscription-Key` header at
-all. You get a startup warning, not a failure. The gateway requires no credential *from* clients on
-any route.
-
-### Capacity and backpressure
+### Capacity
 
 | Variable | Default | What it does |
 |---|---|---|
-| `DI_MAX_INFLIGHT` | `4` | Worker count for the DI surface, and the ceiling on concurrent calls into the DI container. Must be ≥ 1. |
-| `READ_MAX_INFLIGHT` | `4` | The same for the Read surface. |
-| `QUEUE_DEPTH` | `0` | Admitted-but-unstarted jobs allowed to wait, per surface. `0` means a submit is refused with `429` the moment every worker is busy. |
-| `MAX_REQUEST_BYTES` | `524288000` (500 MB) | Ceiling on an **upload**. Exceeding it yields `400` with `InvalidRequest`/`InvalidContentLength` on DI, `InvalidImageSize` on Read — not `413`, which is unmodelled on both surfaces. |
-| `MAX_RESULT_BYTES` | `536870912` (512 MB) | Ceiling on an upstream **response**. Deliberately separate from the upload cap: they bound opposite directions, and lowering the upload limit used to silently fail every large analysis. |
-| `POLL_RETRY_AFTER` | `1` | Integer seconds emitted as `Retry-After` on the `202` and on in-progress polls. Never zero — without the header azure-core waits its 30-second default between polls. |
-| `BUSY_RETRY_AFTER` | `5` | Integer seconds emitted with a `429` and with the `503` the gateway returns under disk pressure. |
+| `DI_MAX_INFLIGHT` / `READ_MAX_INFLIGHT` | `4` | Slots in that surface's scheduler: concurrent calls to its Azure pods of **any** kind — whole documents, parts, hedges, re-checks — and the number of jobs running at once. Must be ≥ 1 for a configured surface. Size it as max pods × per-pod concurrency: **16** for 8 × 2 (§8). |
+| `QUEUE_DEPTH` | `0` | Accepted jobs allowed to wait on the PVC, per surface, on top of `*_MAX_INFLIGHT`. `0` means a submit is refused with `429` the moment every worker is busy. Size for bursts, e.g. `200`. |
+| `SPLIT_PAGES` | `5` | The most pages one part may hold. A PDF with more pages to analyse is split into balanced parts of `ceil(SPLIT_PAGES/2)`–`SPLIT_PAGES` pages. `0` turns splitting off: every document goes whole. Must be ≥ 0. |
+| `MAX_REQUEST_BYTES` | `524288000` (500 MiB) | Ceiling on an **upload**. Exceeding it yields `400` with `InvalidRequest`/`InvalidContentLength` on DI, `InvalidImageSize` on Read — not `413`, which is unmodelled on both surfaces. |
+| `MAX_RESULT_BYTES` | `536870912` (512 MiB) | Ceiling on a **result**: each part's, each whole document's, and the merged one. Separate from the upload cap because they bound opposite directions. |
 
 ### Timeouts
 
 | Variable | Default | What it bounds |
 |---|---|---|
-| `DI_UPSTREAM_TIMEOUT` | `15m` | One complete logical DI analysis, including any fallback polling. |
-| `READ_SYNC_TIMEOUT` | `10m` | One complete logical Read analysis. Your Route timeout must cover this. |
-| `DI_SYNC_PROBE_TIMEOUT` | `60s` | How long a **background job** waits for the undocumented `:syncAnalyze` route to *answer*. Deliberately far below `DI_UPSTREAM_TIMEOUT`, because a build can declare the route and never answer it. It does not bound the result download that follows the answer, and it does not apply to the client-facing `:syncAnalyze` passthrough, which is a straight proxy bounded by `DI_UPSTREAM_TIMEOUT`. Silently clamped down to `DI_UPSTREAM_TIMEOUT` if you set it higher. |
-| `UPLOAD_TIMEOUT` | `10m` | How long a client may take to stream its request body while holding an admission slot. Applied as a read deadline on the connection. |
-| `ARTIFACT_FETCH_TIMEOUT` | `2m` | Aggregate budget for one job's whole result-file phase, so N figures cannot cost N × the per-request timeout. |
+| `DI_UPSTREAM_TIMEOUT` | `15m` | **One attempt** at a whole DI document, or one `pages=` re-check. Not the job: a job may make up to 5 attempts, within the 60-minute job deadline. |
+| `READ_SYNC_TIMEOUT` | `10m` | The same for Read. |
+| `UPLOAD_TIMEOUT` | `10m` | How long a client may take to stream its request body while holding an admission slot. |
 | `SHUTDOWN_GRACE` | `30s` | Connection draining **and then** job draining share this single budget. `terminationGracePeriodSeconds` must exceed it. |
 
-Not configurable, for reference when you are reading timings: the metadata proxy lane is fixed at
-10s per call (`metadataTimeout`), a worker's lease is 2m with a 30s heartbeat, the HTTP server uses
-`ReadHeaderTimeout: 30s` and `IdleTimeout: 120s` and sets **no** `ReadTimeout` or `WriteTimeout` —
-a client may legitimately spend minutes streaming a 500 MB document, and a synchronous passthrough
-holds its connection for the whole analysis.
-
-### Storage and retention
+### Storage, addressing and process
 
 | Variable | Default | What it does |
 |---|---|---|
-| `DATA_DIR` | `/data` | The PVC mount. Holds `gateway.db` and `blobs/`. |
-| `ALLOW_NETWORK_FS` | `false` | Overrides the refusal to start on `nfs`/`smb`/`cifs`/`ceph`/`fuse`/`gfs2`/`ocfs2`. WAL is unsafe there; use at your own risk. |
-| `RESULT_TTL` | `24h` | How long an operation id resolves. Matches the cloud contract: after it, a poll `404`s exactly like Azure. Also applied to the poll itself — an id past `expires_at` 404s even before the sweeper deletes it. |
-| `GC_INTERVAL` | `5m` | Sweeper period: TTL deletion, temp-file cleanup, orphan-blob reclaim, lease reclaim, disk-pressure eviction. |
-| `DISK_HIGH_WATERMARK` | `0.90` | Fraction of the volume above which the sweeper evicts completed results, expired ones first. Must be in `(0,1]`. Submits are refused with `503` at a higher threshold — the watermark plus half the remaining headroom, so `0.95` at the default. |
-
-### Compatibility and addressing
-
-| Variable | Default | What it does |
-|---|---|---|
-| `DI_SYNC_ANALYZE` | `auto` | `auto` tries the undocumented route and falls back permanently on absence; `force` requires it and fails jobs with `InternalServerError` if it is missing; `off` never tries it. |
-| `DI_BLIND_POLL_BUDGET` | `60` | Consecutive poll `404`s tolerated while chasing a degraded DI operation across replicas. |
-| `READ_BLIND_POLL_BUDGET` | `60` | The same budget for the Read surface's degraded-202 poll loop. It has its own variable deliberately: Read reaches that path only rarely, but a DI-named setting silently governing Read behaviour is a surprise an operator should not have to discover. |
-| `ERROR_COMPAT` | `observed` | `observed` reproduces what the containers actually emit: everything wrapped in `{"error":{…}}`, except the DI unknown-or-expired result id, which comes back flat as `{"code":"NotFound","message":"Analyze result does not exist."}`. `documented` follows the swagger — DI wrapped, Read flat. Nothing else is accepted. |
-| `PUBLIC_BASE_URL` | *(derived from the request)* | Scheme and authority for `Operation-Location`. **The recommended setting.** Rejected at startup if it carries a path, query or fragment, because `Azure.AI.FormRecognizer` 4.x locates the model and result ids by counting path segments backwards. |
-| `TRUST_FORWARDED_HEADERS` | `false` | Honour `X-Forwarded-Proto`/`X-Forwarded-Host`. Off by default: with it on and no allowlist, any caller can set `X-Forwarded-Host` and have the gateway mint an `Operation-Location` pointing at its own host — and the client's SDK then sends the operation id there. |
-| `TRUSTED_FORWARDED_HOSTS` | *(empty)* | Comma-separated authorities this gateway may advertise in `Operation-Location`. Constrains **both** `X-Forwarded-Host` and the plain `Host` header — an allowlist that governed only the forwarded header bought nothing, since a caller can simply omit it. An entry with no port matches that host on any port; bracket IPv6 literals (`[::1]`). A request whose authority is not listed gets a configuration error rather than a header pointing somewhere else. Empty means any authority that parses is advertised. |
-
-### Observability and process
-
-| Variable | Default | What it does |
-|---|---|---|
+| `DATA_DIR` | `/data` | The PVC mount: `gateway.db`, its backups, `blobs/`, `work/`. |
+| `RESULT_TTL` | `24h` | How long an operation id resolves. After it, a poll `404`s exactly like Azure. |
+| `GC_INTERVAL` | `5m` | Sweeper period: TTL deletion, temp files, orphan blobs, stale work folders, lease reclaim, disk-pressure eviction. |
+| `DISK_HIGH_WATERMARK` | `0.90` | Fraction of the volume above which completed results are evicted, expired ones first. Must be in `(0,1]`. Submits are refused with `503` at the watermark plus half the remaining headroom — `0.95` at the default. |
+| `PUBLIC_BASE_URL` | *(the request's `Host`)* | Scheme and authority for `Operation-Location`. **Recommended.** Rejected at startup if it carries a path, query or fragment. Forwarded headers are never consulted. |
 | `GATEWAY_ADDR` | `:8080` | Listen address. |
-| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`/`warning`, `error`. Anything else is treated as `info`. |
-| `LOG_FORMAT` | `json` | `text` selects `slog`'s text handler; anything else is JSON. Output is always stdout. |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`/`warning`, `error`. Anything else is `info`. |
+| `LOG_FORMAT` | `json` | `text` selects `slog`'s text handler; anything else is JSON, on stdout. |
 
-### Three tuned profiles
+### Removed settings
 
-**A. A slow container.** The symptom is the one a real probe found: a blank 200×120 PNG still
-`running` after 90 seconds, and `:syncAnalyze` declared in swagger but never answering. First
-confirm the container has its 8 cores and 16–24 GB (see [§7](#7-capacity-and-sizing)) — this is
-usually a resourcing problem, not a gateway one. Then:
+Eleven settings were removed by the sync-only change. A removed setting that is still set does
+**not** stop the gateway: it starts, and `Config.Warnings()` names each one as
+`<NAME> is no longer used` in the startup log and in `/_gw/health` `warnings[]`. Remove them from
+your manifests at your own pace; none of them does anything.
 
-| Setting | Value | Why |
+| Setting | Replaced by |
+|---|---|
+| `DI_SYNC_ANALYZE`, `DI_SYNC_PROBE_TIMEOUT` | nothing: `:syncAnalyze` is the only upstream route, bounded by the per-attempt timeout |
+| `DI_BLIND_POLL_BUDGET`, `READ_BLIND_POLL_BUDGET` | nothing: the gateway never polls a container |
+| `ARTIFACT_FETCH_TIMEOUT` | nothing: `output=pdf` / `output=figures` are rejected with 400 |
+| `ERROR_COMPAT` | the containers' observed error shapes, always |
+| `TRUST_FORWARDED_HEADERS`, `TRUSTED_FORWARDED_HOSTS` | `PUBLIC_BASE_URL`, or else the `Host` header |
+| `ALLOW_NETWORK_FS` | nothing: network filesystems are always refused |
+| `POLL_RETRY_AFTER`, `BUSY_RETRY_AFTER` | the constants 1 and 5 below |
+
+`/_gw/config` no longer shows them. It shows `splitPages`, `diEnabled` and `readEnabled`, and keeps
+`diMaxInflight`, `readMaxInflight` and `queueDepth` — Wega's observer parses those — with `0` and an
+empty URL for a disabled surface.
+
+### Constants
+
+Not configurable, by design: each is either a contract with the clients or a bound whose right
+value does not depend on the deployment.
+
+| Constant | Value | Why |
 |---|---|---|
-| `DI_SYNC_ANALYZE` | `off` | Skips a wasted 60-second attempt on every job that starts before the first probe returns — up to `DI_MAX_INFLIGHT` of them after each restart, plus the first recovery batch. |
-| `DI_UPSTREAM_TIMEOUT` | `30m` | The fallback path is `:analyze` plus polling; give it room or jobs fail with "did not complete the analysis within the configured timeout" while the container is still working. |
-| `haproxy.router.openshift.io/timeout` | `30m` | Only matters if clients use the synchronous passthrough routes; it must cover the timeout above. |
-| `POLL_RETRY_AFTER` | `5` | Client SDKs honour this between polls. At `1`, a job that takes ten minutes generates hundreds of pointless polls per client. |
-| `DI_MAX_INFLIGHT` | `2` | A slow container is a saturated container. Queuing more concurrent work into it makes every job slower without raising throughput. |
-| `QUEUE_DEPTH` | `8` | With inflight lowered, `0` would 429 far too eagerly. The `202` has already been promised for queued work, so waiting is honest. |
-| `SHUTDOWN_GRACE` | `5m` (+ `terminationGracePeriodSeconds: 330`) | Long jobs interrupted by a restart are re-run from scratch on the next boot; a longer grace lets more of them finish instead. |
-
-**B. A fast container**, where the probe says `DI :syncAnalyze AVAILABLE`.
-
-| Setting | Value | Why |
-|---|---|---|
-| `DI_SYNC_ANALYZE` | `auto` | The fast path is stateless: no operation id, no replica affinity, nothing pinned. `force` is also defensible here — it converts a silent degradation to `:analyze` into a loud failure. |
-| `DI_MAX_INFLIGHT` / `READ_MAX_INFLIGHT` | `4`–`8` | Match the container's cores, not the gateway's. Layout wants 8 cores for *one* document. |
-| `DI_UPSTREAM_TIMEOUT` | `5m` | Tighter, so a wedged call surfaces quickly instead of holding a slot for a quarter of an hour. |
-| `POLL_RETRY_AFTER` | `1` | Results arrive in seconds; a higher value just adds latency the client cannot skip. |
-| `QUEUE_DEPTH` | `0`–`2` | With fast jobs, a 429 with `Retry-After: 5` is better feedback than a queue. |
-| `ARTIFACT_FETCH_TIMEOUT` | `2m` | Leave it. Result files are a bonus and the analysis is already stored by the time they are fetched. |
-
-**C. A memory-constrained pod.** The gateway's own heap does not scale with document size —
-uploads stream to the PVC, upstream responses stream to a temp file, the result envelope is
-composed with a range copy, and `jsonx` locates members with a 64 KB byte scanner rather than a
-tokenizer that materialises every scalar. Heap scales with **concurrency**, so:
-
-| Setting | Value | Why |
-|---|---|---|
-| `DI_MAX_INFLIGHT` / `READ_MAX_INFLIGHT` | `1`–`2` | The dominant lever. It sets the worker count, the upstream concurrency, and (indirectly) the SQLite read-pool size, which is `DI_MAX_INFLIGHT + READ_MAX_INFLIGHT + 8`. |
-| `QUEUE_DEPTH` | `8`–`16` | Recovers the throughput lost above without adding concurrent memory. |
-| `MAX_RESULT_BYTES` | `134217728` (128 MB) | Rejects a monster response instead of writing it and then streaming it back. The job fails cleanly at HTTP 200 with `status: "failed"` and the message `upstream: response exceeds the configured maximum` — the sentinel names no number, so read the value you configured from `/_gw/config`. |
-| `MAX_REQUEST_BYTES` | as low as your documents allow | An upload you reject costs nothing. |
-| `DISK_HIGH_WATERMARK` | `0.80` | A small volume fills fast, and eviction is cheaper than a `503`. |
-| `GC_INTERVAL` | `2m` | Reclaim more often on a small volume. |
-
-Sizing note for this profile: memory pressure on the *gateway* is rarely the real problem. The
-containers are the 8-core, 16–24 GB pods; the gateway is a static Go binary streaming bytes between
-a socket and a disk.
+| `Retry-After` on the 202 and in-progress polls | `1` s | without the header azure-core waits its 30-second default between polls |
+| `Retry-After` on the gateway's 429 and its disk-pressure 503 | `5` s | the JS SDK retries a 429 only when the header is present |
+| Attempts per whole document | `5` | at most 2 of them in the once-only class (attempt timeout, 500, 504): a slow analysis is retried once, not five times |
+| Backoff between attempts | 50–100% of `min(60s, 2s × 2^(n−1))` | a parseable integer `Retry-After` from HAProxy or the pod replaces it, capped at 60s |
+| Part attempt timeout | `60s` | a 3–5 page part normally takes about 2 s; a hung pod costs a minute, not fifteen |
+| Attempts per part size | `3` | then the part is halved, down to single pages |
+| Hedge delay | `clamp(4 × median, 5s, 30s)` | the median of the surface's last 200 successful parts; `30s` until there are 20 samples. One hedge per part attempt, idle slots only |
+| Job deadline | `60m` | the containers' own maximum task time; covers all attempts, parts and backoffs |
+| Concurrent splits | `2` | shared by both surfaces; bounds parsing memory |
+| Split budget | `60s` | from when the split slot is held; over budget, the document goes whole |
+| Dial timeout | `10s` | per attempt; a fresh connection every attempt |
+| Metadata relay lane | `4` slots, `10s` per call | `/info`, `/documentModels`, `/operations`, the container root |
+| Worker lease / heartbeat | `2m` / `30s` | a long analysis is never reclaimed under its worker |
+| Worker runs per job | `3` | recovery fails a job that keeps dying with its worker |
+| Stale work folders, temp files, orphan blobs | older than `1h` | swept every `GC_INTERVAL` |
 
 ---
 
@@ -552,91 +482,99 @@ a socket and a disk.
 
 ### The endpoints
 
-The eight `/_gw/*` endpoints live under that prefix so they can never collide with an Azure route.
-The last two are served at the root on purpose, mirroring the containers' own paths so tooling
-pointed at a container keeps working. **None of the ten is authenticated.** Do not expose them
-through the public Route.
+The eight `/_gw/*` endpoints live under that prefix so they can never collide with an Azure route,
+and carry no `Server: Kestrel` because they are the gateway's own. `/status` and `/ready` are served
+at the root on purpose, mirroring the containers' own paths. **None is authenticated.** Do not
+expose them through a public Route.
 
 | Endpoint | Returns |
 |---|---|
-| `GET /_gw/live` | `200 {"status":"ok"}`, always, without touching a dependency. Use it for liveness — a stalled upstream must not cause a restart. |
-| `GET /_gw/ready` | `200 {"status":"ready"}`, or `503 {"status":"unavailable","detail":"the job store is not reachable"}`. Depends only on a 3-second ping of both SQLite pools. Upstream reachability is deliberately excluded. |
-| `GET /_gw/health` | The full diagnostic: `status` (`ok`/`degraded`), `uptime`, `build`, `store` (`dataDir`, `diskUsed`, `diskUsedKnown`, `reachable`), `capacity` per surface, `upstreams[]`, `jobs` counts per surface, and `warnings[]`. HTTP `503` only when the store is unreachable; an unreachable container yields `"status":"degraded"` at HTTP `200`. |
-| `GET /_gw/jobs?limit=N` | `{"jobs":[…],"count":N}`, most recently updated first. `limit` defaults to 50 and is honoured only for values in 1..1000. Anything else — unparseable, zero, negative, or above 1000 — falls back to 50 rather than being clamped, so `?limit=5000` returns 50 rows, not 1000. |
+| `GET /_gw/live` | `200 {"status":"ok"}`, always, without touching a dependency. Use it for liveness and startup. |
+| `GET /_gw/ready` | `200 {"status":"ready"}`, or `503` when either SQLite pool fails a 3-second ping. Upstream reachability is deliberately excluded. |
+| `GET /_gw/health` | `status` (`ok`/`degraded`), `uptime`, `build`, `store`, `capacity` per configured surface (`inFlight`, `limit`, `queued`, `upstreamInUse`, `upstreamWaiting`, `upstreamLimit`), `upstreams[]` for the configured surfaces only, job counts, and `warnings[]`. HTTP `503` only when the store is unreachable; an unreachable container yields `degraded` at `200`. There is no `syncAnalyze` field any more. |
+| `GET /_gw/jobs?limit=N` | `{"jobs":[…],"count":N}`, most recently updated first; `limit` 1..1000, else 50. |
 | `GET /_gw/jobs/{id}` | One job view, or `404 {"error":"no such job"}`. |
-| `GET /_gw/metrics` | Prometheus text format, `version=0.0.4`. Hand-written; there is no client library in the binary. |
-| `GET /_gw/version` | `{"version","commit","built","go"}`. The first three come from the build's `-ldflags` (`-X main.version` and friends, set by the Makefile and Dockerfile); `go` is the toolchain version `runtime.Version()` reports at startup. |
-| `GET /_gw/config` | The effective configuration. Both API keys render as `***`, and any password embedded in an upstream URL renders as `user:xxxxx` via `url.URL.Redacted` — `/_gw/health` and the startup log do the same. Credentials still belong in `DI_UPSTREAM_API_KEY` / `READ_UPSTREAM_API_KEY` rather than in the URL. Every configuration field is surfaced here; `TestRedactedCoversEveryField` fails if one is added and not exposed. |
-| `GET /status` | Container-shaped: `{"apiStatus":"Valid"…}` or `{"apiStatus":"Invalid","apiStatusMessage":"Upstream containers unreachable: …"}`, always at HTTP 200, because Microsoft's own batch tooling parses `apiStatus` and compares it against `Valid`. |
-| `GET /ready` | Container-shaped: `{"ready":"ready"}` at 200, or `{"ready":"notReady"}` at 503 — the exact pair Microsoft's compose healthcheck greps for. |
+| `GET /_gw/metrics` | Prometheus text format, hand-written. |
+| `GET /_gw/version` | `{"version","commit","built","go"}`. |
+| `GET /_gw/config` | The effective configuration. Both API keys render as `***`, and a password embedded in an upstream URL as `user:xxxxx`. |
+| `GET /status` | Container-shaped `{"apiStatus":"Valid"…}` or `Invalid`, always at HTTP 200, over the configured upstreams. |
+| `GET /ready` | Container-shaped `{"ready":"ready"}` at 200, or `{"ready":"notReady"}` at 503. |
 
-The one field on `/_gw/health` worth learning by name is `upstreams[].syncAnalyze`. It reads
-`unknown` until the first DI job runs, then settles on `available` or `unavailable`, and that is
-how you find out what the `:syncAnalyze` route did on *your* image build without reading logs. The
-Read client always reports `available`, because its synchronous route is documented rather than
-probed.
+A job view carries `id`, `surface`, `modelId`, `status`, `createdAt`, `updatedAt`, `expiresAt`,
+`inputBytes`, `resultBytes`, `upstreamMs`, `attempts` (worker runs), `upstreamAttempts` (calls to
+Azure), `upstreamParts` (1 = whole; more = split and merged; 0 = not completed) and `error`, the
+stored Azure-shaped error. `upstreamMode`, `hasPdf` and `figures` are gone. Client `:syncAnalyze`
+calls are not jobs and do not appear.
 
-A job view (`/_gw/jobs`) carries: `id`, `surface`, `modelId`, `status`, `upstreamMode`,
-`createdAt`, `updatedAt`, `expiresAt`, `inputBytes`, `resultBytes`, `upstreamMs`, `attempts`,
-`error` (the stored Azure-shaped error JSON), `hasPdf`, `figures`. `upstreamMode` is the fastest
-way to see which strategy actually ran: `sync`, `degraded-202`, or `async-fallback`.
+**Relayed routes carry the container's own headers.** The metadata and passthrough GETs (`/info`,
+`/documentModels…`, `/operations…`, `/`, `/swagger…`, `/records/usage-logs…`) pass the response
+headers of whichever pod HAProxy picked straight through to the client, minus hop-by-hop headers,
+`Operation-Location`, `Location` and `Set-Cookie`. So on those routes `Server` (Kestrel), and any
+`apim-request-id` a container build does send, come from the pod; every Azure route the gateway
+answers itself sends `Server: Kestrel` and never an `apim-request-id`. When comparing a relay with
+an owned route, expect that difference. Error bodies on a relay are normalised to the surface's
+shape at the container's own status. See
+[`api-surface.md` §0](api-surface.md#0-what-the-gateway-serves).
 
 ### The metrics
 
-These are the complete set exported by `admin.metrics`. All are gauges.
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `gateway_uptime_seconds` | gauge | — | Seconds since process start. A drop means a restart. |
+| `gateway_jobs_in_flight` | gauge | `surface` | Admission slots held: jobs not yet terminal, plus client `:syncAnalyze` calls in progress. Occupancy, not a job count. |
+| `gateway_jobs_capacity` | gauge | `surface` | `MAX_INFLIGHT + QUEUE_DEPTH`. |
+| `gateway_jobs_queued` | gauge | `surface` | Admitted jobs waiting for a worker. |
+| `gateway_jobs_total` | gauge | `surface`, `status` | Rows in the database by status. Falls as the TTL sweeper runs; not cumulative. |
+| `gateway_volume_used_ratio` | gauge | — | Fraction of the volume in use. Omitted when it cannot be determined; alert on absence too. |
+| `gateway_upstream_slots` | gauge | `surface`, `state` (`inUse`, `waiting`, `limit`) | The scheduler. `waiting > 0` means every slot is busy and calls are queued in the gateway. |
+| `gateway_upstream_retries_total` | counter | `surface`, `reason` | Failed attempts that were retried. `reason`: `connection`, `status_408`, `status_429`, `status_500`, `status_502`, `status_503`, `status_504`, `degraded_202`, `timeout`. |
+| `gateway_upstream_exhausted_total` | counter | `surface` | Jobs failed because their attempts ran out. |
+| `gateway_part_seconds` | histogram | `surface` | Duration of successful part calls. |
+| `gateway_job_parts` | histogram | `surface` | Parts per split job. |
+| `gateway_merge_seconds` | histogram | `surface` | Merge duration. |
+| `gateway_parts_total` | counter | `surface`, `outcome` | `succeeded`, `retried`, `halved`, `hedged`, `hedge_won`, `rechecked`. |
+| `gateway_split_fallback_total` | counter | `surface`, `reason` | Documents that qualified for splitting but went whole: `unparseable`, `encrypted`, `budget`, `panic`, `pages_param`, `merge_check`. |
 
-| Metric | Labels | Meaning |
-|---|---|---|
-| `gateway_uptime_seconds` | — | Seconds since process start. A drop means a restart. |
-| `gateway_jobs_in_flight` | `surface` | Admission slots currently held on that surface. Mostly accepted jobs that have not reached a terminal state, but a client-facing synchronous passthrough takes an admission slot for its duration too, and it is never a job and never reaches a terminal state. Read it as occupancy, not as a job count. |
-| `gateway_jobs_capacity` | `surface` | The admission ceiling, which is `MAX_INFLIGHT + QUEUE_DEPTH`, **not** `MAX_INFLIGHT`. |
-| `gateway_jobs_queued` | `surface` | Admitted jobs waiting for a worker. Always 0 when `QUEUE_DEPTH=0`. |
-| `gateway_jobs_total` | `surface`, `status` | Rows currently in the database by status: `notStarted`, `running`, `succeeded`, `failed`. A gauge of *stored* jobs, so it falls as the TTL sweeper runs — it is not a cumulative counter. |
-| `gateway_volume_used_ratio` | — | Fraction of the volume in use. **Omitted entirely** when usage cannot be determined — any platform other than Linux or Darwin, or a `statfs` that fails or reports zero total blocks. Alert on its absence as well as its value. |
-
-Two absences worth knowing: there is no request-latency histogram and no cumulative request
-counter. Per-request timing exists only in the access log's `durationMs`, and per-job upstream
-timing only in `upstreamMs` on `/_gw/jobs` and in the `job succeeded` log line.
+Histogram buckets are 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120 and 300. There is still no request-latency
+histogram; per-request timing is in the access log's `durationMs`, per-job timing in `upstreamMs`.
 
 ### The log fields that matter
 
-Logs are `log/slog` on stdout, JSON by default. Request-scoped lines carry:
+Logs are `log/slog` on stdout, JSON by default.
 
 | Field | Where it comes from |
 |---|---|
-| `requestId` | Minted per request and also returned to the client as the `apim-request-id` header. This is the correlation handle a client can quote back to you. |
-| `clientRequestId` | The client's own `x-ms-client-request-id`, when it sent one. Echoed back in the response too. |
-| `method`, `path`, `status`, `bytes`, `durationMs` | The `"request"` access-log line. Logged at `ERROR` for 5xx, `WARN` for 4xx, `INFO` otherwise. |
+| `requestId` | Minted per request, in the logs only. It is **not** sent to the client: the `apim-request-id` header is gone, because the containers are not known to send it. |
+| `clientRequestId` | The client's own `x-ms-client-request-id`, echoed back in the response. **This is now the correlation handle a client can quote back to you.** |
+| `method`, `path`, `status`, `bytes`, `durationMs` | The `"request"` access-log line: `ERROR` for 5xx, `WARN` for 4xx, `INFO` otherwise. |
+| `job`, `surface` | Every job and engine line. A client `:syncAnalyze` runs as job `sync-<id>`. |
+| `pages`, `attempt` | Engine lines about one part, e.g. `pages=12-15 attempt=2`. |
+| `attempt`, `reason`, `status`, `backoffMs` | The one `WARN` line per failed attempt. |
+| `attempts`, `parts`, `halvings`, `hedges`, `fallback` | A job's final line. |
+| `from`, `to`, `backup`, `legacy`, `took` | The `job store schema migrated` line at startup (§9). |
 
-Job-scoped lines carry `job` (the operation id) and `surface`, plus `mode`, `upstreamMs` and
-`resultBytes` on `job succeeded`, and `code`/`message` on `analysis failed`. **Worker logs are not
-request-scoped**, so they carry `job` but no `requestId`. The bridge between the two is the
-`accepted operation` line, which is request-scoped *and* carries the job id:
+The bridge between a client and a job is the `accepted operation` line, which is request-scoped
+*and* carries the job id:
 
 ```
-client's apim-request-id  →  grep requestId=…  →  "accepted operation" job=<operation id>
-                                              →  grep job=<operation id> for everything after
+client's x-ms-client-request-id → grep clientRequestId=… → "accepted operation" job=<operation id>
+                                                         → grep job=<operation id> for everything after
 ```
-
-Lines worth grepping for by message text, because each names a specific condition:
-`reclaiming jobs that stopped progressing`, `requeued orphaned job`,
-`orphaned job exhausted its attempts; failing it`, `orphaned job has no input document; failing it`,
-`evicted a result that had not yet expired`, `volume above high-water mark`,
-`shutdown grace expired with jobs still running`, `result blob missing for a succeeded job`,
-`result-file budget exhausted`, `upstream returned an unparseable error body`.
 
 ### What to alert on
 
 | Alert | Condition | Why it matters |
 |---|---|---|
-| Clients being refused | `gateway_jobs_in_flight / gateway_jobs_capacity == 1` for more than a few minutes, per surface | The next submit gets a `429`. This is the signal to scale the *container*, not the gateway. |
-| Volume filling | `gateway_volume_used_ratio > DISK_HIGH_WATERMARK` (0.90) | Eviction has started, and results a client could still fetch may be dropped. At watermark + half the headroom (0.95 by default) submits start failing with `503`. |
-| Submits failing on storage | any `evicted a result that had not yet expired` log line | You are past the point where eviction is free. |
-| Work stalling | `gateway_jobs_total{status="running"}` flat and non-zero for longer than your upstream timeout | Either the container is wedged or jobs are being abandoned and reclaimed in a loop. |
-| Failure rate | increase in `gateway_jobs_total{status="failed"}` over a window (it is a gauge — use `increase()`/`delta()` carefully, and cross-check the `analysis failed` log lines) | The dominant failure mode on both surfaces is HTTP 200 with `"status":"failed"`, so HTTP-status-based alerting sees none of it. |
-| Restarts | `gateway_uptime_seconds` resetting | Every restart re-runs in-flight jobs from their stored input. Frequent restarts multiply container load. |
-| Readiness flapping | `/_gw/ready` failing | It only fails when SQLite is unreachable, which on a healthy volume should never happen. |
-| Degraded upstream | `/_gw/health` `.status == "degraded"` | A container's `/status` is not answering. Jobs will fail individually; the gateway stays up on purpose. |
+| Clients being refused | `gateway_jobs_in_flight / gateway_jobs_capacity == 1` for minutes, per surface | The next submit gets a `429`. Raise `QUEUE_DEPTH`, or scale the Azure side. |
+| Jobs failing after all attempts | `increase(gateway_upstream_exhausted_total[15m]) > 0` | The pods were unreachable, overloaded or failing for longer than five attempts. Read the `reason` mix below. |
+| Retry storm | `rate(gateway_upstream_retries_total[5m])` by `reason` well above its baseline | `status_503`: HAProxy has no ready pod or the per-pod cap is too tight. `connection`/`status_502`: pod churn or scale-in cutting work. `timeout`/`status_504`: hung pods, or a Route timeout below the attempt timeout. `degraded_202`: pods under memory pressure. |
+| Gateway-side queueing | `gateway_upstream_slots{state="waiting"} > 0` for long stretches | Every slot is busy. Expected during bursts; sustained, it means `*_MAX_INFLIGHT` is below what the Azure side can take — or the Azure side is slow. |
+| Hung parts | `increase(gateway_parts_total{outcome="halved"}[15m]) > 0`, or part p95 near 60 s | Parts are timing out repeatedly: a pod is hanging. |
+| Merge checks failing | `increase(gateway_split_fallback_total{reason="merge_check"}[1h]) > 0` | Part results disagreed or did not add up. The document was analysed whole, so clients are fine, but something changed: read the log line's check message. |
+| pdfcpu panics | `increase(gateway_split_fallback_total{reason="panic"}[1d]) > 0` | A PDF crashed the splitter (recovered; sent whole). Keep the document and report it. |
+| Volume filling | `gateway_volume_used_ratio > 0.90` | Eviction has started; at 0.95 submits fail with `503`. |
+| Restarts | `gateway_uptime_seconds` resetting | Every restart re-runs in-flight jobs from their stored input. |
+| Degraded upstream | `/_gw/health` `.status == "degraded"` | A configured container's `/status` is not answering. |
 
 ---
 
@@ -644,360 +582,378 @@ Lines worth grepping for by message text, because each names a specific conditio
 
 ### Clients get 429s
 
-**Check.** `curl -s :8080/_gw/health | jq .capacity` and compare `inFlight` against `limit` per
-surface. In metrics, `gateway_jobs_in_flight` versus `gateway_jobs_capacity`. Then
-`/_gw/jobs?limit=20` and look at `status` and `upstreamMs`.
+**Check.** `curl -s :8080/_gw/health | jq .capacity` — compare `inFlight` against `limit` per
+surface. In metrics, `gateway_jobs_in_flight` versus `gateway_jobs_capacity`.
 
-**What it means.** A `429` is always the gateway's own backpressure — the containers never emit one,
-because they do not cap TPS. It comes from one of three admission gates: the per-surface job
-admission (`MAX_INFLIGHT + QUEUE_DEPTH` slots, held from admission all the way to a terminal
-state), the container-concurrency gate that synchronous passthroughs share with workers
-(`MAX_INFLIGHT` slots), or the read-only metadata lane (a fixed 4 slots per surface, for
-`/info`, `/documentModels`). Polls are never admission-controlled and never 429.
+**What it means.** A `429` is always the gateway's own backpressure — the pods never send one. It
+comes from the job admission gate (`MAX_INFLIGHT + QUEUE_DEPTH`, held from acceptance to a terminal
+state, shared by `:analyze` and client `:syncAnalyze`) or from the metadata lane (4 slots, for the
+GET relays). Polls are never admission-controlled. Waiting for a *scheduler* slot never produces a
+429: that wait happens inside a job that has already been accepted.
 
-If `inFlight == limit` while `upstreamMs` on recent jobs is large, the real problem is that the
-container is slow and slots are being held for minutes each — this is a capacity problem wearing a
-429 costume.
+**Do.** Raise `QUEUE_DEPTH` so callers wait on the PVC instead of being refused — the cost is disk
+for the queued inputs. Raise `*_MAX_INFLIGHT` only up to what the Azure side can absorb (§8). If
+`upstreamMs` on recent jobs is large, the pods are slow and that is the real problem.
 
-**Do.** In order of preference: give the container more resources (see [§7](#7-capacity-and-sizing));
-raise `QUEUE_DEPTH` so callers wait instead of being refused; raise `MAX_INFLIGHT` only if the
-container can actually absorb the concurrency. Raising `BUSY_RETRY_AFTER` spaces out retries but
-does not add throughput. Note that a 429 always carries an integer `Retry-After`, deliberately —
-the JS SDK only retries a 429 when that header is present.
+### A job sits at "running" for a long time
 
-### A job sits at "running" and never finishes
-
-```mermaid
-stateDiagram-v2
-    [*] --> notStarted: submit accepted, row committed, then 202
-    notStarted --> running: worker claims it, attempts+1, 2m lease
-    running --> succeeded: envelope written to the PVC
-    running --> failed: analysis error, or 3 attempts used
-    running --> notStarted: restart or lapsed lease, requeued
-    succeeded --> [*]: TTL expiry or DELETE, poll now 404s
-    failed --> [*]: TTL expiry or DELETE
-```
-
-**Check.** `curl -s :8080/_gw/jobs/<id> | jq` — look at `attempts`, `updatedAt`, `upstreamMode`.
-Then the logs for `job=<id>`. Then `/_gw/health` `.upstreams[].ok` and `.syncAnalyze`.
+**Check.** `curl -s :8080/_gw/jobs/<id> | jq`, then `grep job=<id>` in the logs: every failed
+attempt has its own `WARN` line with `reason`, `status` and `backoffMs`.
 
 **What it means.**
+- **No attempt lines:** the job is inside its first call. A whole document's attempt is bounded by
+  `DI_UPSTREAM_TIMEOUT`/`READ_SYNC_TIMEOUT`; a part's by 60 s. Or it is waiting for a scheduler
+  slot — check `gateway_upstream_slots{state="waiting"}`.
+- **Attempt lines with backoffs:** the pods are failing it transiently. It will either succeed or
+  exhaust its attempts and fail with the last error.
+- **`attempts` (worker runs) climbing:** the worker keeps dying — a restart loop or an OOM. At 3 it
+  is failed with "The analysis was interrupted repeatedly and could not be completed."
 
-- `attempts: 1` and `updatedAt` not advancing: a worker is inside a single upstream call. That call
-  is bounded by `DI_UPSTREAM_TIMEOUT` / `READ_SYNC_TIMEOUT` measured from when the analysis
-  started, so it *will* end — the question is whether that ceiling is minutes or a quarter of an
-  hour. The heartbeat refreshes the lease every 30s while it runs, which is why nothing reclaims it.
-- `attempts` climbing (2, then 3): the job is being abandoned and reclaimed. Something is killing
-  the worker — a restart loop, or the pod being OOMKilled. At `attempts >= 3` it is failed
-  permanently with "The analysis was interrupted repeatedly and could not be completed."
-- `upstreamMode` empty and `syncAnalyze: unknown` on a DI job: the first job on this process is
-  still inside the `:syncAnalyze` probe, bounded by `DI_SYNC_PROBE_TIMEOUT` (60s), before it falls
-  back.
-
-**Do.** If the container is simply slow, that is a resourcing question — check its cores and
-memory. If polls are failing to find the operation on a degraded 202 path, look for
-`consecutive polls reached a replica that had no record of it` and see the next playbook. If the
-job's clock has genuinely run out, it ends as `failed` at HTTP 200 with a message naming the
-timeout; nothing is stuck forever.
+Nothing runs forever: every job has a **60-minute deadline**, after which it fails with a timeout
+error in the surface's shape.
 
 ### Polls 404 unexpectedly
 
-**Check.** The exact id the client is polling. `curl -s :8080/_gw/jobs/<id>` — does the row exist at
-all? Compare the client's id to `expiresAt`. Check the logs for `evicted`, `expired jobs removed`,
-or a `DELETE` in the access log.
+The gateway returns `404` for exactly four reasons, never for a live operation:
 
-**What it means.** The gateway returns `404` for exactly four reasons, and never for a live
-operation — a 404 on an in-flight poll kills Java clients with an opaque `NullPointerException`
-and marks the operation terminally failed in .NET and JS, so it is avoided by construction.
+1. **The id is not a well-formed GUID** (`8-4-4-4-12`, either hex case on input).
+2. **The id belongs to the other surface**, or that surface is not configured on this gateway.
+3. **The TTL passed** (`RESULT_TTL`, 24h) — the poll 404s even before the sweeper deletes the row.
+4. **The row is gone**: a client `DELETE`, the TTL sweep, or disk-pressure eviction.
 
-1. **The id is not a well-formed GUID.** `ids.Normalize` requires exactly 36 characters in
-   `8-4-4-4-12` layout. Either hex case is accepted on input. A truncated or re-encoded id from a
-   client that mangled `Operation-Location` lands here.
-2. **The id belongs to the other surface.** A DI result id polled on `/vision/v3.2/read/...`
-   404s, because the poll checks `job.Surface`.
-3. **The TTL passed.** After `RESULT_TTL` (24h) the poll 404s immediately, even before the sweeper
-   deletes the row. This matches Azure.
-4. **The row is gone.** A client `DELETE` on the DI surface (`DELETE .../analyzeResults/{id}`
-   returns 204 and purges everything), the TTL sweep, or disk-pressure eviction.
-
-A **restart never causes this**. Ids and results live on the PVC, which is the whole point.
-
-**Do.** If (1), the client is corrupting the header — check whether it is polling the gateway or
-somehow the container directly, and check `PUBLIC_BASE_URL`. If (4) and the id had not expired,
-look for `evicted a result that had not yet expired` and treat it as a volume-capacity incident.
+A restart never causes this; ids and results live on the PVC. **A rollback restore does** (§9):
+jobs accepted after the backup was taken are not in it.
 
 ### The volume fills
 
-**Check.** `gateway_volume_used_ratio`, or `/_gw/health` `.store.diskUsed`. Then
-`kubectl exec … -- ls -la /data` — but note the distroless image has no shell, so inspect from the
-node or a debug container that mounts the same PVC. `/_gw/jobs?limit=1000` shows what is being
-retained and how large results are (`resultBytes`).
-
-**What it means.** In order, as usage climbs:
+**Check.** `gateway_volume_used_ratio`, `/_gw/health` `.store`, `/_gw/jobs?limit=1000` for
+`resultBytes`. The image has no shell: inspect from a debug pod that mounts the PVC, with the
+gateway scaled to 0 (the volume is RWO).
 
 | Usage | Behaviour |
 |---|---|
-| below `DISK_HIGH_WATERMARK` (0.90) | Normal. TTL sweep every `GC_INTERVAL` only. |
-| at or above the watermark | Every sweep evicts completed jobs, expired ones first, then results a client could still fetch — each of those logged as `evicted a result that had not yet expired`. It stops as soon as usage drops back under the mark. |
-| at or above watermark + half the headroom (0.95 by default) | New submits are refused with `503` and a `Retry-After`, before any bytes are written. Polls and in-flight jobs continue. |
+| below `DISK_HIGH_WATERMARK` | Normal. TTL sweep every `GC_INTERVAL`. |
+| at or above it | Every sweep evicts completed jobs, expired ones first, then results a client could still fetch — each logged as `evicted a result that had not yet expired`. |
+| at watermark + half the headroom (0.95) | New submits get `503` + `Retry-After: 5` before any bytes are written. |
 
-Only terminal jobs are ever evicted; evicting a `running` job would break a promise still in flight.
-
-**Do.** Grow the PVC. Lower `RESULT_TTL` if your clients fetch results promptly — 24h is the Azure
-contract, not a technical requirement. Lower `MAX_REQUEST_BYTES`/`MAX_RESULT_BYTES` if a few huge
-documents dominate. Shorten `GC_INTERVAL` so reclamation keeps up. If usage is high but the job
-table is small, suspect orphaned blobs — the sweeper reclaims those too (`reclaimed artifacts with
-no job row`), but only for ids whose files are all more than an hour old.
+**Do.** Grow the PVC. Lower `RESULT_TTL` if clients fetch promptly. Account for the queue: with
+`QUEUE_DEPTH=200`, up to 200 inputs per surface wait on the PVC. Split jobs also hold their parts
+and part results in `work/` while they run — roughly twice the input plus its result per job,
+briefly. A `work/` that keeps growing means folders outlive their jobs, which the sweeper removes
+after an hour.
 
 ### The pod is OOMKilled
 
-**Check.** The container's `lastState.terminated.reason`. Then `DI_MAX_INFLIGHT`,
-`READ_MAX_INFLIGHT` and `MAX_RESULT_BYTES` in `/_gw/config`. Then `resultBytes` on recent jobs.
+**Check.** `lastState.terminated.reason`; the sizes of recent inputs (`inputBytes`); the
+`gateway_split_fallback_total` and `gateway_job_parts` rates around the kill.
 
-**What it means.** The gateway is written so heap does not scale with document size: uploads stream
-straight to the PVC, upstream responses stream to a temp file, the served envelope is a range copy,
-and member lookup uses a 64 KB byte scanner rather than `encoding/json`'s tokenizer — the tokenizer
-version peaked at 309 MB for a 107 MB `content` string, and four concurrent workers on large scans
-were enough to OOM a pod. So an OOM now means one of:
+**What it means.** Results never land on the heap: uploads stream to the PVC, responses stream to
+temp files, the merge is a streaming rewrite. The one large consumer is **pdfcpu parsing a PDF**,
+about 2–3× the file's size, at most two at once. An OOM therefore almost always means two large
+PDFs were being split at the same time against a limit sized for small ones. A crash loop is
+possible: after an OOM, boot recovery re-runs the same jobs and splits the same PDFs again, until
+the worker-run limit (3) fails them.
 
-- **`MAX_INFLIGHT` too high for the memory limit.** Concurrency is the axis that costs memory.
-- **The limit is genuinely too small.** A few hundred MB is a reasonable floor; the manifest above
-  requests 256Mi and limits 1Gi.
-- **A crash loop amplified by recovery.** After an OOM, boot recovery re-runs everything that was
-  in flight, at full concurrency, immediately. If the original OOM was caused by that concurrency,
-  the pod OOMs again. `attempts >= 3` eventually breaks the loop by failing those jobs, but you
-  will want to lower `MAX_INFLIGHT` first and let it drain.
+**Do.** Size the memory limit for two of your largest PDFs (§8), or lower `MAX_REQUEST_BYTES` to
+what you actually need. `SPLIT_PAGES=0` stops splitting entirely as an emergency measure; documents
+then go whole, as before.
 
-**Do.** Lower `DI_MAX_INFLIGHT`/`READ_MAX_INFLIGHT` and raise `QUEUE_DEPTH` to keep throughput.
-Lower `MAX_RESULT_BYTES`. Raise the memory limit. Do not raise `MAX_INFLIGHT` to "get through the
-backlog" — that is the thing causing it.
+### Analyses fail at about 30 seconds, or at the per-attempt timeout
 
-### Synchronous calls fail at about 30 seconds
+**Check.** `grep reason=` in the attempt lines, and `gateway_upstream_retries_total` by reason.
 
-**Check.** The gateway's access log for that path. Does a `"request"` line exist at all, and what
-is its `durationMs`?
-
-**What it means.** If the gateway logged the request completing with `durationMs` well past 30000
-while the client reported a failure at almost exactly 30 seconds, the OpenShift Route's default
-HAProxy timeout closed the client's connection while the handler kept running. The gateway never
-sees the disconnect until it tries to write. This affects `POST …:syncAnalyze`,
-`POST /vision/v3.2/read/syncAnalyze`, large uploads, and large result streams.
-
-**Do.** Set `haproxy.router.openshift.io/timeout` on the Route to at least the largest of
-`DI_UPSTREAM_TIMEOUT` and `READ_SYNC_TIMEOUT` — see [§3](#the-30-second-route-timeout-against-calls-that-run-for-minutes).
-If there is another proxy in front (a corporate load balancer, an ingress controller, an nginx
-sidecar), it has its own idle timeout and needs the same treatment. If you cannot raise it, move
-those clients to the asynchronous `:analyze` path, which returns its `202` immediately and polls in
-short requests — that is what the gateway exists for.
+**What it means.**
+- `status_504` at almost exactly 30 s: the **Azure Route** still has HAProxy's default timeout.
+  Set `haproxy.router.openshift.io/timeout` above the attempt timeout (§3).
+- A client reports failure at 30 s while the gateway logs the request finishing much later: the
+  **gateway's own Route** timed out. Raise it, or move the client to `:analyze` (§3).
+- `timeout` at exactly `DI_UPSTREAM_TIMEOUT`: the analysis itself takes longer. Raise the timeout
+  (and the Route's with it) or let splitting cut it into small parts.
 
 ### Every analysis fails but the containers look healthy
 
-`/_gw/health` reporting `ok` only means each container's `/status` answered. It says nothing about
-whether analyses succeed.
+`/_gw/health` reporting `ok` only means each container's `/status` answered.
 
-**Check.** `curl -s :8080/_gw/jobs?limit=5 | jq '.jobs[] | {id,status,upstreamMode,error}'`. The
-`error` field holds the exact Azure-shaped error the client received. Then grep the logs for
-`analysis failed` and read `code` and `message`.
+**Check.** `curl -s :8080/_gw/jobs?limit=5 | jq '.jobs[] | {id,status,upstreamAttempts,upstreamParts,error}'`.
 
-**What it means**, by what you find in `error`/`message`:
-
-| Signal | Cause |
+| Signal in `error` / logs | Cause |
 |---|---|
-| `Unauthorized`, or an upstream 401 | Wrong or missing `DI_UPSTREAM_API_KEY`/`READ_UPSTREAM_API_KEY`. An empty key is legal and logs a startup warning, so check `warnings` on `/_gw/health`. |
-| `DI_SYNC_ANALYZE=force but the container does not serve …:syncAnalyze` | You forced a route this image build does not have. Set `DI_SYNC_ANALYZE=auto` or `off`. |
-| `upstream: response exceeds the configured maximum` | `MAX_RESULT_BYTES` is smaller than the container's real output. |
-| `…lost the operation: N consecutive polls reached a replica that had no record of it` | A degraded 202 whose owning container replica is gone. Router affinity failed or the replica was rescheduled. Reduce container replica churn, or raise the budget for that surface — `DI_BLIND_POLL_BUDGET` for a DI job, `READ_BLIND_POLL_BUDGET` for a Read one; the real fix is a build where `:syncAnalyze` works. |
-| `…did not complete the analysis within the configured timeout` | Raise `DI_UPSTREAM_TIMEOUT`/`READ_SYNC_TIMEOUT`, or fix the container's resourcing. |
-| `…container is unreachable` | Name resolution, NetworkPolicy, or the wrong port. The gateway deliberately does not put the upstream URL in the client-visible error; the transport error text is in the logs. |
-| `ModelNotFound` / an unknown-model error | `modelId` in the request, not a gateway setting. |
-| A per-page or content error with a plausible message | The container is doing its job and rejecting the input. Check size and dimensions: minimum 50×50 px, and a container billed against an F0 resource silently truncates every PDF to two pages. |
+| `The … container does not serve the synchronous analyze route.` | This build does not answer `:syncAnalyze` (404/405/501 or `UnhandledEndpointException`). Re-run the probe (§1); the build cannot run behind this gateway. |
+| `… (after 5 attempts)` | Every attempt failed transiently. The attempt lines' `reason` says how: 503s from HAProxy, resets, timeouts. |
+| `Unauthorized` / an upstream 401 | Wrong or missing `*_UPSTREAM_API_KEY`. |
+| `400 InvalidArgument` naming `features`, `queryFields`, `outputContentFormat` or `output` | The parameter policy (README, api-surface §0). Not a container failure. |
+| `upstream: response exceeds the configured maximum` | `MAX_RESULT_BYTES` is smaller than the real output. |
+| `ModelNotFound` | `modelId` in the request. |
+| a content error with a plausible message | The container is rejecting the input. If the document is split, the gateway re-checked the part's pages against the original before failing, so this is Azure's own answer about the original document. |
 
-Cross-check by calling the container directly from a debug pod with the probe script. If the probe
-fails the same way, the gateway is reporting the truth.
+### Large documents come back different from a whole analysis
+
+Page-level content (words, lines, tables and figures on a page, offsets, page numbers) is merged
+exactly. Document-level judgements — which heading Azure marks `title`, section nesting across a
+split point, page headers and footers, a table Azure joins across a page break — can differ. Run
+`gateway probe --compare-split` on the documents in question (§10) and see which pattern it is.
+`SPLIT_PAGES=0` restores whole-document analysis while a merge rule is written.
 
 ### The gateway will not start
 
-**Check.** `kubectl logs`. Startup failures print to stderr as `gateway: configuration is invalid:`
-followed by *every* problem found, not just the first.
-
-**What it means.**
+Startup failures print every problem found, not just the first.
 
 | Message | Cause |
 |---|---|
-| `DI_UPSTREAM_URL must be set` / `READ_UPSTREAM_URL must be set` | Missing, or set to an empty string, which counts as unset. |
-| `…must use http or https` / `…must include a host` | A bare hostname with no scheme is the usual culprit. |
-| `<VAR> is not a valid duration` | Missing unit. `24h`, not `24`. |
-| `PUBLIC_BASE_URL must be scheme and host only…` | You included a path. It shifts the segment positions `Azure.AI.FormRecognizer` counts backwards from, so it is refused rather than silently breaking clients. |
-| `ERROR_COMPAT must be observed or documented` / `DI_SYNC_ANALYZE must be auto, force or off` | Typo, including case — both are lowercased before comparison, so only the spelling can be wrong. |
-| `DISK_HIGH_WATERMARK must be in (0,1]` | It is a fraction, not a percentage. `90` is invalid; `0.90` is what you want. |
-| `store: DATA_DIR … is on a <fs> filesystem, where SQLite WAL mode is unsafe` | The PVC is NFS/CephFS/FUSE and so on. Use a block-backed volume, or `ALLOW_NETWORK_FS=true` at your own risk. |
-| `store: create data dir: … permission denied` | `fsGroup: 65532` is missing, or an SCC assigned a different uid. |
-| A bind failure on `ListenAndServe` | `GATEWAY_ADDR` port already in use. |
+| `at least one of DI_UPSTREAM_URL and READ_UPSTREAM_URL must be set` | Both empty. |
+| `…must use http or https` / `…must include a host` | A bare hostname without a scheme. |
+| `<VAR> is not a valid integer` / `is not a valid duration` | Including `SPLIT_PAGES=off` and `RESULT_TTL=24`. Numbers are never silently defaulted. |
+| `SPLIT_PAGES must not be negative`, `DISK_HIGH_WATERMARK must be in (0,1]` | It is a fraction, not a percentage. |
+| `PUBLIC_BASE_URL must be scheme and host only…` | You included a path. |
+| `store: DATA_DIR … is on a <fs> filesystem, where SQLite WAL mode is unsafe` | Use a block-backed volume. There is no override. |
+| `store: database schema vN is newer than this gateway (vM); deploy the newer image, or restore gateway.db.vM.bak` | An image rollback after a migration. See §9. |
+| `store: … migration …` | A migration failed and was rolled back; the database is unchanged. The message names the statement. |
+| `store: create data dir: … permission denied` | `fsGroup` is missing, or an SCC assigned a different uid. |
 
-Note the asymmetry: a bad *duration* is fatal, but a bad integer, float or boolean silently falls
-back to its default. If a numeric setting seems not to be taking effect, read it back from
-`/_gw/config` rather than trusting the ConfigMap.
+A removed setting is **not** in this table: it only warns.
 
 ---
 
-## 7. Capacity and sizing
-
-### What `MAX_INFLIGHT` actually bounds
-
-Each surface has its own pools, built in [`internal/jobs/manager.go`](../internal/jobs/manager.go):
-
-| Pool | Capacity | Held for |
-|---|---|---|
-| Admission (`admits`) | `MAX_INFLIGHT + QUEUE_DEPTH` | From accepting the request until the job reaches a terminal state. Exhausting it is what produces a `429`. |
-| Workers | `MAX_INFLIGHT` | Goroutines actually executing jobs. |
-| Container concurrency (`upstream`) | `MAX_INFLIGHT` | One call into the container. Shared by workers *and* client-facing synchronous passthroughs, so the container never sees more than `MAX_INFLIGHT` concurrent requests no matter how the queue is configured. |
-| Metadata lane | fixed 4, not configurable | `/info`, `/documentModels` proxying, each capped at 10s. Cheap calls that must not starve analysis or pile up against a wedged container. |
-
-What it does **not** bound: polls (unlimited, served from the local store), the `/_gw` endpoints,
-result-file GETs, or anything the container is doing internally. A slot is taken *before* the
-request body is read, because the body has to be written somewhere and that write is the work being
-admitted — hence `UPLOAD_TIMEOUT`, without which a handful of trickling uploads would hold every
-slot on a surface while the gateway looked perfectly healthy.
-
-### Size against the container, not the gateway
-
-The gateway is a static Go binary streaming bytes between a socket and a disk. The containers are
-the expensive part, and the numbers below come from Microsoft's own documentation, collected in
-[`api-surface.md` §9.4](api-surface.md):
-
-| Container | Resources |
-|---|---|
-| DI Layout | minimum **8 cores / 16 GB**, recommended **8 cores / 24 GB**, each core ≥ 2.6 GHz, x64 Linux only |
-| CV Read 3.2 | minimum 4 cores / 8 GB, recommended 8 cores / 16 GB, and the host **must support AVX2** — the container does not function correctly without it |
-
-Their published throughput benchmark is roughly one request per second on a 523 KB scanned business
-letter with 29 lines. Anything resembling a 50-page PDF is far outside that envelope; field reports
-put a 100-page PDF at 5–10 minutes as a single Layout call. Cold start is around 15 seconds per pod.
-
-So `DI_MAX_INFLIGHT=4` means "let four documents into a container sized for one at a time." That is
-often right — the container queues internally and pipelines — but if `upstreamMs` climbs linearly
-with concurrency, you are queueing, not parallelising, and lowering the number will not cost you
-throughput.
-
-### Why CPU-based autoscaling on the container is close to useless
-
-A single multi-page document pins all eight cores of a Layout container regardless of how many
-requests are waiting. CPU utilisation therefore saturates at one in-flight document and stays there,
-which means an HPA on CPU cannot distinguish "one document, comfortably handled" from "forty
-documents, badly backed up." It will scale at the wrong times and not at the right ones.
-
-Scale on the **gateway's** queue instead: `gateway_jobs_in_flight` relative to
-`gateway_jobs_capacity`, and `gateway_jobs_queued` when `QUEUE_DEPTH > 0`. That is a direct measure
-of demand the containers have not absorbed.
-
-Two caveats before you scale the containers out. These are 8-core / 16–24 GB pods, so a 16-core /
-64 GB node fits two or three — horizontal scale is coarse and expensive. And scale-to-zero is not
-viable with a ~15 second cold start. Note also that adding container replicas makes the *degraded*
-DI path (`upstreamMode: degraded-202`) more fragile, because it depends on router affinity landing
-each poll back on the replica that minted the operation; on the `sync` path, which is stateless,
-more replicas are pure gain.
-
-The gateway itself does not scale horizontally at all. See
-[One replica, `Recreate`](#one-replica-recreate).
-
----
-
-## 8. Data
+## 7. Data
 
 ### What is on the PVC
 
 ```
 ${DATA_DIR}/
-  gateway.db            SQLite, one table `jobs`, three indexes
-  gateway.db-wal        WAL — present while the database is open
-  gateway.db-shm        shared-memory index for the WAL
+  gateway.db              SQLite, one table `jobs`, three indexes; schema version in PRAGMA user_version
+  gateway.db-wal          WAL — present while the database is open
+  gateway.db-shm          shared-memory index for the WAL
+  gateway.db.v<N>.bak     the copy taken before the last migration from version N (§9)
   blobs/
-    di-sync.tmp-*       an upstream response being downloaded; swept once older than an hour
-    read-sync.tmp-*     (and di-poll, read-poll, sync-poll, di-artifact)
-    <aa>/<bb>/          two-level shard, from the first four characters of the job id
-      <id>.in           the submitted document, deleted the moment the job succeeds or fails
-      <id>.res          the exact response envelope a successful poll will stream, byte for byte
-      <id>.pdf          the searchable PDF, only when the submit asked for output=pdf
-      <id>.fig-<figId>  one cropped figure, only when the submit asked for output=figures
-      <id>.<kind>.tmp-* a write in progress; swept once older than an hour
+    *.tmp-*               upstream responses being downloaded; swept once older than an hour
+    <aa>/<bb>/            two-level shard, from the first four characters of the job id
+      <id>.in             the submitted document, deleted the moment the job succeeds or fails
+      <id>.res            the exact response envelope a successful poll will stream
+      <id>.pdf, .fig-*    legacy only: files older builds captured; removed with their job
+  work/
+    <id>/                 a running job: decoded input, part PDFs, part results, merged.json
+    sync-<id>/            a client :syncAnalyze in flight: its saved body
 ```
 
-Note the two levels of temp file. A job's own blobs go through `BlobStore.Create`, which writes
-into that job's shard directory so the temp file and its final name share a directory. The upstream
-scratch files have no job id to shard on — they are downloading a response before anything is known
-about it — so `upstream.tempFile` writes them straight into the blob root. `SweepTemp` walks the
-whole blob tree, so both are reclaimed.
-
-Every blob write is atomic: temp file in the destination directory, `fsync`, `rename`, then
-`fsync` of the directory. A reader never sees a partial file, and a crash mid-write leaves at most
-a temp file. The database runs `journal_mode=WAL` with `synchronous=FULL` on its single writer
-connection, because the client-facing `202` is a durability promise and WAL with
-`synchronous=NORMAL` can roll a committed transaction back after node power loss.
+Every blob write is atomic: temp file in the destination directory, `fsync`, `rename`, `fsync` of
+the directory. The database runs `journal_mode=WAL` with `synchronous=FULL` on its single writer.
+A work folder is deleted when its job finishes; the sweeper removes any left by a crash once they
+are an hour old.
 
 ### How big it gets
 
-Steady-state size is roughly:
+> (submissions per TTL window × average result size)
+> \+ (queued and running jobs × average input size)
+> \+ (running split jobs × roughly twice their input, briefly)
 
-> (submissions per TTL window × average input size, until each job completes)
-> \+ (results per TTL window × average result size)
-> \+ any requested PDFs and figures
-
-The input is deleted as soon as the job is terminal, so inputs only occupy space for the duration
-of an analysis. Results live for the whole `RESULT_TTL` (24h by default). Result sizes are the
-surprise: Azure permits a Document Intelligence JSON response up to 500 MB, and the gateway's own
-ceiling is `MAX_RESULT_BYTES` (512 MB). A hundred large layout analyses a day is tens of gigabytes
-of retained JSON. Size the PVC in tens of gigabytes, not hundreds of megabytes, and watch
-`gateway_volume_used_ratio`.
+The input is deleted as soon as the job is terminal; results live for `RESULT_TTL`. Azure permits a
+Document Intelligence result up to 500 MB, and the gateway's ceiling is `MAX_RESULT_BYTES`
+(512 MiB). Size the PVC in tens of gigabytes and watch `gateway_volume_used_ratio`.
 
 ### What happens at TTL expiry
 
-Two independent mechanisms, deliberately:
-
-- **The poll checks first.** Any GET on an operation whose `expires_at` has passed returns `404`
-  immediately, whether or not the row still exists. Clients see exactly the Azure behaviour.
+- **The poll checks first.** Any GET on an operation past `expires_at` returns `404` immediately.
 - **The sweeper deletes.** Every `GC_INTERVAL`, up to 512 expired jobs are removed — the row first,
-  then the blobs. Row-first is intentional: a partial blob deletion then leaks files (which a later
-  orphan sweep reclaims) instead of stranding a row that points at a result which no longer exists,
-  which would produce a body with no top-level `status` and crash Java clients outright.
-
-An expired `running` job is not swept while its lease is still live, so a worker can never be
-writing a result into a store with no row to reference it. Once `lease_until` has passed the
-sweeper deletes it outright — `store.Expired` selects expired rows that are terminal, `notStarted`,
-or `running` with a lapsed lease. Recovery does not rescue it first: `store.Abandoned` and
-`store.Orphaned` both require `expires_at >= now`, so a job past its TTL is never reclaimed by
-either pass.
+  then the blobs, so a partial failure leaks a file rather than stranding a row that points at a
+  missing result. An expired `running` job is not swept while its lease is live.
 
 ### What a restart does to in-flight work
 
-The graceful path, on `SIGTERM` or `SIGINT`:
+The graceful path, on `SIGTERM`:
 
-1. The signal only *triggers* the drain. Requests and workers run under a separate context that
-   outlives it, so in-flight handlers are not cancelled the instant the signal lands.
-2. `srv.Shutdown` stops accepting connections and lets in-flight handlers finish — synchronous
-   passthroughs matter most here, because a client is holding that connection.
-3. `manager.Drain` then waits for background jobs. Steps 2 and 3 **share one `SHUTDOWN_GRACE`
-   budget**; anything still running when it expires is logged as
-   `shutdown grace expired with jobs still running; they will be reclaimed on the next start`.
-4. Workers are cancelled. A job interrupted this way is **not** marked failed — its `202` was
-   already promised, so it is left in the store as `running` for the next process.
+1. The signal only *triggers* the drain; requests and workers run under a context that outlives it.
+2. `srv.Shutdown` stops accepting connections and lets in-flight handlers finish — client
+   `:syncAnalyze` calls matter most, because a client is holding the connection.
+3. `manager.Drain` waits for background jobs. Steps 2 and 3 **share one `SHUTDOWN_GRACE`**.
+4. Workers are cancelled. Every part attempt and backoff in progress is cancelled with them. A job
+   interrupted this way is **not** marked failed — it is left `running` for the next process.
 
-On the next boot, before the listener opens:
+On the next boot, after the schema check and before the listener opens:
 
-- `notStarted` and `running` rows are scanned **ignoring leases** — a crashed process leaves
-  `lease_until` minutes in the future, so filtering on it would skip exactly the jobs that need
-  rescuing. This is single-pod-only reasoning; see [§2](#one-replica-recreate).
-- Rows past their TTL are excluded. After an outage longer than `RESULT_TTL`, nothing is re-run,
-  because the results would carry ids that already 404.
-- A job whose input blob is gone fails with "The analysis was interrupted and could not be
-  resumed." A job at `attempts >= 3` fails with "…interrupted repeatedly and could not be
-  completed." Everything else is requeued and **waits** for an admission slot rather than being
-  429'd — a 429 is a refusal to make a promise, and these promises were already made.
-- Recovery runs before the listener opens, deliberately: running it alongside live traffic once let
-  the scan pick up a row a submit had just committed and not yet enqueued, and the same analysis
-  ran twice against the container.
+- unfinished rows are scanned **ignoring leases** and re-run **from their stored input**. Part
+  progress is not kept: parts take seconds, so a split job simply splits again;
+- rows past their TTL are excluded;
+- a job whose input is gone, or which has used 3 worker runs, fails with an Azure-shaped error;
+- everything else **waits** for an admission slot rather than being 429'd — a 429 is a refusal to
+  make a promise, and these promises were already made.
 
-A client polling across all of this sees `running`, then eventually a terminal state. It never sees
-a 404 and never sees an error it must interpret. That is the entire point of the gateway.
+A client polling across all of this sees `running`, then a terminal state. A client in the middle
+of a `:syncAnalyze` sees its connection close, exactly as it would with a real pod, and retries.
+
+---
+
+## 8. Capacity and sizing
+
+### What the limits bound
+
+| Pool | Capacity | Held for |
+|---|---|---|
+| Admission | `MAX_INFLIGHT + QUEUE_DEPTH` per surface | From accepting a submit (or a client `:syncAnalyze`) until it is terminal. Exhausting it produces a `429`. |
+| Workers | `MAX_INFLIGHT` per surface | Jobs actually running. |
+| Scheduler slots | `MAX_INFLIGHT` per surface | One call to the Azure pods — whole document, part, hedge or re-check — including the backoff before its retry. Shared fairly between jobs: waiting jobs take turns, round-robin. |
+| Split slots | 2, both surfaces together | Parsing and cutting one PDF. |
+| Metadata lane | 4 per surface | One GET relay, 10 s at most. |
+
+### Sizing `MAX_INFLIGHT` and `QUEUE_DEPTH`
+
+**`*_MAX_INFLIGHT = max Azure pods × per-pod concurrency`**: with the deployment autoscaling to 8
+pods that each take 2 analyses at once, **16**. That keeps every pod busy at full scale. When the
+deployment is scaled in, the extra calls queue in HAProxy at the per-pod cap and come back as 503s,
+which the gateway retries while holding the slot — so a gateway sized for 8 pods slows itself down
+to what 2 pods can take, without configuration.
+
+Do not size it far above that: calls beyond what the pods can take only wait in HAProxy, then
+fail and back off. Do not size it far below either: with splitting, one job can use every slot,
+and the hedges that rescue hung parts only ever use idle slots.
+
+**`QUEUE_DEPTH`** absorbs bursts. Each queued job is an input file on the PVC and nothing else, so
+a large value (e.g. `200`) is cheap; it is what makes the gateway's 429 — the one place it behaves
+unlike a real pod — rare.
+
+### Memory for two concurrent splits
+
+The gateway's own heap is small and does not grow with result size. Splitting adds one consumer:
+pdfcpu holds about **2–3× a PDF's size** while parsing it, and up to **2** PDFs are parsed at once.
+So:
+
+> memory limit ≈ 512 MiB + 2 × 3 × (largest PDF you expect to split)
+
+| Largest PDF | Limit |
+|---|---|
+| 50 MB | 1 GiB |
+| 200 MB | 2 GiB |
+| 500 MB (`MAX_REQUEST_BYTES` default) | 4 GiB |
+
+If that is more than you can give, lower `MAX_REQUEST_BYTES` to what your documents need. The
+60-second split budget bounds the time a parse may take, not its memory.
+
+### The Azure pods
+
+The containers are the expensive part. From Microsoft's documentation
+([`api-surface.md` §9.4](api-surface.md)):
+
+| Container | Resources |
+|---|---|
+| DI Layout | minimum **8 cores / 16 GB**, recommended **8 cores / 24 GB**, x64 Linux only |
+| CV Read 3.2 | minimum 4 cores / 8 GB, recommended 8 cores / 16 GB; the host **must support AVX2** |
+
+A 3–5 page part takes about 2 seconds on a healthy Layout pod; a 100-page PDF as one call takes
+minutes. That difference is the point of splitting: 8 pods each analysing a few pages beat one pod
+analysing the whole document while seven sit idle.
+
+Scale the Azure deployment on demand the gateway can see: `gateway_upstream_slots{state="waiting"}`
+and `gateway_jobs_queued`. CPU is a poor signal, because one multi-page document pins all of a
+Layout pod's cores regardless of how much is waiting.
+
+The gateway itself does not scale horizontally. See [One replica, `Recreate`](#one-replica-recreate).
+
+---
+
+## 9. Schema migrations and rollback
+
+The job store is versioned. Each binary carries numbered migrations
+(`internal/store/migrations/NNNN_name.sql`); the database records its version in
+`PRAGMA user_version`. The sync-only release ships **migration 0002**, which drops four dead
+columns and adds `upstream_attempts` and `upstream_parts`. ARCHITECTURE §5 has the mechanism.
+
+### Upgrading
+
+Nothing to do but deploy. On the first start of a new image, before the listener opens:
+
+1. If the database is already at the image's version: nothing, one read.
+2. Otherwise the gateway copies the database to `${DATA_DIR}/gateway.db.v<N>.bak` (`N` = the
+   version it found; a database from before versioning counts as version 1), replacing any older
+   backup.
+3. It applies every pending migration in one transaction. Any failure rolls back and stops the
+   gateway with the database unchanged; a pod killed mid-migration leaves it unchanged too, and the
+   next start tries again.
+4. It logs one line, `job store schema migrated`, with `from`, `to`, `backup`, `legacy` (a
+   database from before versioning) and `took`:
+
+   ```
+   {"level":"INFO","msg":"job store schema migrated","from":1,"to":2,"backup":"/data/gateway.db.v1.bak","legacy":true,"took":"180ms"}
+   ```
+
+   An ordinary restart logs `job store schema is current` with the `version` instead.
+
+The migration takes seconds (the table holds at most a day of rows), but the startup probe should
+allow minutes. Leave enough free space on the PVC for one copy of `gateway.db`.
+
+### Rolling back
+
+**To an image that knows migrations** (this release or later): it refuses to start on a newer
+schema, with a message naming the backup to restore —
+`database schema v2 is newer than this gateway (v1); deploy the newer image, or restore gateway.db.v1.bak`.
+Either roll forward again, or restore (below).
+
+**To an image from before versioning** (anything older than this release, including Wega's
+`0f9c794`): it does **not** check the schema version. On a version-2 database it would start, and
+then every query naming a dropped column would fail. **Always restore the backup before deploying
+such an image.**
+
+### Restoring the backup
+
+The image has no shell, and the volume is RWO, so the restore runs in a one-off pod while the
+gateway is stopped:
+
+1. **Stop the gateway:** `oc scale deploy/azure-gateway-api --replicas=0`, and wait until its pod
+   is gone.
+2. **Mount the PVC in a debug pod** with a shell (any UBI or busybox image, running as a uid that
+   can write the volume) and, in `/data`:
+   1. **delete `gateway.db-wal` and `gateway.db-shm`**: they belong to the newer database, and
+      SQLite would otherwise try to apply that WAL to the restored file;
+   2. **copy `gateway.db.v<N>.bak` over `gateway.db`** (`cp gateway.db.v1.bak gateway.db`). Keep the
+      `.bak` until the old image is confirmed running.
+3. Delete the debug pod, set the older image, and scale back to 1.
+
+What a restore costs: every job accepted **after** the backup was taken is gone from the database.
+Clients polling those ids get `404`; their blobs become orphans the sweeper removes after an hour.
+Jobs in the backup that were unfinished are re-run on boot. Prefer rolling forward when the reason
+for the rollback allows it.
+
+**Rule for future changes:** every schema change is a new migration file, pinned by sha256 in
+`TestReleasedMigrationsAreUnchanged`. A released migration file is never edited.
+
+---
+
+## 10. Go-live gates
+
+All of these must pass on the real deployment, in this order, before production traffic.
+
+1. **The sync route answers.** `gateway probe` with `PROBE_DOCUMENT` set to a representative
+   multi-page PDF reports `:syncAnalyze` **200** on every configured surface (§1). An earlier
+   probed DI build listed the route in its swagger and never answered it.
+2. **Golden responses are recorded and the parity test passes.**
+   `gateway probe --record <dir>` runs a fixed case list against the real containers —
+   `:analyze` + poll and `:syncAnalyze` on the same real document; an unknown result id; a missing
+   or invalid `api-version`; an unsupported `Content-Type`; a wrong verb and an unknown path;
+   `HEAD` and `DELETE` on a result; the metadata and passthrough GETs; the per-parameter
+   comparisons; the same for Read — and writes one JSON file per case: the request (method, path
+   template, query, `Content-Type`), the status, every response header except `Date`, and the
+   body, with GUIDs masked as `<guid>` and timestamps as `<datetime:…>` keeping their format.
+   Commit the files under `test/conformance/testdata/golden/<surface>/<image-tag>/`; the parity
+   test replays every case against the gateway and compares status, header names and shapes, and
+   body keys, order and types. Only the operator's network reaches the containers, so the operator
+   records them.
+3. **Split results match whole results.** `gateway probe --compare-split <folder>` on a
+   representative corpus — **at least 30 PDFs** across your document types. For each PDF it
+   analyses the document whole through the container's `:syncAnalyze`, then split, through the
+   gateway's own planner, splitter, part calls and merge code (linked into the probe), and diffs
+   the two JSONs field by field. It writes `<folder>/compare-report.json` and prints a summary
+   grouped by path pattern (e.g. `paragraphs[*].role: 3 differences`), each labelled
+   **page-level** (anything under `pages[]`, page-local bounding regions, figures, table cells) or
+   **document-level** (paragraph roles, `sections`, the table count, `styles`, `content` at part
+   boundaries). It exits non-zero on any page-level difference. The gate:
+   - **zero page-level differences**;
+   - every **document-level** pattern either has a merge rule that reproduces Azure's
+     whole-document answer, with a regression test built from that document, or is explicitly
+     accepted by the user.
+4. **The Route annotations are in place** on every Azure Route (§3), and the Azure pods'
+   `terminationGracePeriodSeconds` covers the slowest analysis.
+5. **The real SDKs pass.** `make sdk-test` against the deployed gateway, including the large-PDF
+   flows.
+
+Rerun gates 1–3 after any Azure image upgrade. A new image tag gets its own golden directory.
 
 ---
 
@@ -1008,7 +964,7 @@ a 404 and never sees an error it must interpret. That is the entire point of the
 | [`../README.md`](../README.md) | What this is, and the shortest path to running it |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | How it works internally, before you change it |
 | [`CONTAINER-BEHAVIOUR.md`](CONTAINER-BEHAVIOUR.md) | What the containers really do versus what they document |
-| [`TESTING.md`](TESTING.md) | Test strategy, and how to verify a change |
+| [`TESTING.md`](TESTING.md) | Test strategy, the local end-to-end script, and how to verify a change |
 | [`HANDOFF.md`](HANDOFF.md) | Current state, what is unfinished, how to pick this up |
-| [`api-surface.md`](api-surface.md) | The container contract reference, with citations |
-| [design spec](superpowers/specs/2026-09-08-azure-gateway-api-design.md) | The approved design, every review finding, and what probing real containers changed |
+| [`api-surface.md`](api-surface.md) | What the gateway serves, and the container contract reference |
+| [sync-only upstream design](superpowers/specs/2026-10-10-sync-only-upstream-design.md) · [splitting design](superpowers/specs/2026-10-10-large-document-splitting-design.md) | The approved designs |
