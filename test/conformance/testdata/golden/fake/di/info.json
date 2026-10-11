@@ -1,0 +1,22 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/documentintelligence/info",
+    "query": "api-version=2024-11-30",
+    "contentType": ""
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Length": "50",
+      "Content-Type": "application/json; charset=utf-8",
+      "Server": "Kestrel"
+    },
+    "body": {
+      "customDocumentModels": {
+        "count": 0,
+        "limit": 20000
+      }
+    }
+  }
+}

@@ -1,0 +1,93 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/vision/v3.2/read/analyzeResults/<guid>",
+    "query": "",
+    "contentType": ""
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Length": "563",
+      "Content-Type": "application/json; charset=utf-8",
+      "Server": "Kestrel"
+    },
+    "body": {
+      "status": "succeeded",
+      "createdDateTime": "<datetime:2006-01-02T15:04:05Z>",
+      "lastUpdatedDateTime": "<datetime:2006-01-02T15:04:05Z>",
+      "analyzeResult": {
+        "version": "3.2.0",
+        "modelVersion": "2022-04-30",
+        "readResults": [
+          {
+            "page": 1,
+            "angle": 0,
+            "width": 601,
+            "height": 800,
+            "unit": "pixel",
+            "lines": [
+              {
+                "boundingBox": [
+                  11,
+                  21,
+                  361,
+                  21,
+                  361,
+                  51,
+                  11,
+                  51
+                ],
+                "text": "Read line 1",
+                "words": [
+                  {
+                    "boundingBox": [
+                      11,
+                      21,
+                      111,
+                      21,
+                      111,
+                      51,
+                      11,
+                      51
+                    ],
+                    "text": "Read",
+                    "confidence": 0.99
+                  },
+                  {
+                    "boundingBox": [
+                      131,
+                      21,
+                      231,
+                      21,
+                      231,
+                      51,
+                      131,
+                      51
+                    ],
+                    "text": "line",
+                    "confidence": 0.99
+                  },
+                  {
+                    "boundingBox": [
+                      251,
+                      21,
+                      351,
+                      21,
+                      351,
+                      51,
+                      251,
+                      51
+                    ],
+                    "text": "1",
+                    "confidence": 0.99
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

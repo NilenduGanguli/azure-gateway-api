@@ -1,0 +1,19 @@
+{
+  "request": {
+    "method": "POST",
+    "path": "/vision/v3.2/read/analyze",
+    "query": "",
+    "contentType": "text/plain",
+    "document": "junk"
+  },
+  "response": {
+    "status": 202,
+    "headers": {
+      "Content-Length": "0",
+      "Operation-Location": "<base>/vision/v3.2/read/analyzeResults/<guid>",
+      "Retry-After": "1",
+      "Server": "Kestrel"
+    },
+    "body": ""
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "request": {
+    "method": "POST",
+    "path": "/documentintelligence/documentModels/prebuilt-layout:analyze",
+    "query": "api-version=2024-11-30",
+    "contentType": "text/plain",
+    "document": "junk"
+  },
+  "response": {
+    "status": 202,
+    "headers": {
+      "Content-Length": "0",
+      "Operation-Location": "<base>/documentintelligence/documentModels/prebuilt-layout/analyzeResults/<guid>",
+      "Retry-After": "1",
+      "Server": "Kestrel"
+    },
+    "body": ""
+  }
+}

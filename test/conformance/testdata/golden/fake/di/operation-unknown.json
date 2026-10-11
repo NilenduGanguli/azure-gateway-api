@@ -1,0 +1,26 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/documentintelligence/operations/<guid>",
+    "query": "api-version=2024-11-30",
+    "contentType": ""
+  },
+  "response": {
+    "status": 404,
+    "headers": {
+      "Content-Length": "208",
+      "Content-Type": "application/json; charset=utf-8",
+      "Server": "Kestrel"
+    },
+    "body": {
+      "error": {
+        "code": "NotFound",
+        "message": "Resource not found.",
+        "innererror": {
+          "code": "OperationNotFound",
+          "message": "The requested operation wasn't found. The identifier is invalid or the operation is expired."
+        }
+      }
+    }
+  }
+}

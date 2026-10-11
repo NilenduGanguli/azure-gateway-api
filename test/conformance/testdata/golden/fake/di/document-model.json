@@ -1,0 +1,21 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/documentintelligence/documentModels/prebuilt-layout",
+    "query": "api-version=2024-11-30",
+    "contentType": ""
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Length": "93",
+      "Content-Type": "application/json; charset=utf-8",
+      "Server": "Kestrel"
+    },
+    "body": {
+      "apiVersion": "2024-11-30",
+      "description": "Prebuilt layout model",
+      "modelId": "prebuilt-layout"
+    }
+  }
+}

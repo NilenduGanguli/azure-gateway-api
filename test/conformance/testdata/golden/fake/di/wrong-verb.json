@@ -1,0 +1,17 @@
+{
+  "request": {
+    "method": "PUT",
+    "path": "/documentintelligence/documentModels/prebuilt-layout:analyze",
+    "query": "api-version=2024-11-30",
+    "contentType": ""
+  },
+  "response": {
+    "status": 405,
+    "headers": {
+      "Allow": "GET, HEAD, POST",
+      "Content-Length": "0",
+      "Server": "Kestrel"
+    },
+    "body": ""
+  }
+}

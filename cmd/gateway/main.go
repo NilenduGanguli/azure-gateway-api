@@ -4,8 +4,10 @@
 //
 // Subcommands:
 //
-//	gateway serve   run the gateway (default)
-//	gateway probe   interrogate the configured containers and report what they actually serve
+//	gateway serve                        run the gateway (default)
+//	gateway probe                        report whether each configured container can run behind it
+//	gateway probe --record DIR           record the containers' golden responses into DIR
+//	gateway probe --compare-split DIR    compare whole and split analysis of the PDFs in DIR
 package main
 
 import (
@@ -18,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -49,10 +52,7 @@ func main() {
 			os.Exit(1)
 		}
 	case "probe":
-		if err := runProbe(); err != nil {
-			fmt.Fprintf(os.Stderr, "gateway probe: %v\n", err)
-			os.Exit(1)
-		}
+		os.Exit(runProbe(os.Args[2:]))
 	case "version", "-v", "--version":
 		fmt.Printf("azure-gateway-api %s (%s, built %s, %s)\n", version, commit, built, runtime.Version())
 	case "help", "-h", "--help":
@@ -66,11 +66,14 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `azure-gateway-api
 
-  gateway serve     run the gateway (default)
-  gateway probe     interrogate the configured containers and report what they serve
-  gateway version   print build information
+  gateway serve                       run the gateway (default)
+  gateway probe                       report whether each configured container can run behind it
+  gateway probe --record DIR          record the containers' golden responses into DIR
+  gateway probe --compare-split DIR   compare whole and split analysis of the PDFs in DIR
+  gateway version                     print build information
 
-Configuration is read from the environment; see README.md.
+Configuration is read from the environment; see README.md. The probe also reads PROBE_DOCUMENT
+(the file its analyze calls send) and PROBE_TIMEOUT (one call's timeout, default 10m).
 `)
 }
 
@@ -218,12 +221,21 @@ func logMigration(log *slog.Logger, m store.MigrationReport) {
 		"legacy", m.Legacy, "took", m.Took.String())
 }
 
-func runProbe() error {
+// runProbe runs `gateway probe` and returns the process's exit status.
+func runProbe(args []string) int {
 	cfg, err := config.Load()
 	if err != nil {
-		return fmt.Errorf("configuration is invalid:\n%w", err)
+		fmt.Fprintf(os.Stderr, "gateway probe: configuration is invalid:\n%v\n", err)
+		return 1
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-	return probe.Run(ctx, cfg, os.Stdout)
+	// No overall deadline: PROBE_TIMEOUT bounds each call, and a corpus for --compare-split can
+	// take hours. An interrupt stops the run.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	code, err := probe.Command(ctx, cfg, args, os.Getenv, os.Stdout)
+	if err != nil {
+		// The package names itself in its errors already.
+		fmt.Fprintf(os.Stderr, "gateway probe: %s\n", strings.TrimPrefix(err.Error(), "probe: "))
+	}
+	return code
 }

@@ -1,0 +1,19 @@
+{
+  "syncEqualsAsync": {
+    "verdict": "equal"
+  },
+  "parameters": [
+    {
+      "query": "features=ocrHighResolution",
+      "verdict": "honoured"
+    },
+    {
+      "query": "queryFields=Total",
+      "verdict": "honoured"
+    },
+    {
+      "query": "outputContentFormat=markdown",
+      "verdict": "honoured"
+    }
+  ]
+}

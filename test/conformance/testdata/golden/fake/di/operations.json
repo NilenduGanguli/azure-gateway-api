@@ -1,0 +1,19 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/documentintelligence/operations",
+    "query": "api-version=2024-11-30",
+    "contentType": ""
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Length": "12",
+      "Content-Type": "application/json; charset=utf-8",
+      "Server": "Kestrel"
+    },
+    "body": {
+      "value": []
+    }
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "syncEqualsAsync": {
+    "verdict": "equal"
+  },
+  "parameters": [
+    {
+      "query": "language=en",
+      "verdict": "honoured"
+    },
+    {
+      "query": "pages=1",
+      "verdict": "honoured"
+    },
+    {
+      "query": "readingOrder=natural",
+      "verdict": "honoured"
+    },
+    {
+      "query": "model-version=latest",
+      "verdict": "honoured"
+    }
+  ]
+}

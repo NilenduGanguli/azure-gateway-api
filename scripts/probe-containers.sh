@@ -1,24 +1,29 @@
 #!/bin/sh
-# probe-containers.sh — interrogate the two Azure containers and print a short report.
+# probe-containers.sh — interrogate the configured Azure containers and print a short report.
 #
-# The gateway has to be indistinguishable from these containers, and the containers do not always
-# match their own documentation. This asks yours what they actually do, so the gateway is built
-# against observed behaviour rather than inference.
+# The gateway is sync-only: every analysis it makes is one call to a container's synchronous
+# route, with no asynchronous fallback. A build that does not answer that route cannot run behind
+# it at all, and Document Intelligence's :syncAnalyze is undocumented: some builds serve it, some
+# 404 it, and one probed build declared it in its swagger and never answered. This asks yours.
 #
-# It answers, in order of how much they change the design:
-#   - does this build serve POST .../{modelId}:syncAnalyze, and how slow is it cold
+# It answers, in order of how much they matter:
+#   - does each build answer its synchronous route (the verdict: READY or CANNOT RUN)
 #   - what error shape does each surface really emit — wrapped {"error":{...}} or flat {"code":...}
 #   - the exact Operation-Location format, and whether Retry-After is present
 #   - which routes the swagger actually declares
 #
-# Only curl is required. It sends a blank 200x120 white PNG, never a document of yours; it prints
-# no API key and writes nothing outside a temp directory.
+# Only curl is required. Only the surfaces whose URL is set are probed. It sends a blank 200x120
+# white PNG unless PROBE_DOCUMENT names a document; it never prints an API key (and masks any
+# credentials in a URL) and writes nothing outside a temp directory. `gateway probe` does the same
+# in Go, with the per-parameter checks, --record and --compare-split besides.
 #
 # Usage:
 #   DI_UPSTREAM_URL=http://layout:5000 READ_UPSTREAM_URL=http://ocr:5000 ./probe-containers.sh
 #
 # Optional:
 #   DI_UPSTREAM_API_KEY, READ_UPSTREAM_API_KEY   sent as Ocp-Apim-Subscription-Key
+#   PROBE_DOCUMENT     a document to send instead of the blank PNG: use a representative
+#                      multi-page PDF, which proves the route answers your documents in time
 #   API_VERSION        (default 2024-11-30)
 #   MODEL_ID           (default prebuilt-layout)
 #   POLL_SECONDS       (default 90)  how long to wait for an async round trip
@@ -26,6 +31,8 @@
 #   REQ_MAX_SECONDS    (default 30)  per-request ceiling for everything else
 #
 # Cost: roughly ten analyses per container, billed like any other query.
+#
+# Exit status: 0 when every probed surface is READY, 1 when one is not, 3 when none answered.
 
 set -u
 
@@ -36,6 +43,7 @@ SYNC_MAX_SECONDS="${SYNC_MAX_SECONDS:-300}"
 REQ_MAX_SECONDS="${REQ_MAX_SECONDS:-30}"
 ZERO_GUID="00000000-0000-0000-0000-000000000000"
 
+PROBE_DOCUMENT="${PROBE_DOCUMENT:-}"
 DI_UPSTREAM_URL="${DI_UPSTREAM_URL:-}"
 READ_UPSTREAM_URL="${READ_UPSTREAM_URL:-}"
 DI_UPSTREAM_API_KEY="${DI_UPSTREAM_API_KEY:-}"
@@ -70,6 +78,24 @@ else
 fi
 printf 'not a document' >"$TMP/junk.txt"
 
+# The document every analyze sends, and its Content-Type.
+DOC="$TMP/probe.png"; DOC_CT=image/png
+if [ -n "$PROBE_DOCUMENT" ]; then
+  if [ ! -r "$PROBE_DOCUMENT" ]; then
+    echo "PROBE_DOCUMENT is not a readable file: $PROBE_DOCUMENT" >&2
+    exit 2
+  fi
+  DOC=$PROBE_DOCUMENT
+  case "$PROBE_DOCUMENT" in
+    *.[Pp][Dd][Ff])               DOC_CT=application/pdf ;;
+    *.[Pp][Nn][Gg])               DOC_CT=image/png ;;
+    *.[Jj][Pp][Gg]|*.[Jj][Pp][Ee][Gg]) DOC_CT=image/jpeg ;;
+    *.[Tt][Ii][Ff]|*.[Tt][Ii][Ff][Ff]) DOC_CT=image/tiff ;;
+    *.[Bb][Mm][Pp])               DOC_CT=image/bmp ;;
+    *)                            DOC_CT=application/octet-stream ;;
+  esac
+fi
+
 # ---------------------------------------------------------------- output helpers
 # Everything is kept inside 78 columns so a screenshot stays readable.
 
@@ -96,6 +122,14 @@ body() {
 }
 
 pathonly() { printf '%s' "$1" | sed -e 's|^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*||'; }
+
+# safeurl masks credentials an operator may carry in a URL's userinfo, so nothing secret is
+# printed: the API keys never are, and neither is a password in DI_UPSTREAM_URL.
+safeurl() { printf '%s' "$1" | sed -e 's|^\([a-zA-Z][a-zA-Z0-9+.-]*://\)[^/@]*@|\1***@|'; }
+
+# unhandled reports whether the last body is the UnhandledEndpointException older DI builds
+# answer an unserved route with, as opposed to a 500 from a route that exists.
+unhandled() { grep -q 'UnhandledEndpointException' "$TMP/b" 2>/dev/null; }
 
 jget() {
   tr -d '\r\n' <"$1" 2>/dev/null |
@@ -179,7 +213,7 @@ probe_di() {
   q="api-version=$API_VERSION"
   dm="$base/documentintelligence/documentModels"
 
-  hr; printf 'DOCUMENT INTELLIGENCE   %s\n' "$base"; hr
+  hr; printf 'DOCUMENT INTELLIGENCE   %s\n' "$(safeurl "$base")"; hr
 
   st=$(req GET "$base/status" "$key")
   row GET "/status" "$st" "apiStatus=$(jget "$TMP/b" apiStatus)"
@@ -209,7 +243,7 @@ probe_di() {
 
   # The decisive question, given its own ceiling. A cold container can spend minutes loading a
   # model on the first request, and a timeout is not the same answer as a 404.
-  st=$(req POST "$dm/$MODEL_ID:syncAnalyze?$q" "$key" image/png "$TMP/probe.png" "$SYNC_MAX_SECONDS")
+  st=$(req POST "$dm/$MODEL_ID:syncAnalyze?$q" "$key" "$DOC_CT" "$DOC" "$SYNC_MAX_SECONDS")
   row POST ":syncAnalyze" "$st" ""
   case "$st" in
     200)
@@ -222,16 +256,18 @@ probe_di() {
       note "$DI_SHAPE"; body "$TMP/b" ;;
     202) DI_SYNC="DEGRADES TO 202"
          note "Operation-Location: $(pathonly "$(hdr "$TMP/h" operation-location)")" ;;
-    404) DI_SYNC="ABSENT (404)"; body "$TMP/b" ;;
-    500) DI_SYNC="ABSENT (500)"; body "$TMP/b" ;;
+    404|405|501) DI_SYNC="ABSENT ($st)"; body "$TMP/b" ;;
+    500) if unhandled; then DI_SYNC="ABSENT (500 UnhandledEndpointException)"
+         else DI_SYNC="ERROR 500"; fi
+         body "$TMP/b" ;;
     000) DI_SYNC="NO ANSWER: $(why "$SYNC_MAX_SECONDS")"
          note "$DI_SYNC"
-         note "if the swagger declares it above, the route exists and is slow" ;;
+         note "if the swagger declares it above, the route exists and hangs" ;;
     *)   DI_SYNC="unexpected $st"; body "$TMP/b" ;;
   esac
 
   # Async round trip: the real Operation-Location format, and whether Retry-After is present.
-  st=$(req POST "$dm/$MODEL_ID:analyze?$q" "$key" image/png "$TMP/probe.png" "$SYNC_MAX_SECONDS")
+  st=$(req POST "$dm/$MODEL_ID:analyze?$q" "$key" "$DOC_CT" "$DOC" "$SYNC_MAX_SECONDS")
   loc=$(hdr "$TMP/h" operation-location)
   ra=$(hdr "$TMP/h" retry-after)
   apim=$(hdr "$TMP/h" apim-request-id)
@@ -283,7 +319,7 @@ probe_read() {
   key=$READ_UPSTREAM_API_KEY
   rd="$base/vision/v3.2/read"
 
-  hr; printf 'COMPUTER VISION READ    %s\n' "$base"; hr
+  hr; printf 'COMPUTER VISION READ    %s\n' "$(safeurl "$base")"; hr
 
   host=$(printf '%s' "$base" | sed 's://:_:; s:^[^_]*_::; s:/.*::; s/:.*//')
   case "$host" in *[Vv][Ii][Ss][Ii][Oo][Nn]*) WARN_VISION="yes" ;; esac
@@ -309,7 +345,7 @@ probe_read() {
   done
   [ "$st" = "200" ] || row GET "/swagger*" "$st" "not found at the known paths"
 
-  st=$(req POST "$rd/syncAnalyze" "$key" image/png "$TMP/probe.png" "$SYNC_MAX_SECONDS")
+  st=$(req POST "$rd/syncAnalyze" "$key" "$DOC_CT" "$DOC" "$SYNC_MAX_SECONDS")
   row POST "/read/syncAnalyze" "$st" ""
   case "$st" in
     200) RD_SYNC="AVAILABLE"
@@ -317,11 +353,15 @@ probe_read() {
          [ -n "$rs" ] && note "envelope status=$rs (a blank page may legitimately fail)"
          body "$TMP/b" ;;
     202) RD_SYNC="DEGRADES TO 202" ;;
+    404|405|501) RD_SYNC="ABSENT ($st)"; body "$TMP/b" ;;
+    500) if unhandled; then RD_SYNC="ABSENT (500 UnhandledEndpointException)"
+         else RD_SYNC="ERROR 500"; fi
+         body "$TMP/b" ;;
     000) RD_SYNC="NO ANSWER: $(why "$SYNC_MAX_SECONDS")"; note "$RD_SYNC" ;;
     *)   RD_SYNC="unexpected $st"; body "$TMP/b" ;;
   esac
 
-  st=$(req POST "$rd/analyze" "$key" image/png "$TMP/probe.png" "$SYNC_MAX_SECONDS")
+  st=$(req POST "$rd/analyze" "$key" "$DOC_CT" "$DOC" "$SYNC_MAX_SECONDS")
   loc=$(hdr "$TMP/h" operation-location)
   row POST "/read/analyze" "$st" ""
   if [ "$st" = "202" ]; then
@@ -362,56 +402,94 @@ probe_read() {
 # ---------------------------------------------------------------- run
 
 printf '\nazure-gateway-api  container probe   %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)"
-printf 'api-version=%s  model=%s  sync-ceiling=%ss\n\n' \
+printf 'api-version=%s  model=%s  sync-ceiling=%ss\n' \
   "$API_VERSION" "$MODEL_ID" "$SYNC_MAX_SECONDS"
+if [ -n "$PROBE_DOCUMENT" ]; then
+  printf 'document=%s (%s)\n\n' "$(basename "$PROBE_DOCUMENT")" "$DOC_CT"
+else
+  printf 'document=a blank 200x120 PNG\n\n'
+fi
 
 [ -n "$DI_UPSTREAM_URL" ] && probe_di
 [ -n "$READ_UPSTREAM_URL" ] && probe_read
 
 hr; printf 'VERDICT\n'; hr
-printf '  DI   :syncAnalyze     %s\n' "$DI_SYNC"
-printf '  DI   in swagger       %s\n' "$DI_SWAGSYNC"
-[ "$DI_SHAPE" = "-" ] || printf '  DI   200 body shape   %s\n' "$DI_SHAPE"
-printf '  DI   :analyze         %s\n' "$DI_ASYNC"
-[ "$DI_PDF" = "-" ] || printf '  DI   result-file /pdf  %s\n' "$DI_PDF"
-printf '  DI   error shape      %s\n' "$DI_ERRSHAPE"
-printf '  READ syncAnalyze      %s\n' "$RD_SYNC"
-printf '  READ /read/analyze    %s\n' "$RD_ASYNC"
-printf '  READ error shape      %s\n' "$RD_ERRSHAPE"
-if [ "$RD_ALIAS" = "404" ]; then
-  printf '  READ operations alias 404   (not served, as expected)\n'
-else
-  printf '  READ operations alias %s\n' "$RD_ALIAS"
+# Only the configured surfaces are reported: an unset URL is a disabled surface, not a finding.
+if [ -n "$DI_UPSTREAM_URL" ]; then
+  printf '  DI   :syncAnalyze     %s\n' "$DI_SYNC"
+  printf '  DI   in swagger       %s\n' "$DI_SWAGSYNC"
+  [ "$DI_SHAPE" = "-" ] || printf '  DI   200 body shape   %s\n' "$DI_SHAPE"
+  printf '  DI   :analyze         %s\n' "$DI_ASYNC"
+  [ "$DI_PDF" = "-" ] || printf '  DI   result-file /pdf  %s\n' "$DI_PDF"
+  printf '  DI   error shape      %s\n' "$DI_ERRSHAPE"
 fi
-printf '  READ host has "vision" %s\n' "$WARN_VISION"
+if [ -n "$READ_UPSTREAM_URL" ]; then
+  printf '  READ syncAnalyze      %s\n' "$RD_SYNC"
+  printf '  READ /read/analyze    %s\n' "$RD_ASYNC"
+  printf '  READ error shape      %s\n' "$RD_ERRSHAPE"
+  if [ "$RD_ALIAS" = "404" ]; then
+    printf '  READ operations alias 404   (not served, as expected)\n'
+  else
+    printf '  READ operations alias %s\n' "$RD_ALIAS"
+  fi
+  printf '  READ host has "vision" %s\n' "$WARN_VISION"
+fi
 echo
 
-# A run in which neither container answered anything must not read as a set of findings. Every
-# field above is still at its "not probed" default in that case, and the advice below would be
-# confidently wrong.
-di_answered=no; rd_answered=no
-case "$DI_SYNC" in "not probed"|"NO ANSWER"*) ;; *) di_answered=yes ;; esac
-case "$RD_SYNC" in "not probed"|"NO ANSWER"*) ;; *) rd_answered=yes ;; esac
-if [ "$di_answered" = no ] && [ "$rd_answered" = no ]; then
-  printf '  !! NO VERDICT. Neither container answered, so nothing below could be measured.\n'
+# A run in which no container answered anything must not read as a set of findings: every field
+# above is still at its default, and the advice below would be confidently wrong. A timeout is an
+# answer here: under sync-only it is the verdict that the route hangs.
+measured() {
+  case "$1" in
+    "NO ANSWER: TIMED OUT"*) return 0 ;;
+    "not probed"|"NO ANSWER"*) return 1 ;;
+  esac
+  return 0
+}
+unmeasured=""; probed=0
+if [ -n "$DI_UPSTREAM_URL" ]; then
+  probed=$((probed + 1)); measured "$DI_SYNC" || unmeasured="$unmeasured DI"
+fi
+if [ -n "$READ_UPSTREAM_URL" ]; then
+  probed=$((probed + 1)); measured "$RD_SYNC" || unmeasured="$unmeasured Read"
+fi
+missed=$(printf '%s' "$unmeasured" | wc -w | tr -d ' ')
+if [ "$missed" -eq "$probed" ]; then
+  printf '  !! NO VERDICT. No container answered, so nothing below could be measured.\n'
   printf '     Check the URLs, the API keys, and that the pods are running and reachable\n'
   printf '     from where this script runs. Re-run once one of them responds.\n\n'
   exit 3
 fi
-if [ "$di_answered" = no ] || [ "$rd_answered" = no ]; then
-  printf '  !! PARTIAL RUN. '
-  [ "$di_answered" = no ] && printf 'The DI container did not answer; its rows are unmeasured.\n'
-  [ "$rd_answered" = no ] && printf 'The Read container did not answer; its rows are unmeasured.\n'
-  printf '\n'
+if [ "$missed" -gt 0 ]; then
+  printf '  !! PARTIAL RUN. Not reachable:%s; those rows are unmeasured.\n\n' "$unmeasured"
 fi
 
-case "$DI_SYNC" in
-  AVAILABLE)         printf '  -> keep DI_SYNC_ANALYZE=auto. The fast path works on this build.\n' ;;
-  "DEGRADES TO 202") printf '  -> keep DI_SYNC_ANALYZE=auto. The gateway polls the 202 out.\n' ;;
-  ABSENT*)           printf '  -> set DI_SYNC_ANALYZE=off to skip a wasted call per job.\n' ;;
-  "NO ANSWER"*)      printf '  -> inconclusive. If the swagger declares it, the route exists and is\n'
-                     printf '     slow; re-run with SYNC_MAX_SECONDS=600 before deciding.\n' ;;
-esac
+# The sync-only verdict. Every analysis through the gateway is one call to the synchronous route,
+# with no asynchronous fallback, so a build that does not answer it cannot run behind the gateway.
+ready=yes
+verdict() {
+  v_name=$1; v_sync=$2
+  case "$v_sync" in
+    "not probed") return 0 ;;
+    AVAILABLE)
+      printf '  %-5s READY. The synchronous route answered 200.\n' "$v_name" ;;
+    ABSENT*)
+      ready=no
+      printf '  %-5s CANNOT RUN BEHIND THIS GATEWAY: %s. This build does not\n' "$v_name" "$v_sync"
+      printf '        serve the synchronous route; deploy a build that does.\n' ;;
+    "NO ANSWER: TIMED OUT"*)
+      ready=no
+      printf '  %-5s CANNOT RUN BEHIND THIS GATEWAY: no answer in %ss. The route\n' \
+        "$v_name" "$SYNC_MAX_SECONDS"
+      printf '        exists and hangs, or the pods are starved; give them their resources\n'
+      printf '        and re-run with a larger SYNC_MAX_SECONDS before deciding.\n' ;;
+    *)
+      ready=no
+      printf '  %-5s INCONCLUSIVE: %s. Check the body above and re-probe.\n' "$v_name" "$v_sync" ;;
+  esac
+}
+verdict DI "$DI_SYNC"
+verdict READ "$RD_SYNC"
 if [ "$DI_ERRSHAPE" != "-" ] && [ "$DI_ERRSHAPE" != "wrapped" ]; then
   printf '  -> DI errors are %s, not the wrapped shape its SDK models expect.\n' "$DI_ERRSHAPE"
 fi
@@ -423,3 +501,4 @@ if [ "$WARN_VISION" = "yes" ]; then
   printf '     strip the port and the /vision segment from its Operation-Location.\n'
 fi
 echo
+[ "$ready" = yes ] || exit 1
