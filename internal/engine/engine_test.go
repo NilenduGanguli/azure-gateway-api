@@ -310,16 +310,19 @@ func TestRead(t *testing.T) {
 	}
 }
 
-// A page that never answers costs the job PartAttempts at every size: 4 pages, then 2, then 1,
-// and then the job fails with the timeout.
+// A page that never answers costs the job PartAttempts at every size: 4 pages, then 2, then 1.
+// The page alone is then re-checked against the original under the whole-document rules, and
+// the job fails only with that answer: the timeout, after the two attempts a slow document gets.
 func TestHangHalvesDownToOnePage(t *testing.T) {
 	fake := newFake(t, mockazure.PagedOptions{Hang: map[int]bool{9: true}})
 	e := newEngine(t, azerr.SurfaceDI, fake.URL(), 4)
 	e.partTimeout = 200 * time.Millisecond
+	e.o.WholeTimeout = 300 * time.Millisecond
 	_, err := e.Run(context.Background(), pdfInput(t, "job-hang", 12, nil))
 	var apiErr *azerr.APIError
-	if !errors.As(err, &apiErr) || !strings.Contains(apiErr.Message, "timeout") {
-		t.Fatalf("Run error %v, want the attempt's timeout error", err)
+	if !errors.As(err, &apiErr) || !strings.Contains(apiErr.Message, "timeout") ||
+		!strings.HasSuffix(apiErr.Message, "(after 2 attempts)") {
+		t.Fatalf("Run error %v, want the re-check's timeout after 2 attempts", err)
 	}
 	var covering [][]int
 	for _, c := range fake.Calls() {
@@ -331,12 +334,14 @@ func TestHangHalvesDownToOnePage(t *testing.T) {
 		{9, 10, 11, 12}, {9, 10, 11, 12}, {9, 10, 11, 12},
 		{9, 10}, {9, 10}, {9, 10},
 		{9}, {9}, {9},
+		{9}, {9}, // the re-check: the original with pages=9
 	}
 	if !slices.EqualFunc(covering, want, slices.Equal) {
 		t.Errorf("calls covering page 9: %v, want %v", covering, want)
 	}
 	snap := e.Metrics().Snapshot()
-	if snap.Parts["halved"] != 2 || snap.Exhausted != 1 || snap.Retries["timeout"] != 6 {
+	if snap.Parts["halved"] != 2 || snap.Parts["rechecked"] != 1 || snap.Exhausted != 1 ||
+		snap.Retries["timeout"] != 7 {
 		t.Errorf("metrics parts=%v exhausted=%d retries=%v", snap.Parts, snap.Exhausted, snap.Retries)
 	}
 	if _, err := os.Stat(filepath.Join(e.o.WorkRoot, "job-hang")); !errors.Is(err, os.ErrNotExist) {

@@ -439,10 +439,13 @@ func (m *Manager) run(ctx context.Context, r *surfaceRunner, owner, id string) {
 		Query:       query,
 	})
 	if err != nil {
-		var attempts, parts int
+		// A failed run's output holds no result, only what the run cost.
+		var attempts, parts, upstreamStatus int
 		var upstreamMS int64
+		var fallback string
 		if out != nil {
 			attempts, parts, upstreamMS = out.Attempts, out.Parts, out.UpstreamMS
+			upstreamStatus, fallback = out.UpstreamStatus, out.Fallback
 			out.Cleanup()
 		}
 		// Cancellation is checked first and on the context itself, not on the error. During
@@ -461,8 +464,9 @@ func (m *Manager) run(ctx context.Context, r *surfaceRunner, owner, id string) {
 			log.Error("analysis failed with an unmapped error", "error", err)
 			apiErr = azerr.Internal(r.surface, "")
 		}
-		log.Warn("analysis failed", "code", apiErr.Code, "message", apiErr.Message)
-		m.failJob(context.WithoutCancel(ctx), r, id, apiErr, 0, upstreamMS, attempts, parts)
+		log.Warn("analysis failed", "code", apiErr.Code, "message", apiErr.Message,
+			"attempts", attempts, "parts", parts, "fallback", fallback, "upstreamStatus", upstreamStatus)
+		m.failJob(context.WithoutCancel(ctx), r, id, apiErr, upstreamStatus, upstreamMS, attempts, parts)
 		return
 	}
 	defer out.Cleanup()

@@ -16,7 +16,7 @@ var histogramBounds = []float64{0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300}
 // zero series rather than a missing one.
 var (
 	partOutcomes    = []string{outcomeSucceeded, outcomeRetried, outcomeHalved, outcomeHedged, outcomeHedgeWon, outcomeRechecked}
-	fallbackReasons = []string{fallbackUnparseable, fallbackEncrypted, fallbackBudget, fallbackPanic, fallbackPagesParam, fallbackMergeCheck}
+	fallbackReasons = []string{fallbackUnparseable, fallbackEncrypted, fallbackBudget, fallbackPanic, fallbackPagesParam, fallbackStringIndexType, fallbackMergeCheck}
 )
 
 // Part outcomes, gateway_parts_total{outcome}.
@@ -36,7 +36,9 @@ const (
 	fallbackBudget      = "budget"
 	fallbackPanic       = "panic"
 	fallbackPagesParam  = "pages_param"
-	fallbackMergeCheck  = "merge_check"
+	// fallbackStringIndexType is a stringIndexType the merge cannot count offsets in.
+	fallbackStringIndexType = "string_index_type"
+	fallbackMergeCheck      = "merge_check"
 )
 
 // Metrics counts what the engine does, for the admin's /_gw/metrics. It is safe for concurrent

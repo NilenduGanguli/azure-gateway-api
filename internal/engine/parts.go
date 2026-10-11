@@ -16,7 +16,6 @@ import (
 	"github.com/NilenduGanguli/azure-gateway-api/internal/azerr"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/merge"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/pdfsplit"
-	"github.com/NilenduGanguli/azure-gateway-api/internal/textunit"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/upstream"
 )
 
@@ -43,10 +42,12 @@ func (e *Engine) split(ctx context.Context, in Input, work *workdir, d decision,
 		}
 	}()
 
-	out, err := e.merge(in, work, d.pages, results, log)
+	out, err := e.merge(work, d, results, log)
 	switch {
 	case errors.Is(err, errMergeCheck):
 		e.metrics.fallback(fallbackMergeCheck)
+		t.fallback.Store(fallbackMergeCheck)
+		t.parts.Store(1)
 		log.Warn("engine: merge check failed; sending whole", "err", err)
 		out, err := e.runWhole(ctx, in, t, fallbackMergeCheck, log)
 		if err == nil {
@@ -72,7 +73,8 @@ type fanout struct {
 	work *workdir
 	t    *tally
 	log  *slog.Logger
-	// query is the client's query minus pages: a part is its own document, analysed whole.
+	// query is the client's query minus pages, under any spelling: a part is its own document,
+	// analysed whole.
 	query url.Values
 
 	ctx    context.Context
@@ -86,8 +88,7 @@ type fanout struct {
 
 func (e *Engine) runParts(ctx context.Context, in Input, work *workdir, parts []partFile, t *tally,
 	log *slog.Logger) ([]partResult, error) {
-	f := &fanout{e: e, in: in, work: work, t: t, log: log, query: maps.Clone(in.Query)}
-	delete(f.query, "pages")
+	f := &fanout{e: e, in: in, work: work, t: t, log: log, query: withoutParam(in.Query, "pages")}
 	f.ctx, f.cancel = context.WithCancel(ctx)
 	defer f.cancel()
 
@@ -158,7 +159,7 @@ func (f *fanout) part(p pdfsplit.Part, path string) error {
 			return err
 		}
 		a := f.hedged(ctx, p.Pages, call, release)
-		f.t.attempts.Add(1)
+		f.t.attempt(a)
 		switch a.Outcome {
 		case upstream.Success:
 			e.metrics.part(outcomeSucceeded)
@@ -173,20 +174,28 @@ func (f *fanout) part(p pdfsplit.Part, path string) error {
 			return f.recheck(p, a, log)
 		}
 		last = a
-		log.Info("engine: part attempt failed", "attempt", n, "reason", a.Reason, "cause", a.Cause)
-		if n < PartAttempts {
-			e.metrics.retry(a.Reason)
-			e.metrics.part(outcomeRetried)
-			if err := sleep(ctx, e.backoff(n, a.RetryAfter)); err != nil {
-				return err
-			}
+		if n == PartAttempts {
+			log.Warn("engine: part attempt failed", "attempt", n, "reason", a.Reason,
+				"status", a.Status, "cause", a.Cause)
+			break
+		}
+		wait := e.backoff(n, a.RetryAfter)
+		log.Warn("engine: part attempt failed", "attempt", n, "reason", a.Reason, "status", a.Status,
+			"backoffMs", wait.Milliseconds(), "cause", a.Cause)
+		e.metrics.retry(a.Reason)
+		e.metrics.part(outcomeRetried)
+		if err := sleep(ctx, wait); err != nil {
+			return err
 		}
 	}
 
 	if len(p.Pages) < 2 {
-		// A single page that keeps failing fails the job, as the whole document would have.
-		e.metrics.exhaust()
-		return e.attemptErr(last)
+		// A single page that keeps failing is not yet Azure failing the document: the part
+		// timeout is far shorter than the whole document's and also covers time queued in
+		// HAProxy while the pods scale up. So the page gets the whole document's chance, a
+		// re-check of the original under the whole-document rules, and only that answer can fail
+		// the job.
+		return f.recheck(p, last, log)
 	}
 	return f.halve(p, path, last, log)
 }
@@ -239,10 +248,8 @@ func (f *fanout) recheck(p pdfsplit.Part, failed upstream.Attempt, log *slog.Log
 	e := f.e
 	e.metrics.part(outcomeRechecked)
 	log.Info("engine: re-checking part against the original", "reason", failed.Reason)
+	// f.query holds no spelling of pages, so this is the only one the container sees.
 	q := maps.Clone(f.query)
-	if q == nil {
-		q = url.Values{}
-	}
 	q["pages"] = []string{pdfsplit.FormatPages(p.Pages)}
 	res, err := e.whole(f.ctx, f.in.JobID, e.wholeCall(f.in, q), f.t, log.With("recheck", true))
 	if err != nil {
@@ -252,9 +259,9 @@ func (f *fanout) recheck(p pdfsplit.Part, failed upstream.Attempt, log *slog.Log
 	return nil
 }
 
-// merge writes the parts' merged analyzeResult to the work folder.
-func (e *Engine) merge(in Input, work *workdir, pages []int, results []partResult,
-	log *slog.Logger) (*Output, error) {
+// merge writes the parts' merged analyzeResult to the work folder, held to the result ceiling a
+// whole document's answer is held to.
+func (e *Engine) merge(work *workdir, d decision, results []partResult, log *slog.Logger) (*Output, error) {
 	slices.SortFunc(results, func(a, b partResult) int { return cmp.Compare(a.part.Pages[0], b.part.Pages[0]) })
 	var covered []int
 	parts := make([]merge.Part, len(results))
@@ -262,37 +269,35 @@ func (e *Engine) merge(in Input, work *workdir, pages []int, results []partResul
 		covered = append(covered, r.part.Pages...)
 		parts[i] = merge.Part{Path: r.res.Path, Start: r.res.Start, End: r.res.End, Pages: r.part.Pages}
 	}
-	if !slices.Equal(covered, pages) {
+	if !slices.Equal(covered, d.pages) {
 		// merge cannot see a part that is missing altogether; this would be the engine's bug.
 		log.Error("engine: parts do not cover the selected pages", "covered", pdfsplit.FormatPages(covered),
-			"selected", pdfsplit.FormatPages(pages))
+			"selected", pdfsplit.FormatPages(d.pages))
 		return nil, errMergeCheck
-	}
-
-	var unit textunit.Unit
-	if e.o.Client.Surface() == azerr.SurfaceDI {
-		u, ok := textunit.Parse(in.Query.Get("stringIndexType"))
-		if !ok {
-			return nil, fmt.Errorf("%w: unknown stringIndexType", errMergeCheck)
-		}
-		unit = u
 	}
 
 	path := work.path("merged.json")
 	started := e.now()
+	capped := &cappedWriter{left: e.o.Client.MaxResultBytes()}
 	err := writeFile(path, func(w io.Writer) error {
+		capped.w = w
 		var err error
 		if e.o.Client.Surface() == azerr.SurfaceRead {
-			_, err = merge.Read(w, parts)
+			_, err = merge.Read(capped, parts)
 		} else {
-			_, err = merge.DI(w, parts, unit)
+			_, err = merge.DI(capped, parts, d.unit)
 		}
 		return err
 	})
-	if errors.Is(err, merge.ErrCheck) {
+	switch {
+	case capped.over:
+		// Too large whole is too large split: the job fails as the whole document's would have,
+		// rather than by way of the merge-check fallback, whose answer would be refused too.
+		log.Warn("engine: merged result exceeds the result ceiling", "limit", e.o.Client.MaxResultBytes())
+		return nil, e.o.Client.ResultTooLarge()
+	case errors.Is(err, merge.ErrCheck):
 		return nil, fmt.Errorf("%w: %w", errMergeCheck, err)
-	}
-	if err != nil {
+	case err != nil:
 		return nil, fmt.Errorf("engine: merge: %w", err)
 	}
 	e.metrics.mergeSeconds(e.now().Sub(started))
@@ -301,4 +306,25 @@ func (e *Engine) merge(in Input, work *workdir, pages []int, results []partResul
 		return nil, fmt.Errorf("engine: stat merged result: %w", err)
 	}
 	return &Output{Path: path, End: info.Size(), Bare: results[0].res.Bare, Parts: len(results)}, nil
+}
+
+// errResultCeiling stops a merge whose output has passed the result ceiling.
+var errResultCeiling = errors.New("engine: merged result exceeds the result ceiling")
+
+// cappedWriter passes at most left bytes to w and fails every write after that, so a merge stops
+// as soon as its output is too large instead of writing it all to the PVC first.
+type cappedWriter struct {
+	w    io.Writer
+	left int64
+	over bool
+}
+
+func (c *cappedWriter) Write(p []byte) (int, error) {
+	if int64(len(p)) > c.left {
+		c.over = true
+		return 0, errResultCeiling
+	}
+	n, err := c.w.Write(p)
+	c.left -= int64(n)
+	return n, err
 }

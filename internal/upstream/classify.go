@@ -127,8 +127,7 @@ func (c *Client) readResult(ctx, actx context.Context, resp *http.Response, star
 	case errors.Is(err, ErrResultTooLarge):
 		return Attempt{
 			Outcome: Terminal, Reason: ReasonTooLarge, Status: resp.StatusCode, Cause: err,
-			Err: azerr.Internal(c.b.surface, fmt.Sprintf(
-				"The %s container's result is larger than this gateway accepts.", c.b.name)),
+			Err: c.ResultTooLarge(),
 		}
 	default:
 		return c.gatewayFailure(err, resp.StatusCode)

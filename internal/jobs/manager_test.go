@@ -100,6 +100,32 @@ func TestJobRunsThroughTheEngine(t *testing.T) {
 	}
 }
 
+// TestFailedJobRecordsItsUpstreamCounts checks that a failed job's row says what its run cost, as
+// a succeeded one's does: an operator reading a failure needs to know whether the gateway tried
+// once or five times.
+func TestFailedJobRecordsItsUpstreamCounts(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	container := mockazure.NewDI(mockazure.Options{StatusFirst: 99, StatusFirstCode: 400})
+	t.Cleanup(container.Close)
+	m, st := newTestManager(t, container.URL(), now)
+	ctx, cancel := context.WithCancel(context.Background())
+	m.Start(ctx)
+	t.Cleanup(func() { cancel(); m.Stop() })
+
+	const id = "00000000-0000-4000-8000-0000000000b2"
+	submitJob(t, m, st, id, now)
+
+	var job *store.Job
+	waitFor(t, "the job to fail", func() bool {
+		job, _ = st.Get(context.Background(), id)
+		return job != nil && job.Status == store.StatusFailed
+	})
+	if job.UpstreamAttempts != 1 || job.UpstreamParts != 1 {
+		t.Errorf("upstream counts are attempts=%d parts=%d, want 1 and 1",
+			job.UpstreamAttempts, job.UpstreamParts)
+	}
+}
+
 // TestRecoveryFailsAJobThatExhaustedItsAttempts covers a poison input: a job whose runs keep
 // dying with the process is failed at recovery, with a well-formed error, and never sent to the
 // container again.

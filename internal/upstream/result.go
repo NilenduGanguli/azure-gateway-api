@@ -52,6 +52,17 @@ func jsonUnmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }
 // ErrResultTooLarge reports an upstream response beyond the configured ceiling.
 var ErrResultTooLarge = errors.New("upstream: response exceeds the configured maximum")
 
+// defaultMaxResultBytes is the result ceiling when MAX_RESULT_BYTES is not set.
+const defaultMaxResultBytes = 512 << 20
+
+// resultLimit is the ceiling on one result: the configured one, or the default.
+func (b *base) resultLimit() int64 {
+	if b.maxBytes <= 0 {
+		return defaultMaxResultBytes
+	}
+	return b.maxBytes
+}
+
 // downloadBody streams a response body to a scratch file, bounded by maxBytes.
 //
 // The body is never held in memory: Azure permits a 500 MB OCR JSON response, and buffering that
@@ -63,10 +74,7 @@ func (b *base) downloadBody(resp *http.Response, prefix string) (path string, si
 	}
 	defer func() { _ = f.Close() }()
 
-	limit := b.maxBytes
-	if limit <= 0 {
-		limit = 512 << 20
-	}
+	limit := b.resultLimit()
 	n, err := io.Copy(f, io.LimitReader(resp.Body, limit+1))
 	if err != nil {
 		_ = os.Remove(f.Name())

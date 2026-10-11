@@ -48,7 +48,7 @@ func (e *Engine) whole(ctx context.Context, job string, call upstream.Call, t *t
 		if err != nil {
 			return nil, err
 		}
-		t.attempts.Add(1)
+		t.attempt(a)
 		switch a.Outcome {
 		case upstream.Success:
 			return a.Result, nil
@@ -62,12 +62,15 @@ func (e *Engine) whole(ctx context.Context, job string, call upstream.Call, t *t
 		}
 		if n >= WholeAttempts || retryOnce >= retryOnceLimit {
 			e.metrics.exhaust()
-			log.Info("engine: attempts exhausted", "attempts", n, "reason", a.Reason, "cause", a.Cause)
+			log.Warn("engine: attempts exhausted", "attempts", n, "reason", a.Reason, "status", a.Status,
+				"cause", a.Cause)
 			return nil, exhausted(e.attemptErr(a), n)
 		}
 		e.metrics.retry(a.Reason)
-		log.Info("engine: retrying", "attempt", n, "reason", a.Reason, "cause", a.Cause)
-		if err := sleep(ctx, e.backoff(n, a.RetryAfter)); err != nil {
+		wait := e.backoff(n, a.RetryAfter)
+		log.Warn("engine: retrying", "attempt", n, "reason", a.Reason, "status", a.Status,
+			"backoffMs", wait.Milliseconds(), "cause", a.Cause)
+		if err := sleep(ctx, wait); err != nil {
 			return nil, err
 		}
 	}

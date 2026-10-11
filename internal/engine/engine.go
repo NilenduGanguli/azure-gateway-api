@@ -20,6 +20,7 @@ import (
 	"mime"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -28,6 +29,7 @@ import (
 	"github.com/NilenduGanguli/azure-gateway-api/internal/jsonx"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/pdfsplit"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/sched"
+	"github.com/NilenduGanguli/azure-gateway-api/internal/textunit"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/upstream"
 )
 
@@ -151,6 +153,9 @@ type Output struct {
 	Fallback string
 	// UpstreamMS is the time Azure spent on the calls whose results make up the output.
 	UpstreamMS int64
+	// UpstreamStatus is, for a failed run, the HTTP status of the latest failed call a container
+	// answered; 0 when none was answered.
+	UpstreamStatus int
 
 	cleanup func()
 }
@@ -167,10 +172,41 @@ func (o *Output) Cleanup() {
 // tally is a job's running counts, shared by its parts.
 type tally struct {
 	attempts, halvings, hedges, upstreamMS atomic.Int64
+	// parts is how many results the job is being assembled from: 1 whole, the plan's parts split.
+	parts atomic.Int64
+	// status is the HTTP status of the latest failed call a container answered.
+	status atomic.Int64
+	// fallback is why a document that could have been split went whole, or "".
+	fallback atomic.Value
+}
+
+// attempt counts one call to Azure and remembers the status a failed one was answered with: the
+// status that explains a failed job is its failing call's, not a sibling part's 200.
+func (t *tally) attempt(a upstream.Attempt) {
+	t.attempts.Add(1)
+	if a.Outcome != upstream.Success && a.Status != 0 {
+		t.status.Store(int64(a.Status))
+	}
+}
+
+// fallbackReason is why the document went whole, or "".
+func (t *tally) fallbackReason() string {
+	r, _ := t.fallback.Load().(string)
+	return r
+}
+
+// failed is the output of a run that failed: no result, only what the run cost, for the job
+// record and its log line.
+func (t *tally) failed() *Output {
+	return &Output{
+		Attempts: int(t.attempts.Load()), Parts: int(t.parts.Load()), Halvings: int(t.halvings.Load()),
+		Hedges: int(t.hedges.Load()), UpstreamMS: t.upstreamMS.Load(), UpstreamStatus: int(t.status.Load()),
+	}
 }
 
 // Run analyses one document. Errors are *azerr.APIError, or the context's error on shutdown: the
-// job then stays running and recovery re-runs it from its stored input.
+// job then stays running and recovery re-runs it from its stored input, and the output is nil.
+// With an *azerr.APIError the output is not nil: it holds no result, only the run's counts.
 func (e *Engine) Run(ctx context.Context, in Input) (*Output, error) {
 	parent := ctx
 	ctx, cancel := context.WithTimeout(ctx, e.jobDeadline)
@@ -193,19 +229,23 @@ func (e *Engine) Run(ctx context.Context, in Input) (*Output, error) {
 		}
 		if ctx.Err() != nil {
 			log.Warn("engine: job deadline passed", "deadline", e.jobDeadline)
-			return nil, azerr.Internal(e.o.Client.Surface(), fmt.Sprintf(
+			return t.failed(), azerr.Internal(e.o.Client.Surface(), fmt.Sprintf(
 				"The analysis did not complete within the job deadline of %s.", minutes(e.jobDeadline)))
 		}
+		failed := t.failed()
+		failed.Fallback = t.fallbackReason()
 		var apiErr *azerr.APIError
 		if errors.As(err, &apiErr) {
-			log.Info("engine: job failed", "err", apiErr, "attempts", t.attempts.Load(),
-				"halvings", t.halvings.Load(), "hedges", t.hedges.Load())
-			return nil, apiErr
+			log.Warn("engine: job failed", "err", apiErr, "attempts", failed.Attempts,
+				"parts", failed.Parts, "halvings", failed.Halvings, "hedges", failed.Hedges,
+				"upstreamStatus", failed.UpstreamStatus, "fallback", failed.Fallback)
+			return failed, apiErr
 		}
 		// The gateway's own failure: a full PVC, an unreadable input. The text names paths, so
 		// it goes to the log and the client hears only that something went wrong.
-		log.Error("engine: job failed in the gateway", "err", err)
-		return nil, azerr.Internal(e.o.Client.Surface(), "")
+		log.Error("engine: job failed in the gateway", "err", err, "attempts", failed.Attempts,
+			"parts", failed.Parts)
+		return failed, azerr.Internal(e.o.Client.Surface(), "")
 	}
 	out.Attempts = int(t.attempts.Load())
 	out.Halvings = int(t.halvings.Load())
@@ -233,8 +273,10 @@ func (e *Engine) run(ctx context.Context, in Input, work *workdir, t *tally, log
 	}
 	if d.fallback != "" {
 		e.metrics.fallback(d.fallback)
+		t.fallback.Store(d.fallback)
 		log.Info("engine: sent whole", "fallback", d.fallback)
 	}
+	t.parts.Store(int64(max(len(d.parts), 1)))
 	if d.parts == nil {
 		out, err := e.runWhole(ctx, in, t, d.fallback, log)
 		if err == nil {
@@ -247,9 +289,10 @@ func (e *Engine) run(ctx context.Context, in Input, work *workdir, t *tally, log
 
 // decision is how a document is analysed: whole when parts is nil.
 type decision struct {
-	fallback string     // why a split was attempted and abandoned, or ""
-	pages    []int      // the selected original pages, for a split
-	parts    []partFile // the cut parts, for a split
+	fallback string        // why a split was attempted and abandoned, or ""
+	pages    []int         // the selected original pages, for a split
+	parts    []partFile    // the cut parts, for a split
+	unit     textunit.Unit // the stringIndexType the parts answer in, for a Document Intelligence split
 }
 
 // partFile is a part cut to a file in the work folder.
@@ -283,6 +326,10 @@ func (e *Engine) decide(ctx context.Context, in Input, work *workdir) (decision,
 	if len(pages) <= e.o.SplitPages {
 		return decision{}, nil
 	}
+	unit, ok := e.mergeUnit(in.Query)
+	if !ok {
+		return decision{fallback: fallbackStringIndexType}, nil
+	}
 	plan := pdfsplit.Plan(pages, e.o.SplitPages)
 	parts := make([]partFile, 0, len(plan))
 	for _, p := range plan {
@@ -293,7 +340,7 @@ func (e *Engine) decide(ctx context.Context, in Input, work *workdir) (decision,
 		}
 		parts = append(parts, partFile{part: p, path: path})
 	}
-	return decision{pages: pages, parts: parts}, nil
+	return decision{pages: pages, parts: parts, unit: unit}, nil
 }
 
 // splitFailure sorts a pdfsplit error: the document's fault sends it whole with the reason
@@ -316,9 +363,11 @@ func splitFailure(ctx context.Context, err error) (decision, error) {
 }
 
 // selectPages is the pages to analyse: the client's pages= selection, or every page. ok is false
-// when pages= is given but is not Azure's grammar or names a page the document lacks.
+// when pages= is given but is not Azure's grammar or names a page the document lacks, and when it
+// is given more than once: the container binds it under any spelling of the name, and which of
+// two values it would take is not the gateway's to guess.
 func selectPages(q url.Values, count int) ([]int, bool) {
-	vals, given := q["pages"]
+	vals, given := queryValues(q, "pages")
 	if !given {
 		all := make([]int, count)
 		for i := range all {
@@ -334,6 +383,47 @@ func selectPages(q url.Values, count int) ([]int, bool) {
 		return nil, false
 	}
 	return pdfsplit.Select(ranges, count)
+}
+
+// mergeUnit is the stringIndexType the parts will answer in, which the merge must count offsets
+// in. ok is false when the merge cannot know it: a value it does not support, or more than one
+// value or spelling. The document then goes whole and the container answers about the value.
+func (e *Engine) mergeUnit(q url.Values) (textunit.Unit, bool) {
+	if e.o.Client.Surface() != azerr.SurfaceDI {
+		return textunit.TextElements, true // Read has no stringIndexType; merge.Read needs none
+	}
+	vals, given := queryValues(q, "stringIndexType")
+	if !given {
+		return textunit.TextElements, true
+	}
+	if len(vals) != 1 {
+		return 0, false
+	}
+	return textunit.Parse(vals[0])
+}
+
+// queryValues gathers a query parameter's values under every spelling of its name, because the
+// containers bind parameters as ASP.NET does: by name, ignoring case. given reports whether any
+// spelling was present.
+func queryValues(q url.Values, name string) (vals []string, given bool) {
+	for k, v := range q {
+		if strings.EqualFold(k, name) {
+			vals = append(vals, v...)
+			given = true
+		}
+	}
+	return vals, given
+}
+
+// withoutParam is a copy of q without any spelling of name.
+func withoutParam(q url.Values, name string) url.Values {
+	out := make(url.Values, len(q))
+	for k, v := range q {
+		if !strings.EqualFold(k, name) {
+			out[k] = slices.Clone(v)
+		}
+	}
+	return out
 }
 
 // pdfSource is the path of the PDF to split, or "" when the body is not one (splitting spec §1):

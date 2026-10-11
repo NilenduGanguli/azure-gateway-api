@@ -240,6 +240,17 @@ func NewClient(surface azerr.Surface, up config.Upstream, tempDir string, maxRes
 // Surface identifies the error vocabulary this client speaks.
 func (c *Client) Surface() azerr.Surface { return c.b.surface }
 
+// MaxResultBytes is the ceiling on a result this gateway stores: MAX_RESULT_BYTES, or the 512 MB
+// default. It bounds each container answer here, and the engine holds a merged result to it too,
+// so a document is refused for its size the same way whether it was split or not.
+func (c *Client) MaxResultBytes() int64 { return c.b.resultLimit() }
+
+// ResultTooLarge is the terminal error of a result over MaxResultBytes.
+func (c *Client) ResultTooLarge() *azerr.APIError {
+	return azerr.Internal(c.b.surface, fmt.Sprintf(
+		"The %s container's result is larger than this gateway accepts.", c.b.name))
+}
+
 // Name is the container's name in logs and errors: "document-intelligence" or
 // "computer-vision-read".
 func (c *Client) Name() string { return c.b.name }
