@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"embed"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -144,7 +145,7 @@ func migrate(w *sql.DB, dataDir string) (MigrationReport, error) {
 	// bringing a pre-versioning database to version 1 touches no row: it stamps the header and at
 	// most adds a column with a default, which leaves every earlier image able to run on it.
 	if from > 0 && len(pending) > 0 {
-		if report.Backup, err = backup(ctx, conn, dataDir, from); err != nil {
+		if report.Backup, err = backup(ctx, conn, dataDir, from, seen); err != nil {
 			return MigrationReport{}, err
 		}
 	}
@@ -176,18 +177,24 @@ func backupPath(dataDir string, v int) string {
 // backup copies the database to backupPath(dataDir, from) with VACUUM INTO, which writes one
 // consistent snapshot, WAL content included, as a standalone file.
 //
-// The copy is written under a ".partial" name and renamed into place only once it is complete and
-// fsynced. VACUUM INTO builds its output incrementally, and what it has written when the pod is
-// killed or the node loses power is still a valid SQLite file: a copy cut short early has no pages
-// at all, passes quick_check, and reads as an empty database. Under the backup's own name, an
-// operator restoring it would get a gateway that takes it for a fresh volume and silently drops
-// every job. A rename is atomic, so gateway.db.v<N>.bak is either complete or absent.
+// The copy is written under a ".partial" name and renamed into place only once it is complete,
+// fsynced and checked. VACUUM INTO builds its output incrementally, and what it has written when
+// the pod is killed or the node loses power is still a valid SQLite file that reads as an empty
+// database. Under the backup's own name, an operator restoring it would get a gateway that takes
+// it for a fresh volume and silently drops every job. A rename is atomic, so gateway.db.v<N>.bak
+// is either complete or absent.
 //
-// Only the newest copy is kept. Older ones hold jobs long since expired, and VACUUM INTO refuses to
-// overwrite a file, which a leftover partial copy or a retry at the same version would otherwise
-// hit.
-func backup(ctx context.Context, conn *sql.Conn, dataDir string, from int) (_ string, err error) {
-	if err := removeBackups(dataDir); err != nil {
+// The check is that the copy's user_version is still seen, the version this start read: a copy
+// of a database another gateway process has since migrated would carry a name that misstates its
+// schema.
+//
+// Only the newest copy is kept, since older ones hold jobs long since expired. They are removed
+// only once the new copy is in place, so a start that fails before then leaves the volume's
+// backups as it found them. Partial copies left by an earlier start go first instead: none of
+// them is a backup, and VACUUM INTO refuses to write over one.
+func backup(ctx context.Context, conn *sql.Conn, dataDir string, from, seen int) (_ string,
+	err error) {
+	if err := removeBackups(dataDir, isPartial); err != nil {
 		return "", err
 	}
 	bak := backupPath(dataDir, from)
@@ -206,13 +213,40 @@ func backup(ctx context.Context, conn *sql.Conn, dataDir string, from int) (_ st
 	if err := syncFile(partial); err != nil {
 		return "", err
 	}
+	copied, err := fileUserVersion(partial)
+	if err != nil {
+		return "", err
+	}
+	if copied != seen {
+		return "", fmt.Errorf("store: the backup copy holds schema v%d, not the v%d this start "+
+			"read; another gateway process is migrating this volume", copied, seen)
+	}
 	if err := os.Rename(partial, bak); err != nil {
 		return "", fmt.Errorf("store: install backup %s: %w", bak, err)
 	}
 	if err := syncDir(dataDir); err != nil {
 		return "", err
 	}
+	installed := filepath.Base(bak)
+	if err := removeBackups(dataDir, func(name string) bool { return name != installed }); err != nil {
+		return "", err
+	}
 	return bak, nil
+}
+
+// fileUserVersion reads user_version from a database file's header, where SQLite keeps it as a
+// big-endian 32-bit integer at offset 60.
+func fileUserVersion(name string) (int, error) {
+	f, err := os.Open(name)
+	if err != nil {
+		return 0, fmt.Errorf("store: open %s: %w", name, err)
+	}
+	defer func() { _ = f.Close() }()
+	var b [4]byte
+	if _, err := f.ReadAt(b[:], 60); err != nil {
+		return 0, fmt.Errorf("store: read the header of %s: %w", name, err)
+	}
+	return int(int32(binary.BigEndian.Uint32(b[:]))), nil
 }
 
 // backupFile matches exactly the names backup writes: gateway.db.v<N>.bak, and the same with
@@ -221,8 +255,12 @@ func backup(ctx context.Context, conn *sql.Conn, dataDir string, from int) (_ st
 // alone.
 var backupFile = regexp.MustCompile(`^` + regexp.QuoteMeta(dbName) + `\.v[0-9]+\.bak(\.partial)?$`)
 
-// removeBackups deletes every earlier pre-migration copy in dataDir, complete or partial.
-func removeBackups(dataDir string) error {
+// isPartial selects the copies a start was cut short in the middle of.
+func isPartial(name string) bool { return strings.HasSuffix(name, ".partial") }
+
+// removeBackups deletes the pre-migration copies in dataDir, complete or partial, that drop
+// selects. Directories are never touched.
+func removeBackups(dataDir string, drop func(name string) bool) error {
 	entries, err := os.ReadDir(dataDir)
 	if err != nil {
 		return fmt.Errorf("store: list old backups: %w", err)
@@ -231,7 +269,7 @@ func removeBackups(dataDir string) error {
 		// Names are matched one by one rather than by globbing the joined path, which a DATA_DIR
 		// containing glob metacharacters would make match nothing at all.
 		name := e.Name()
-		if e.IsDir() || !backupFile.MatchString(name) {
+		if e.IsDir() || !backupFile.MatchString(name) || !drop(name) {
 			continue
 		}
 		err := os.Remove(filepath.Join(dataDir, name))
@@ -276,10 +314,10 @@ type plan struct {
 // lock at its first write instead, and in WAL mode that upgrade can fail at once with SQLITE_BUSY,
 // busy_timeout or not.
 //
-// The plan was made from a version read before the lock was taken. Two gateways can start on one
-// volume, as a RollingUpdate briefly runs them, and the one that waited for the lock would then
-// apply migrations the other has just committed. So the version is read again under the lock, and
-// any change stops this start; the restart that follows finds the schema current.
+// The plan was made from a version read before the lock was taken. If another gateway process
+// committed a migration in between, applying the plan would run those migrations a second time,
+// so the version is read again under the lock and any change fails this start. That is all the
+// check guards against: it does not make two gateways on one volume safe to run together.
 func apply(ctx context.Context, conn *sql.Conn, p plan) (err error) {
 	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
 		return fmt.Errorf("store: begin migration: %w", err)

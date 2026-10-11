@@ -593,15 +593,15 @@ func TestSchemaFromScratchEqualsMigrated(t *testing.T) {
 	}
 }
 
-// TestReleasedMigrationsAreUnchanged pins every migration that has shipped. A released file has
+// TestReleasedMigrationsAreUnchanged pins every migration this binary carries. A released file has
 // already run on volumes in service, so editing it changes nothing there and only makes fresh
-// volumes differ from old ones; a schema change must be a new file instead. Each release adds its
-// file's hash here.
+// volumes differ from old ones; a schema change must be a new file instead. A file missing from
+// the map fails the test too, so adding a migration means adding its hash here.
 func TestReleasedMigrationsAreUnchanged(t *testing.T) {
-	released := map[string]string{
+	pinned := map[string]string{
 		"0001_initial.sql": "de6eedb8ab8389d825f538658c3382eeeb905bc6cd0a4d60902af11ce10663eb",
 	}
-	for name, want := range released {
+	for name, want := range pinned {
 		body, err := fs.ReadFile(migrationFS, "migrations/"+name)
 		if err != nil {
 			t.Errorf("released migration %s is gone: %v", name, err)
@@ -612,32 +612,57 @@ func TestReleasedMigrationsAreUnchanged(t *testing.T) {
 				"instead", name, got, want)
 		}
 	}
+	entries, err := fs.ReadDir(migrationFS, "migrations")
+	if err != nil {
+		t.Fatalf("list embedded migrations: %v", err)
+	}
+	for _, e := range entries {
+		if _, ok := pinned[e.Name()]; !ok {
+			body, _ := fs.ReadFile(migrationFS, "migrations/"+e.Name())
+			t.Errorf("migration %s is not pinned; add %q: %q to the map", e.Name(), e.Name(),
+				fmt.Sprintf("%x", sha256.Sum256(body)))
+		}
+	}
+}
+
+// cutShortCopy writes at path what a copy cut short leaves: a file with pages in it that
+// SQLite still reads as a sound, empty database. Being non-empty, it is also what VACUUM INTO
+// refuses to write over.
+func cutShortCopy(t *testing.T, path string) {
+	t.Helper()
+	db := rawDB(t, path)
+	if _, err := db.Exec(`CREATE TABLE t (x); DROP TABLE t;`); err != nil {
+		t.Fatalf("write debris: %v", err)
+	}
+	var check string
+	if err := db.QueryRow(`PRAGMA quick_check`).Scan(&check); err != nil || check != "ok" {
+		t.Fatalf("the debris is not the valid-looking file a cut-short copy is: %q, %v", check, err)
+	}
+	if len(schemaOf(t, db)) != 0 {
+		t.Fatal("the debris is not empty of schema objects")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close debris: %v", err)
+	}
+	if fi, err := os.Stat(path); err != nil || fi.Size() == 0 {
+		t.Fatalf("the debris is empty on disk, which VACUUM INTO would accept anyway: %v", err)
+	}
 }
 
 // TestInterruptedBackupIsCleared covers a pod killed, or a node losing power, partway through the
-// pre-migration copy. Whatever VACUUM INTO had written by then is a valid SQLite file: a copy cut
-// short early has no pages at all, passes quick_check, and reads as an empty database. Restored as
-// gateway.db it would pass for a fresh volume and every job would be gone, so such a file must
-// never carry a backup's name, and the next start must clear it away.
+// pre-migration copy. Whatever VACUUM INTO had written by then is a valid SQLite file: a copy
+// killed 8 MB into 550 MB passes quick_check with no schema objects and user_version 0, so it
+// reads as an empty database. Restored as gateway.db it would pass for a fresh volume and every
+// job would be gone, so such a file must never carry a backup's name, and the next start must
+// clear it away, whatever version it was for.
 func TestInterruptedBackupIsCleared(t *testing.T) {
 	dir := t.TempDir()
 	id := currentVolume(t, dir)
 	base := SchemaVersion()
-	partial := backupPath(dir, base) + ".partial"
-	if err := os.WriteFile(partial, nil, 0o600); err != nil {
-		t.Fatalf("seed interrupted copy: %v", err)
-	}
-	// What makes the debris dangerous: SQLite accepts it as a sound, empty database.
-	debris := rawDB(t, partial)
-	var check string
-	if err := debris.QueryRow(`PRAGMA quick_check`).Scan(&check); err != nil || check != "ok" {
-		t.Fatalf("the seeded copy is not the valid-looking file a cut-short copy is: %q, %v",
-			check, err)
-	}
-	if len(schemaOf(t, debris)) != 0 {
-		t.Fatal("the seeded copy is not empty")
-	}
-	_ = debris.Close()
+	// One sits on the name this start's copy needs, the other was left by a start at another
+	// version.
+	cutShortCopy(t, backupPath(dir, base)+".partial")
+	cutShortCopy(t, backupPath(dir, 42)+".partial")
 
 	withMigration(t, nextMigration("extra", "CREATE TABLE extra (x INTEGER);\n"))
 	s := openVolume(t, dir)
@@ -684,10 +709,49 @@ func TestBackupAppearsOnlyWhenComplete(t *testing.T) {
 	}
 }
 
-// TestVersionChangedBeforeTheLockIsRefused covers two gateways starting on one volume, as a
-// RollingUpdate can briefly run them. Each reads user_version before it takes the write lock, so
-// the one that gets the lock second must notice the other has already migrated, and stop, rather
-// than apply the same migrations again.
+// TestMismatchedCopyIsNotInstalled covers a copy taken after another gateway process migrated the
+// database this start read. It holds a newer user_version than its name would claim, and a
+// rollback restoring it would be misled, so it must be discarded, and the backups already on the
+// volume left exactly as they were.
+func TestMismatchedCopyIsNotInstalled(t *testing.T) {
+	dir := t.TempDir()
+	currentVolume(t, dir)
+	base := SchemaVersion()
+	previous := []string{backupPath(dir, base), backupPath(dir, 42)}
+	slices.Sort(previous)
+	for _, p := range previous {
+		if err := os.WriteFile(p, []byte("previous"), 0o600); err != nil {
+			t.Fatalf("seed previous backup: %v", err)
+		}
+	}
+	db := rawDB(t, filepath.Join(dir, dbName))
+	// This start read base; another process has since moved the database on.
+	if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, base+1)); err != nil {
+		t.Fatalf("set user_version: %v", err)
+	}
+
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("conn: %v", err)
+	}
+	_, err = backup(ctx, conn, dir, base, base)
+	_ = conn.Close()
+	if err == nil || !strings.HasPrefix(err.Error(), "store: ") {
+		t.Fatalf("backup of a database that moved on returned %v", err)
+	}
+	if got := backups(t, dir); !slices.Equal(got, previous) {
+		t.Errorf("backup files on the volume are %v, want the previous ones %v", got, previous)
+	}
+	for _, p := range previous {
+		if body, err := os.ReadFile(p); err != nil || string(body) != "previous" {
+			t.Errorf("%s changed: %q, %v", p, body, err)
+		}
+	}
+}
+
+// TestVersionChangedBeforeTheLockIsRefused checks that a plan made from a version that has since
+// changed is not applied. The migrations it lists have already run, and must not run twice.
 func TestVersionChangedBeforeTheLockIsRefused(t *testing.T) {
 	dir := t.TempDir()
 	currentVolume(t, dir)
