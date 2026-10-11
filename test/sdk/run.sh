@@ -17,11 +17,16 @@ if ! curl -fsS "${GATEWAY_URL}/_gw/live" >/dev/null 2>&1; then
   exit 1
 fi
 
-if [ ! -d .venv ]; then
+# The install is stamped with a copy of the requirements it installed. Checking only for the
+# directory let a venv whose pip install was interrupted, or that predates a new requirement, be
+# reused forever: the missing SDK's checks then SKIP and the run still reads as a pass.
+if [ ! -x .venv/bin/python ] || ! cmp -s requirements.txt .venv/requirements.installed; then
   echo "Creating a virtualenv for the Azure SDKs..."
   python3 -m venv .venv
   ./.venv/bin/pip install --quiet --upgrade pip
   ./.venv/bin/pip install --quiet -r requirements.txt
+  cp requirements.txt .venv/requirements.installed
 fi
 
-exec ./.venv/bin/python sdk_test.py
+# SDK_STRICT=1 makes a skipped check a failure; scripts/e2e-local.sh sets it.
+exec ./.venv/bin/python sdk_test.py "$@"
