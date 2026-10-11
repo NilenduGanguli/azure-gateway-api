@@ -1,0 +1,72 @@
+{
+  "request": {
+    "method": "POST",
+    "path": "/vision/v3.2/read/syncAnalyze",
+    "query": "",
+    "contentType": "application/pdf"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Length": "512",
+      "Content-Type": "application/json; charset=utf-8",
+      "Server": "Kestrel"
+    },
+    "body": {
+      "status": "succeeded",
+      "createdDateTime": "<datetime:2006-01-02T15:04:05Z>",
+      "lastUpdatedDateTime": "<datetime:2006-01-02T15:04:05Z>",
+      "analyzeResult": {
+        "version": "3.2.0",
+        "modelVersion": "2022-04-30",
+        "readResults": [
+          {
+            "page": 1,
+            "angle": 0,
+            "width": 800,
+            "height": 600,
+            "unit": "pixel",
+            "lines": [
+              {
+                "boundingBox": [
+                  10,
+                  10,
+                  90,
+                  10,
+                  90,
+                  30,
+                  10,
+                  30
+                ],
+                "text": "PAGE 1",
+                "appearance": {
+                  "style": {
+                    "name": "other",
+                    "confidence": 0.97
+                  }
+                },
+                "words": [
+                  {
+                    "boundingBox": [
+                      10,
+                      10,
+                      50,
+                      10,
+                      50,
+                      30,
+                      10,
+                      30
+                    ],
+                    "text": "PAGE",
+                    "confidence": 0.99
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

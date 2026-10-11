@@ -298,3 +298,26 @@ func TestPadResultBytesPadsBothBodiesAndKeepsThemValidJSON(t *testing.T) {
 		})
 	})
 }
+
+// TestSyncBodyIsServedVerbatim covers the golden parity test's need: a fake that answers its
+// synchronous route with a body recorded from a real container, byte for byte, so the gateway's
+// polls and synchronous answers can be compared with the container's own.
+func TestSyncBodyIsServedVerbatim(t *testing.T) {
+	recorded := []byte(`{"status":"succeeded","createdDateTime":"<datetime:2006-01-02T15:04:05Z>",` +
+		`"analyzeResult":{"apiVersion":"2024-11-30","modelId":"prebuilt-layout","pages":[]}}`)
+	for _, tc := range []struct {
+		name string
+		c    *Container
+		path string
+	}{
+		{"document intelligence", NewDI(Options{SyncBody: recorded}), bodyDISync},
+		{"read", NewRead(Options{SyncBody: recorded}), bodyReadSync},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer tc.c.Close()
+			if got := bodySync(t, tc.c, tc.path); string(got) != string(recorded) {
+				t.Fatalf("body = %s, want the recorded body %s", got, recorded)
+			}
+		})
+	}
+}

@@ -1,0 +1,19 @@
+{
+  "request": {
+    "method": "POST",
+    "path": "/documentintelligence/documentModels/prebuilt-layout:analyze",
+    "query": "api-version=2024-11-30",
+    "contentType": "application/pdf"
+  },
+  "response": {
+    "status": 202,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Length": "0",
+      "Operation-Location": "http://localhost:5000/documentintelligence/documentModels/prebuilt-layout/analyzeResults/<guid>?api-version=2024-11-30",
+      "Retry-After": "1",
+      "Server": "Kestrel"
+    },
+    "body": null
+  }
+}

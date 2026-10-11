@@ -17,6 +17,11 @@ import (
 
 func jsonUnmarshal(b []byte, v any) error { return json.Unmarshal(b, v) }
 
+// runningFor is how long the fake container takes over each call, so an operation is still in
+// progress when a test's first poll arrives. The gateway never polls a container — every upstream
+// call is synchronous — so the container's own operation states cannot be used to hold a job open.
+const runningFor = 500 * time.Millisecond
+
 // TestDISubmitReturnsExactly202 covers the strictest shared requirement: Python's
 // _analyze_document_initial, .NET's StatusCodeClassifier{202}, Java's @ExpectedResponses({202})
 // and JS's isUnexpected all accept 202 and nothing else, not even 200 or 201.
@@ -95,7 +100,7 @@ func TestDISubmitOmitsLocationHeader(t *testing.T) {
 // Document Intelligence client runs Retry-After through _deserialize("int", ...), so an HTTP-date
 // raises DeserializationError and fails the call outright.
 func TestRetryAfterIsIntegerSeconds(t *testing.T) {
-	h := newHarness(t, harnessOpts{di: mockazure.Options{PollsBeforeSuccess: 1}})
+	h := newHarness(t, harnessOpts{di: mockazure.Options{Latency: runningFor}})
 
 	resp := h.post(diAnalyze, "%PDF-1.7 fake")
 	loc := resp.Header.Get("Operation-Location")
@@ -266,7 +271,7 @@ func TestSucceededEnvelopeNestsAnalyzeResult(t *testing.T) {
 // TestStatusStringsAreExact covers spelling, which unlike casing is not forgiven anywhere:
 // "cancelled" is terminal in JS only, and "skipped" in none of the four.
 func TestStatusStringsAreExact(t *testing.T) {
-	h := newHarness(t, harnessOpts{di: mockazure.Options{PollsBeforeSuccess: 2}})
+	h := newHarness(t, harnessOpts{di: mockazure.Options{Latency: runningFor}})
 	resp := h.post(diAnalyze, "%PDF-1.7 fake")
 	loc := resp.Header.Get("Operation-Location")
 	_ = resp.Body.Close()
@@ -317,7 +322,7 @@ func TestFailedAnalysisIsHTTP200(t *testing.T) {
 // TestPollBodyIsAlwaysJSONWithStatus covers Python's BadResponse on an empty body, .NET's
 // treatment of a zero-length stream as failure, and Java's NPE.
 func TestPollBodyIsAlwaysJSONWithStatus(t *testing.T) {
-	h := newHarness(t, harnessOpts{di: mockazure.Options{PollsBeforeSuccess: 1}})
+	h := newHarness(t, harnessOpts{di: mockazure.Options{Latency: runningFor}})
 	resp := h.post(diAnalyze, "%PDF-1.7 fake")
 	loc := resp.Header.Get("Operation-Location")
 	_ = resp.Body.Close()

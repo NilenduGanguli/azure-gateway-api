@@ -1,0 +1,74 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/documentintelligence/documentModels/prebuilt-layout/analyzeResults/<guid>",
+    "query": "api-version=2024-11-30",
+    "contentType": ""
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Cache-Control": "no-store",
+      "Content-Length": "512",
+      "Content-Type": "application/json; charset=utf-8",
+      "Server": "Kestrel"
+    },
+    "body": {
+      "status": "succeeded",
+      "createdDateTime": "<datetime:2006-01-02T15:04:05Z>",
+      "lastUpdatedDateTime": "<datetime:2006-01-02T15:04:05Z>",
+      "analyzeResult": {
+        "apiVersion": "2024-11-30",
+        "modelId": "prebuilt-layout",
+        "stringIndexType": "textElements",
+        "content": "PAGE 1",
+        "pages": [
+          {
+            "pageNumber": 1,
+            "angle": 0,
+            "width": 8.5,
+            "height": 11,
+            "unit": "inch",
+            "words": [
+              {
+                "content": "PAGE",
+                "polygon": [
+                  1,
+                  1,
+                  2,
+                  1,
+                  2,
+                  2,
+                  1,
+                  2
+                ],
+                "confidence": 0.99,
+                "span": {
+                  "offset": 0,
+                  "length": 4
+                }
+              }
+            ],
+            "spans": [
+              {
+                "offset": 0,
+                "length": 6
+              }
+            ]
+          }
+        ],
+        "paragraphs": [
+          {
+            "spans": [
+              {
+                "offset": 0,
+                "length": 6
+              }
+            ],
+            "content": "PAGE 1"
+          }
+        ]
+      }
+    }
+  }
+}
