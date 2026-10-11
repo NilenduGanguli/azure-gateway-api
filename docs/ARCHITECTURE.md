@@ -587,13 +587,18 @@ document instead (one call, long timeout) and counts `merge_check`:
 - every offset, page number and pointer index the merge rewrites is a canonical non-negative
   integer, and every pointer and region falls inside its own part;
 - **strict root spans and the per-part unit self-check**: each part's root section spans are
-  decoded strictly and must lie within that part's content; a part with content must have a root
-  span; and a root that is one span from offset 0 is the service's own measure of that part's
-  content length, which must equal the gateway's `textunit.Len`. The service and the gateway
-  segment text with different Unicode versions (uniseg implements 15.0; a .NET runtime may
-  implement 15.1, whose rule GB9c joins Devanagari conjuncts into one grapheme cluster), and where
-  they disagree every offset shifted past that part would be wrong — so the merge refuses rather
-  than guesses.
+  decoded strictly and must lie within that part's content, and a part with content must have a
+  root span. The unit self-check is the end of a part's **page spans**: Document Intelligence gives
+  every page a span over its text (a blank page an empty one), so the furthest end of any page's
+  span is the service's own measure of the part's content length — in every real output, page
+  furniture, blank pages and markdown included — and it must equal the gateway's `textunit.Len`.
+  The service and the gateway segment text with different Unicode versions (uniseg implements
+  15.0; a .NET runtime may implement 15.1, whose rule GB9c joins Devanagari conjuncts into one
+  grapheme cluster), and where they disagree every offset shifted past that part would be wrong —
+  so the merge refuses rather than guesses. (Until 2026-10-11 the check compared a root section
+  starting at 0 with the content length. Real roots leave out page headers, footers, page numbers
+  and blank pages, so most real documents failed it and were analysed whole after every part had
+  run.)
 
 **Member order.** The merged `analyzeResult` members are an **order-preserving merge of all the
 parts' member orders**. A part's member order is a subsequence of the order the service writes for
@@ -614,7 +619,7 @@ other, so that no order keeps them all, are an `ErrCheck`.
 | `pages[].pageNumber`, and `pageNumber` in every `boundingRegions[]` element | mapped to the original page |
 | strings in any `elements` array matching `/(paragraphs\|tables\|figures\|sections\|keyValuePairs)/N` | index plus the earlier parts' element count for that member |
 | `figures[].id` (`"<page>.<n>"`) | the page mapped to the original; `<n>` kept |
-| `sections` | **one root**, as Azure produces: its `elements` are every part's root elements in order, shifted, and its `spans` one span from part 0's root start to the end of the last part's root span; other members from the first root that has them. Non-root sections follow in part order, part *k*'s section *i* ≥ 1 becoming `1 + Σ_{j<k}(sections_j − 1) + (i − 1)`. A part with no sections is allowed only when it has no content |
+| `sections` | **one root**, as Azure produces: its `elements` are every part's root elements in order, shifted; its `spans` every root's own spans, shifted, a part's first span joined to the previous part's last **only where nothing but the page separator lies between them** (the earlier root ends where its part does and this one starts where its part does), so the root never covers the page furniture and blank pages the service leaves out of it; other members from the first root that has them. Non-root sections follow in part order, part *k*'s section *i* ≥ 1 becoming `1 + Σ_{j<k}(sections_j − 1 − drop_j) + (i − 1 − drop_k)`. **A section continues across a cut**: a part whose leading content has no heading (its root's first element an untitled leaf section 1, or a root-only part whose first element is not a `title` or `sectionHeading` paragraph) is folded into the deepest last section the earlier parts left open — its elements appended, its spans appended and joined across the separator — and section 1 is dropped (`drop_k = 1`) or the root contributes nothing. A part with no sections is allowed only when it has no content, whichever part it is |
 | other arrays (`paragraphs`, `tables`, `figures`, `styles`, `warnings`, unknown arrays) | concatenated in part order with the rules above applied structurally |
 
 **Read rules.** `version` and `modelVersion` must agree and come from the first part;
@@ -1035,7 +1040,8 @@ Splitting adds two memory consumers, and both are bounded by construction:
 - **Merging.** `merge` never materialises a result. It measures each part with byte scanners
   (`jsonx.Members`, `CountItems`), decodes only one part's `content` at a time to count its length
   (a few pages of text), and writes the output with `jsonx.Rewrite` and `ArrayItems`, which hold a
-  few buffers whatever the result size. The only value decoded whole is each part's root section.
+  few buffers whatever the result size. The only values decoded whole are each part's sections,
+  pointers and spans for a few pages, one part at a time, and the root and continuation of each.
 
 ---
 

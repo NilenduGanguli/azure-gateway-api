@@ -24,12 +24,14 @@ at different layers.
 | Layer | Where | What it is for |
 |---|---|---|
 | Unit tests | `internal/<pkg>/*_test.go` | One package at a time: parsing, validation, migrations, the attempt classifier, the scheduler, the splitter, the rewriter, the merge, error rendering. Table-driven. |
-| Round-trip tests | `internal/merge/roundtrip_test.go` | A whole-document result from `docgen`, cut into parts, merged back: **byte for byte** equal, for both surfaces and all three `stringIndexType` units. |
+| Round-trip tests | `internal/merge/roundtrip_test.go` | A whole-document result from `docgen`, cut into parts, merged back: **byte for byte** equal, for both surfaces, all three `stringIndexType` units and every `docgen` shape (plain, realistic, 2023-07-31). |
+| Real-data merge tests | `internal/merge/realdata_test.go` | **Genuine** service outputs (`test/azure-reference`), cut by `internal/realcut` at every page boundary and merged back: byte for byte the real whole-document result. |
+| Azure-shape validation | `internal/azschema`, `test/conformance/azureshape_test.go` | Every analyze response the gateway serves, whole and split, validated against Microsoft's own specs (strictly), the invariants real output keeps, and the member order of real outputs. §10. |
 | Engine tests | `internal/engine/engine_test.go` | The whole/split decision, retries, hedges, halving, re-checks, fallbacks, fairness and cancellation, against the paged fake with real PDFs. |
 | Fakes | `internal/mockazure`, `cmd/fakeazure` | Not tests. HTTP servers that impersonate both containers *including their failure modes and HAProxy's*, and a paged fake that answers per original page. |
 | Conformance suite | `test/conformance` | A fully wired gateway — built by the same `app.NewHandler` and `app.NewEngines` as the binary — driven over real HTTP against the fakes. Every endpoint; what unmodified Azure SDK clients depend on. |
 | Live end to end | `scripts/e2e-local.sh` | The built gateway binary against `cmd/fakeazure` on real ports: every route by `curl`, the real-SDK suite, and `gateway probe --compare-split`. |
-| Real-SDK harness | `test/sdk` | The official Python Azure client libraries pointed at a running gateway, including 23-page PDFs that are split and merged. |
+| Real-SDK harness | `test/sdk` | The official Python Azure client libraries pointed at a running gateway, including 23-page PDFs that are split and merged, and read strictly through the SDKs' own models. |
 
 `internal/surface` is tested both through `test/conformance` and with its own handler tests for the
 parameter policy, the sync route, the artifact 404s and the relays. Wire shape is still asserted
@@ -139,11 +141,17 @@ alongside the document.
 - **`Calls() [][]int`** returns, for every synchronous analyze served, the original pages it
   covered, in order — so a test can assert exactly which parts, halves, hedges and re-checks were
   sent.
+- **Shape.** The answer follows the request, as the service's does: on `/formrecognizer` with
+  `api-version=2023-07-31` it has that API's shape (no `contentFormat`, `sections`, `figures`,
+  cell `elements` or captions), and a Read answer is in inches for a PDF and in pixels for an
+  image. `docgen` writes the real 2024-11-30 member order, always writes `styles`, leaves `figures`
+  out when there are none, and gives a figure its caption as a `caption` member.
 
 | `PagedOptions` field | Behaviour |
 |---|---|
 | `Surface` | `DI` or `Read`; DI serves both API families |
-| `Doc docgen.Options` | `Unit` (the `stringIndexType` a request naming none is answered in) and `TitleOnFirstPage` (the first analysed page's heading becomes `title` — a document-level judgement, so `--compare-split` has a difference to report) |
+| `Doc docgen.Options` | `Unit` (the `stringIndexType` a request naming none is answered in), `TitleOnFirstPage` (the first analysed page's heading becomes `title` — a document-level judgement, so `--compare-split` has a difference to report), and the realistic shape's options: `Furniture` (page headers, footers and numbers outside every section), `BlankEvery` (blank pages), `Captions`, `SelectionMarks`. `docgen.Realistic(unit)` turns them all on |
+| `Replay func(pages, numbering, di) []byte` | answers each analysis with the given bytes for the original pages the call carries, in place of `docgen`'s: `TestRealOutputThroughTheGateway` replays recorded service output, cut per part by `internal/realcut` |
 | `Hang map[int]bool` | any call covering one of these pages hangs until its client gives up |
 | `HangFirst map[int]bool` | only the **first** call covering the page hangs; a retry or a hedge is answered even while the first is still held |
 | `FailFirst map[int]int` | page → how many calls covering it answer 503 first. A call fails while any page it covers has failures left, and uses one of each |
@@ -158,7 +166,9 @@ go run ./cmd/fakeazure -di 127.0.0.1:5001 -read 127.0.0.1:5002 -hang 7 -fail-fir
 ```
 
 It serves a paged fake per surface until interrupted, and prints one `NAME=URL` line per fake in
-the form the gateway's settings take. The page flags apply to both fakes and accept ranges, bounded
+the form the gateway's settings take. It answers in `docgen`'s **realistic** shape — page
+furniture outside every section, every seventh page blank, captions, selection marks — so the
+live end to end splits documents as irregular as real ones; `-plain` gives the plain shape. The page flags apply to both fakes and accept ranges, bounded
 so a typo like `1-1000000` is refused rather than expanded. It is a development tool: the image
 builds only `cmd/gateway`.
 
@@ -217,6 +227,7 @@ deserialiser. Break one and the failure is remote, opaque and blamed on the wron
 | `split_test.go` | Against the paged fake with `splitPages 5`: a 40-page PDF through `:analyze` equals the envelope around `docgen.DI(1..40)`; the same through `:syncAnalyze`; Read 40 pages; `pages=10-25`; a page that hangs on its first call (hedge or retry); bad content only when split (re-check, success); an unparseable PDF (whole); `splitPages 0` (one call); 50 submits against `Capacity(4)` with `MaxInflight 16` (all succeed); `/_gw/jobs` showing `upstreamParts`. |
 | `single_surface_test.go` | A DI-only gateway serves DI and answers every Read route with the bodyless 404; Read-only the reverse; `/_gw/health` lists one upstream; `/_gw/config` reports the disabled surface's inflight as 0. |
 | `parity_test.go` | Replays every golden case under `testdata/golden/<surface>/<tag>/` (an operator's real recording) or `testdata/golden/<tag>/<surface>/` (as `--record` writes one) against a harness whose fakes serve the recorded bodies, comparing status, header names and shapes, and body keys, order and types, under the probe's masks (`<guid>`, `<datetime:…>`, `<base>`). Cases replay in the order `--record` made the analyze round trip, then by name; each sends the body its `request.document` names. `testdata/golden/fake/` holds the set recorded from the paged fake, so the record-and-replay path is always exercised; it carries a profile of what the paged fake does not model (`Cache-Control`, which the gateway adds; the `api-version` in `Operation-Location`; four validation cases), each with its reason. Real recordings are compared in full. |
+| `azureshape_test.go` | Every analyze response — running, succeeded and failed polls and synchronous bodies, whole and split, on all three route families — validated with `internal/azschema` against the official specs, real invariants and real member order, with the fakes in the realistic shape; and recorded service output replayed through the gateway, merged back to the real whole-document result byte for byte. §10. |
 | `admin_test.go` | The metric families after a split job, with `# HELP`/`# TYPE` and monotonic histogram buckets; health and config shapes. |
 | `fidelity_test.go` | Wire-shape rules an SDK depends on — the examples below. |
 | `behaviour_test.go`, `sync_test.go` | Lifecycle, retries from the stored input, recovery, admission, TTL. The async-upstream, degraded-202 poll-out and artifact-capture cases were deleted with that code. |
@@ -304,8 +315,9 @@ The sync-only and splitting work is mostly new packages, each test-first. What e
 | `internal/sched` | the limit; round-robin rotation (job A queues three, job B one: A1, B1, A2, A3); FIFO within a job; a cancelled waiter leaves the queue; cancel racing a grant returns the slot (1,000 iterations under `-race`); `TryAcquireIdle` fails while anyone waits; idempotent release; a 50-goroutine stress test that never exceeds the limit | fairness and no slot leaks |
 | `internal/textunit` | `abc`, decomposed `é`, a ZWJ family emoji, a flag, `\n`, in all three units | offsets are counted as Azure counts them |
 | `internal/jsonx` | `Rewrite` identity over escapes, nested arrays, `-0.0`, `1e-07` and 20-digit integers; targeted replacements change only their bytes; visitor paths; long strings copied unvisited; truncated input and trailing garbage are errors; `ArrayItems`, `Members`, `CountItems`; an allocation bound on a 10 MB input | the merge copies what it does not rewrite byte for byte, in bounded memory |
-| `internal/docgen` | valid JSON; spans inside content in the unit; pointers resolve; deterministic bytes | the reference results the fakes and the round trip use |
-| `internal/merge` | **round trip**: for `n ∈ {1, 2, 6, 7, 11, 23}`, each unit, parts numbered locally, originally, and mixed, merging `docgen` parts reproduces the whole result **byte for byte**, DI and Read; every safety check (`stringIndexType` mismatch, missing, duplicated or out-of-order pages, a differing unknown member, contradictory member orders, a root span that disagrees with the unit); the markdown separator and its escaping; unknown arrays shifted; a memory bound on a 60 MB result | merge rules of ARCHITECTURE §4.7 |
+| `internal/docgen` | every shape (plain, realistic, 2023-07-31), page set and unit, validated with `internal/azschema` against the spec, the invariants and the real member order; the realistic shape keeps furniture and blank pages out of every section; deterministic bytes; local numbering differs only in page numbers | the reference results the fakes and the round trip use |
+| `internal/azschema` | calibration: every vendored real output passes with no finding; 17 planted departures (an undeclared member, an integer written as a float, a span off by one, pages not joined by one separator, a pointer past its array, members out of the real order, `styles` left out, an empty `figures`, a figure id on the wrong page, a section pointed at twice, Read's `"v3.2"`, a line without `appearance`, …) and 7 envelope cases are each caught by the rule meant to catch them | the validator the shape tests rely on |
+| `internal/merge` | **round trip**: for `n ∈ {1, 2, 6, 7, 11, 23}`, each unit, each `docgen` shape, parts numbered locally, originally, and mixed, merging `docgen` parts reproduces the whole result **byte for byte**, DI and Read; **real data** (`realdata_test.go`): every vendored real result cut at every set of page boundaries merges back to the original byte for byte, real one-page results merged as parts cut back to themselves, and a section that continues across a cut is folded back into one; every safety check (`stringIndexType` mismatch, missing, duplicated or out-of-order pages, a differing unknown member, contradictory member orders, page spans that disagree with the content's length in the unit, a root that reaches past its part); the markdown separator and its escaping; unknown arrays shifted; a memory bound on a 60 MB result | merge rules of ARCHITECTURE §4.7 |
 | `internal/upstream` (`attempt_test.go`) | the outcome table row by row against `mockazure` and `httptest` edge cases; a 202 is never polled; cancellation wins over a transport error; a new connection per attempt (`ConnState` sees one `StateNew` per attempt); `Backoff` with jitter 0 and 1, `Retry-After` override and caps | sync-only design §1 |
 | `internal/engine` | whole for a 3-page PDF, a JPEG and `urlSource`; split for 23 pages (parts 5,5,5,4,4) equal to `docgen.DI(1..23)`; `pages=3-14`; `base64Source`; `SPLIT_PAGES=0`; a page that always hangs is halved down to itself and fails with a timeout; a first-call hang is hedged and the hedge wins; `FailFirst` retried; bad content re-checked (success when only split; the container's error otherwise); unparseable → whole; a failed merge check → whole; fairness (a 1-page job finishes before a 30-page job's third part); cancellation mid-split returns `context.Canceled`, leaks no goroutine and removes the work folder; Read 12 pages | splitting design §3–§5, §9 |
 | `internal/config` | `SPLIT_PAGES` default, `0`, `-1`, `off`; DI-only and Read-only valid, neither invalid; a removed setting warns and does not fail; `Redacted` has no removed keys and has `splitPages`, `diEnabled`, `readEnabled`; `TestRedactedCoversEveryField` | the 22 settings |
@@ -482,6 +494,7 @@ fakes.
 | `test_document_intelligence_large_pdf`: a 23-page PDF built with Pillow, `len(result.pages) == 23`, page numbers 1..23 | Splitting and the merge, through the real DI SDK's models. |
 | `test_read_large_pdf` | The same through the Read client. |
 | `test_sync_analyze_large_pdf`: a raw `urllib` POST to `:syncAnalyze` → 200, 23 pages | The engine-backed sync route. |
+| `test_strict_sdk_round_trip`: the 23-page PDF on both surfaces, its raw poll body walked against `azure-ai-documentintelligence`'s `AnalyzeResult` (type hints) and the Computer Vision `ReadOperationResult` (msrest attribute map) | The merged result has no member the SDK model lacks (one msrest would park in `additional_properties`), none it requires missing, no JSON type or enum value it would not produce, and no explicit null; and the model gives it back unchanged (`as_dict()`, or a serialize round trip). |
 
 ### Real containers
 
@@ -531,8 +544,10 @@ In order. Each step is cheap relative to the one after it.
    rules, the merge. Then `internal/mockazure` (or the paged fake) must model the case, and the test
    should assert *how* the result was reached — `Calls()`, `SyncCalls()`, `upstreamAttempts`,
    `upstreamParts`, the fallback reason — not only the client-visible result.
-8. **Did you change the merge?** The round trip must still be byte for byte for every unit, and a
-   new rule needs a regression test built from the document `--compare-split` found it on.
+8. **Did you change the merge?** The round trip must still be byte for byte for every unit and
+   shape, `internal/merge/realdata_test.go` must still give every real output back, and a new rule
+   needs a regression test built from the document `--compare-split` found it on — vendored, with
+   its provenance, under `test/azure-reference` when its licence allows.
 9. **Did you change the schema?** Add a **new** migration file and its sha256 to
    `TestReleasedMigrationsAreUnchanged`; never edit a released one. `TestSchemaFromScratchEqualsMigrated`
    must pass.
@@ -546,3 +561,67 @@ In order. Each step is cheap relative to the one after it.
 
 Finally, the repository's own convention, visible in every commit body: state what you verified,
 by name — and say which step surfaced the defect you fixed.
+
+---
+
+## 10. Validating against Microsoft's own description of the responses
+
+The question every other layer answers indirectly — *is this exactly what Azure would have sent?*
+— is answered directly here, against references that do not come from this repository.
+
+### The references: `test/azure-reference`
+
+- **Specs:** the official Swagger 2.0 documents from Azure/azure-rest-api-specs — Document
+  Intelligence 2024-11-30, Form Recognizer 2023-07-31 and Computer Vision v3.2 — plus the two
+  spec examples with a result body.
+- **Real output:** nine prebuilt-layout 2024-11-30 results and three Read 3.2 results recorded
+  from the cloud service by the Azure SDKs' live tests (azure-sdk-assets, azure-sdk-for-net), and
+  one third-party markdown capture. They have multi-page documents with a blank page, a root
+  section of two spans, a section and a table continuing across a page, page headers, footers and
+  numbers, captions, selection marks, barcodes and styles.
+- `PROVENANCE.md` pins every file to its URL at a commit SHA, with its sha256 and licence (MIT,
+  except where noted), and lists the facts the tests rely on. Two recordings carry the figure id
+  `"Sanitized"`, a test-proxy artefact; tests restore `"<page>.<n>"`.
+
+### The validator: `internal/azschema` (tests only)
+
+- **Schema, strictly.** `$ref`, `allOf`, types (an integer must have no fraction or exponent),
+  `required`, `enum` (an error when the set is closed, a warning when `modelAsString` is true),
+  formats (RFC 3339 `date-time`, `uuid`, `int32`), bounds and patterns, `x-nullable`, and
+  **any member a definition does not declare is an error** unless it declares
+  `additionalProperties`.
+- **Invariants real output keeps.** Every span lies in the content and slices it, in the result's
+  own `stringIndexType`, to the text its word, line, paragraph or cell claims. Pages are numbered as
+  requested, joined by exactly one `\n`, and their spans end where the content does. Every pointer
+  resolves, `sections` is one tree under `sections[0]`, regions name the result's pages, figure ids
+  are `<page>.<n>` on their first region's page, and items are in reading order. Read results say
+  `version "3.2.0"`, the model version asked for, the unit the input implies (inch for a PDF,
+  pixel for an image), and every line has its `appearance`.
+- **Member order and presence.** The pairwise member order of every kind of object, learned from
+  the real outputs; `styles` always present; `figures`, `selectionMarks` and `barcodes` left out
+  when empty; the envelope's `status`, `createdDateTime`, `lastUpdatedDateTime` first; no
+  `analyzeResult` unless succeeded; no `error` member on a Read envelope.
+
+Its own tests calibrate it — every real output passes with no finding — and check that planted
+departures are caught (§4).
+
+### What is validated
+
+| Test | What |
+|---|---|
+| `test/conformance/azureshape_test.go` `TestResponsesAreAzureShaped` | The first poll (running), the final poll and the synchronous body for 1, 6 and 23 pages and `pages=3-14`, whole (`SPLIT_PAGES=0`) and split (`5`), on `/documentintelligence`, `/formrecognizer` 2023-07-31 and Read, with the fakes in the realistic shape. Merged equals unsplit byte for byte; synchronous equals polled. |
+| `TestUnitsAreAzureShaped`, `TestReadImageIsAzureShaped`, `TestFailedOperationsAreAzureShaped` | Each `stringIndexType` split at 2 pages; Read on an image (pixels); failed operations (DI with its `error`, Read without one). |
+| `TestRealOutputThroughTheGateway` | Recorded service output replayed through the gateway: the fake answers each part with the real result cut to its pages, and the merged answer, polled and synchronous, is the real whole-document result byte for byte, with every call one page (no fallback to the whole document). |
+| `internal/merge/realdata_test.go` | The merge alone on every real result at every set of page boundaries (§4). |
+| `test/sdk/sdk_test.py` `test_strict_sdk_round_trip` | The live merged results read strictly through the SDKs' models (§7); `scripts/e2e-local.sh` runs it. |
+
+### What it cannot settle
+
+- The containers' `:syncAnalyze` body is in no public spec. The gateway answers it with the
+  operation envelope, as the containers were observed to, and it is validated as one.
+- The real outputs are cloud recordings, not container ones. Headers the tests do not hold the
+  gateway to — `Cache-Control: no-store`, `Retry-After` on Read polls, timestamp spelling — are
+  open questions in HANDOFF.md, settled by `gateway probe --record` against the real containers.
+- Where the service makes a document-level judgement a part cannot see, the merge follows the
+  evidence the references give (a section continues across a cut unless the next part opens with a
+  heading) and `--compare-split` on a real corpus remains the measure.

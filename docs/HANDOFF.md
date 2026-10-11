@@ -597,7 +597,7 @@ Do not "fix" these without reading the reason.
 | pdfcpu runs with `NewStatelessConfiguration` | The default configuration writes a config file in the home directory and panics when it cannot — which is always, on a read-only root filesystem |
 | An owner-password-only encrypted PDF is sent whole although pdfcpu could open it | The design splits only unencrypted documents; whole, Azure handles the encryption as it always did |
 | Parts have no named destinations | pdfcpu rewrites the `/Dests` tree in place while extracting, which gave later parts destinations pointing at pages they do not hold |
-| The merge refuses when a part's root span length disagrees with the gateway's grapheme count | uniseg and .NET can implement different Unicode versions. Where they disagree every shifted offset would be wrong |
+| The merge refuses when the end of a part's page spans disagrees with the gateway's count of its content | uniseg and .NET can implement different Unicode versions. Where they disagree every shifted offset would be wrong. The page spans, not the root section, are the measure: real roots leave out page furniture and blank pages |
 | Old migration files can never be edited, even for a typo | They have already run on volumes in service. `TestReleasedMigrationsAreUnchanged` pins them by sha256 |
 | The unrouted 404 has **no body** | Both containers answer that way. Every *routed* endpoint still carries a body |
 | DI's unknown-result-id error is **flat** while every other DI error is wrapped | The container does exactly this |

@@ -509,7 +509,7 @@ Field notes the gateway must reproduce faithfully:
 - `angle`: `[-180, 180)`, clockwise.
 - `appearance.style.name`: `other` | `handwriting`, `modelAsString: true` (**open set**). Latin-only; `appearance` is absent otherwise.
 - `Line.words` is **required**; `Line.appearance` is not.
-- **`ReadOperationResult` has NO `error` property and `analyzeResult` has NO `errors[]` array — in v3.0, v3.1 and v3.2.** A failed read is a 200 with `"status":"failed"` and **zero diagnostics**. There is nothing to map; the gateway must synthesize its own diagnostics from its own upstream logs, and must not invent an `error` field the SDK models will drop anyway.
+- **`ReadOperationResult` has NO `error` property and `analyzeResult` has NO `errors[]` array — in v3.0, v3.1 and v3.2.** A failed read is a 200 with `"status":"failed"` and **zero diagnostics**. There is nothing to map; the gateway must synthesize its own diagnostics from its own upstream logs, and must not invent an `error` field the SDK models will drop anyway. The gateway's failed Read envelope is exactly `{"status":"failed","createdDateTime":…,"lastUpdatedDateTime":…}`; the diagnostic is in its log and `/_gw/jobs` (`TestFailedReadEnvelopeHasNoErrorMember`, and the strict validation of docs/TESTING.md §10).
 
 **Response headers on the poll:** `Content-Type: application/json`, `Date`, `Server: Kestrel`. **The CV SDK requires exactly `200`** — a `202` on the poll is a hard error.
 
