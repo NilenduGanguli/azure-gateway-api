@@ -92,6 +92,10 @@ func TestSplitPages(t *testing.T) {
 		{"0", 0, false}, // splitting off
 		{"12", 12, false},
 		{"-1", 0, true},
+		// 0 is the kill switch, so a typo must not quietly leave splitting on at the default.
+		{"O", 0, true},
+		{"off", 0, true},
+		{"0.5", 0, true},
 	} {
 		t.Run("SPLIT_PAGES="+tc.value, func(t *testing.T) {
 			setEnv(t, map[string]string{"SPLIT_PAGES": tc.value})
@@ -125,13 +129,15 @@ func TestLoadAcceptsOneSurface(t *testing.T) {
 			name: "document intelligence only",
 			env: map[string]string{
 				"READ_UPSTREAM_URL": "", "READ_MAX_INFLIGHT": "0", "READ_SYNC_TIMEOUT": "soon",
+				"READ_BLIND_POLL_BUDGET": "lots",
 			},
 			wantDI: true,
 		},
 		{
 			name: "read only",
 			env: map[string]string{
-				"DI_UPSTREAM_URL": "", "DI_MAX_INFLIGHT": "-2", "DI_UPSTREAM_TIMEOUT": "-1s",
+				"DI_UPSTREAM_URL": "", "DI_MAX_INFLIGHT": "four", "DI_UPSTREAM_TIMEOUT": "-1s",
+				"DI_BLIND_POLL_BUDGET": "lots",
 			},
 			wantRdr: true,
 		},
@@ -184,6 +190,11 @@ func TestLoadFailsFastOnBadConfiguration(t *testing.T) {
 		{"public base url with a path", map[string]string{"PUBLIC_BASE_URL": "https://gw.example.com/api"}, "no path"},
 		{"zero artifact budget", map[string]string{"ARTIFACT_FETCH_TIMEOUT": "0s"}, "must be positive"},
 		{"unparseable duration", map[string]string{"RESULT_TTL": "24 hours"}, "not a valid duration"},
+		{"unparseable integer", map[string]string{"QUEUE_DEPTH": "lots"}, "QUEUE_DEPTH is not a valid integer"},
+		{"byte cap with a unit", map[string]string{"MAX_REQUEST_BYTES": "500Mi"}, "MAX_REQUEST_BYTES is not a valid integer"},
+		{"unparseable enabled inflight", map[string]string{"DI_MAX_INFLIGHT": "four"}, "DI_MAX_INFLIGHT is not a valid integer"},
+		{"unparseable enabled poll budget", map[string]string{"READ_BLIND_POLL_BUDGET": "lots"}, "READ_BLIND_POLL_BUDGET is not a valid integer"},
+		{"unparseable watermark", map[string]string{"DISK_HIGH_WATERMARK": "90%"}, "DISK_HIGH_WATERMARK is not a valid number"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

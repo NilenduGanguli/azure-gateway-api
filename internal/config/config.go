@@ -138,28 +138,19 @@ type Config struct {
 // Load reads configuration from the environment and validates it.
 func Load() (*Config, error) {
 	c := &Config{
-		Addr:                env("GATEWAY_ADDR", ":8080"),
-		PublicBaseURL:       strings.TrimRight(env("PUBLIC_BASE_URL", ""), "/"),
-		DataDir:             env("DATA_DIR", "/data"),
-		DISyncMode:          SyncMode(strings.ToLower(env("DI_SYNC_ANALYZE", string(SyncAuto)))),
-		DIBlindPollBudget:   envInt("DI_BLIND_POLL_BUDGET", 60),
-		ReadBlindPollBudget: envInt("READ_BLIND_POLL_BUDGET", 60),
-		QueueDepth:          envInt("QUEUE_DEPTH", 0),
-		SplitPages:          envInt("SPLIT_PAGES", 5),
-		DiskHighWatermark:   envFloat("DISK_HIGH_WATERMARK", 0.90),
-		MaxRequestBytes:     int64(envInt("MAX_REQUEST_BYTES", 500*1024*1024)),
-		MaxResultBytes:      int64(envInt("MAX_RESULT_BYTES", 512*1024*1024)),
-		LogLevel:            strings.ToLower(env("LOG_LEVEL", "info")),
-		LogFormat:           strings.ToLower(env("LOG_FORMAT", "json")),
+		Addr:          env("GATEWAY_ADDR", ":8080"),
+		PublicBaseURL: strings.TrimRight(env("PUBLIC_BASE_URL", ""), "/"),
+		DataDir:       env("DATA_DIR", "/data"),
+		DISyncMode:    SyncMode(strings.ToLower(env("DI_SYNC_ANALYZE", string(SyncAuto)))),
+		LogLevel:      strings.ToLower(env("LOG_LEVEL", "info")),
+		LogFormat:     strings.ToLower(env("LOG_FORMAT", "json")),
 		DI: Upstream{
-			BaseURL:     strings.TrimRight(env("DI_UPSTREAM_URL", ""), "/"),
-			APIKey:      env("DI_UPSTREAM_API_KEY", ""),
-			MaxInflight: envInt("DI_MAX_INFLIGHT", 4),
+			BaseURL: strings.TrimRight(env("DI_UPSTREAM_URL", ""), "/"),
+			APIKey:  env("DI_UPSTREAM_API_KEY", ""),
 		},
 		Read: Upstream{
-			BaseURL:     strings.TrimRight(env("READ_UPSTREAM_URL", ""), "/"),
-			APIKey:      env("READ_UPSTREAM_API_KEY", ""),
-			MaxInflight: envInt("READ_MAX_INFLIGHT", 4),
+			BaseURL: strings.TrimRight(env("READ_UPSTREAM_URL", ""), "/"),
+			APIKey:  env("READ_UPSTREAM_API_KEY", ""),
 		},
 	}
 	for _, name := range removedSettings {
@@ -176,7 +167,42 @@ func Load() (*Config, error) {
 		}
 	}
 
+	// A number that does not parse is an error, never a quiet fallback to the default. SPLIT_PAGES
+	// is why: 0 is its kill switch, and SPLIT_PAGES=off or a letter O for a zero would otherwise
+	// have left splitting on at 5.
 	var err error
+	if c.QueueDepth, err = envInt("QUEUE_DEPTH", 0); err != nil {
+		collect(err)
+	}
+	if c.SplitPages, err = envInt("SPLIT_PAGES", 5); err != nil {
+		collect(err)
+	}
+	if c.DiskHighWatermark, err = envFloat("DISK_HIGH_WATERMARK", 0.90); err != nil {
+		collect(err)
+	}
+	if c.MaxRequestBytes, err = envInt64("MAX_REQUEST_BYTES", 500*1024*1024); err != nil {
+		collect(err)
+	}
+	if c.MaxResultBytes, err = envInt64("MAX_RESULT_BYTES", 512*1024*1024); err != nil {
+		collect(err)
+	}
+	// A disabled surface's own settings are not validated, so a stale value left in the manifest
+	// of a gateway that fronts only the other container cannot stop it starting.
+	if c.DI.MaxInflight, err = envInt("DI_MAX_INFLIGHT", 4); err != nil && c.DI.Enabled() {
+		collect(err)
+	}
+	if c.Read.MaxInflight, err = envInt("READ_MAX_INFLIGHT", 4); err != nil && c.Read.Enabled() {
+		collect(err)
+	}
+	if c.DIBlindPollBudget, err = envInt("DI_BLIND_POLL_BUDGET", 60); err != nil &&
+		c.DI.Enabled() {
+		collect(err)
+	}
+	if c.ReadBlindPollBudget, err = envInt("READ_BLIND_POLL_BUDGET", 60); err != nil &&
+		c.Read.Enabled() {
+		collect(err)
+	}
+
 	if c.ResultTTL, err = envDuration("RESULT_TTL", 24*time.Hour); err != nil {
 		collect(err)
 	}
@@ -192,8 +218,7 @@ func Load() (*Config, error) {
 	if c.DISyncProbeTimeout, err = envDuration("DI_SYNC_PROBE_TIMEOUT", 60*time.Second); err != nil {
 		collect(err)
 	}
-	// A disabled surface's own settings are not validated, so a stale value left in the manifest
-	// of a gateway that fronts only the other container cannot stop it starting.
+	// As above, only an enabled surface's own timeout is validated.
 	if c.DI.Timeout, err = envDuration("DI_UPSTREAM_TIMEOUT", 15*time.Minute); err != nil &&
 		c.DI.Enabled() {
 		collect(err)
@@ -410,28 +435,40 @@ func env(key, def string) string {
 	return def
 }
 
-func envInt(key string, def int) int {
+func envInt(key string, def int) (int, error) {
 	v, ok := os.LookupEnv(key)
 	if !ok || v == "" {
-		return def
+		return def, nil
 	}
 	n, err := strconv.Atoi(strings.TrimSpace(v))
 	if err != nil {
-		return def
+		return def, fmt.Errorf("%s is not a valid integer: %w", key, err)
 	}
-	return n
+	return n, nil
 }
 
-func envFloat(key string, def float64) float64 {
+func envInt64(key string, def int64) (int64, error) {
 	v, ok := os.LookupEnv(key)
 	if !ok || v == "" {
-		return def
+		return def, nil
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+	if err != nil {
+		return def, fmt.Errorf("%s is not a valid integer: %w", key, err)
+	}
+	return n, nil
+}
+
+func envFloat(key string, def float64) (float64, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def, nil
 	}
 	f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
 	if err != nil {
-		return def
+		return def, fmt.Errorf("%s is not a valid number: %w", key, err)
 	}
-	return f
+	return f, nil
 }
 
 func envDuration(key string, def time.Duration) (time.Duration, error) {

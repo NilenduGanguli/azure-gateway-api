@@ -431,9 +431,7 @@ func (s *Server) relaySync(w http.ResponseWriter, r *http.Request, surface azerr
 			// value, which the SDKs' integer-only parser rejects.
 			if !skipRelayHeader(k) && k != "Content-Length" &&
 				http.CanonicalHeaderKey(k) != "Retry-After" {
-				for _, v := range vs {
-					w.Header().Add(k, v)
-				}
+				relayHeader(w.Header(), k, vs)
 			}
 		}
 		w.Header().Set("Content-Length", "0")
@@ -525,12 +523,23 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) {
 		if skipRelayHeader(k) {
 			continue
 		}
-		for _, v := range vs {
-			dst.Add(k, v)
-		}
+		relayHeader(dst, k, vs)
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+// relayHeader gives the client the container's own values for one header, replacing any the
+// gateway set first.
+//
+// Middleware writes Server, Cache-Control and the x-ms-client-request-id echo before any handler
+// runs, and a real container sends Server and the echo too. Appending to them sent each header
+// twice, which no pod does, and the spec asks for these routes to be relayed verbatim.
+func relayHeader(dst http.Header, k string, vs []string) {
+	dst.Del(k)
+	for _, v := range vs {
+		dst.Add(k, v)
+	}
 }
 
 func skipRelayHeader(k string) bool {

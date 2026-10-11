@@ -74,17 +74,27 @@ Configuration is read from the environment; see README.md.
 `)
 }
 
+// requireBothUpstreams refuses to serve with only one upstream configured.
+//
+// The configuration accepts a gateway in front of one kind of container, but the job manager
+// still builds a runner and an upstream client for both surfaces. Serving a surface with no
+// container behind it would answer 202 for work that can never run, so refuse instead. Plan task
+// T10 deletes this guard: by then T9 builds runners, and T10 registers routes, for configured
+// surfaces only.
+func requireBothUpstreams(cfg *config.Config) error {
+	if !cfg.DI.Enabled() || !cfg.Read.Enabled() {
+		return errors.New("this build still needs both DI_UPSTREAM_URL and READ_UPSTREAM_URL")
+	}
+	return nil
+}
+
 func serve() error {
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("configuration is invalid:\n%w", err)
 	}
-	// The configuration accepts a gateway in front of one kind of container, but the job manager
-	// still builds a runner and an upstream client for both surfaces. Serving a surface with no
-	// container behind it would answer 202 for work that can never run, so refuse instead, until
-	// the runners are built for configured surfaces only.
-	if !cfg.DI.Enabled() || !cfg.Read.Enabled() {
-		return errors.New("this build still needs both DI_UPSTREAM_URL and READ_UPSTREAM_URL")
+	if err := requireBothUpstreams(cfg); err != nil {
+		return err
 	}
 	log := logging.New(cfg.LogLevel, cfg.LogFormat)
 	started := time.Now()

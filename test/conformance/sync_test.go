@@ -3,6 +3,9 @@ package conformance
 import (
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -199,6 +202,70 @@ func TestServerHeaderMatchesTheContainers(t *testing.T) {
 				t.Errorf("Server is %q, want %q (status %d)", got, tc.want, resp.StatusCode)
 			}
 		})
+	}
+}
+
+// TestRelayedResponsesCarryOneServerHeader is a regression test.
+//
+// The gateway names Kestrel before any handler runs, and the relay paths appended the container's
+// own headers to it. A real container sends Server: Kestrel too, and HAProxy passes it through, so
+// every relayed response carried the header twice, which no pod does. mockazure is built on
+// httptest and sends no Server header, so here it sits behind a proxy that adds one.
+func TestRelayedResponsesCarryOneServerHeader(t *testing.T) {
+	info := func(h *harness) *http.Response {
+		return h.get("/documentintelligence/info?api-version=" + apiVersion)
+	}
+	for _, tc := range []struct {
+		name       string
+		di         mockazure.Options
+		do         func(*harness) *http.Response
+		wantStatus int
+	}{
+		{"metadata relay", mockazure.Options{}, info, http.StatusOK},
+		{"model relay", mockazure.Options{}, func(h *harness) *http.Response {
+			return h.get("/documentintelligence/documentModels/prebuilt-layout?api-version=" +
+				apiVersion)
+		}, http.StatusOK},
+		{"syncAnalyze relay", mockazure.Options{}, func(h *harness) *http.Response {
+			return h.post(diSync, "%PDF-1.7 fake")
+		}, http.StatusOK},
+		{"bodyless upstream error", mockazure.Options{MetadataMissing: true}, info,
+			http.StatusNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, harnessOpts{di: tc.di, tweak: behindKestrel(t)})
+
+			resp := tc.do(h)
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+
+			if resp.StatusCode != tc.wantStatus {
+				t.Fatalf("status %d, want %d", resp.StatusCode, tc.wantStatus)
+			}
+			if got := resp.Header.Values("Server"); len(got) != 1 || got[0] != "Kestrel" {
+				t.Errorf("Server is %q, want exactly one Kestrel", got)
+			}
+		})
+	}
+}
+
+// behindKestrel puts the DI container behind a proxy that names Kestrel on every response, as the
+// real container does.
+func behindKestrel(t *testing.T) func(*config.Config) {
+	t.Helper()
+	return func(c *config.Config) {
+		target, err := url.Parse(c.DI.BaseURL)
+		if err != nil {
+			t.Fatalf("parse DI URL: %v", err)
+		}
+		proxy := httputil.NewSingleHostReverseProxy(target)
+		proxy.ModifyResponse = func(resp *http.Response) error {
+			resp.Header.Set("Server", "Kestrel")
+			return nil
+		}
+		front := httptest.NewServer(proxy)
+		t.Cleanup(front.Close)
+		c.DI.BaseURL = front.URL
 	}
 }
 

@@ -1265,8 +1265,9 @@ T10 and T11 then add the remaining surface and admin features.
 ### T10: surface and app (wave 2)
 
 **Files:**
-- Modify: `internal/surface/{surface,di,read}.go`, `internal/app/app.go`
+- Modify: `internal/surface/{surface,di,read}.go`, `internal/app/app.go`, `cmd/gateway/main.go`
 - Create: `internal/surface/params.go`, `passthrough.go`, `sync.go`, and tests
+- Delete: `cmd/gateway/main_test.go`
 
 **Changes:**
 1. **`params.go`:** `checkDIParams(q url.Values) *azerr.APIError` implements the sync-only spec
@@ -1311,6 +1312,10 @@ T10 and T11 then add the remaining surface and admin features.
 6. **`submit`** uses `config.RetryAfterPoll` and `RetryAfterBusy`, and `diAnalyze` calls
    `checkDIParams` before `submit`.
 7. **Delete** `writeResolvedSync` and the old `passthrough`.
+8. **Must remove:** `requireBothUpstreams` in `cmd/gateway/main.go` and its test,
+   `cmd/gateway/main_test.go`. T6 added the guard because the job manager still built a runner for
+   both surfaces. With T9's runners and item 5's routes both per configured surface, a gateway with
+   one upstream is servable, and leaving the guard in keeps the optional-upstream feature unusable.
 
 **Tests** (`surface` package, `httptest` with fake engines through the real wiring):
 - every parameter-policy row, on both DI routes;

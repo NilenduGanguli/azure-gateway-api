@@ -421,8 +421,9 @@ Everything is an environment variable; nothing is read from disk. A few parsing 
 before the tables:
 
 - An **empty value counts as unset** and the default applies (`env()` checks for a non-empty value).
-- A malformed **integer, float or boolean silently falls back to its default**. `DI_MAX_INFLIGHT=four`
-  quietly becomes `4`. Check `/_gw/config` after any change.
+- A malformed **number is fatal**. `DI_MAX_INFLIGHT=four` fails startup with
+  `DI_MAX_INFLIGHT is not a valid integer`. Byte sizes are plain integers, so `500Mi` is rejected
+  too. A disabled surface's own settings are not checked.
 - A malformed **duration is fatal**. `RESULT_TTL=24` (no unit) fails startup with
   `RESULT_TTL is not a valid duration`. Durations are Go syntax: `30s`, `10m`, `24h`, `1h30m`.
 - Validation is fail-fast and reports *every* problem at once, because a gateway that starts with a
