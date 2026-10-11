@@ -13,10 +13,14 @@ import (
 // BaseWidth is the width of a notional page 0.
 const BaseWidth = 600
 
+// Height is every page's height. Together with a width above BaseWidth it tells a page Make built
+// from an ordinary one: no common paper size is 800 points tall.
+const Height = 800
+
 // PageOf maps a MediaBox width back to its original page number.
 func PageOf(width float64) int { return int(width+0.5) - BaseWidth }
 
-// Make returns a PDF with n pages. Page i's MediaBox is [0 0 BaseWidth+i 800] and its content
+// Make returns a PDF with n pages. Page i's MediaBox is [0 0 BaseWidth+i Height] and its content
 // stream draws the text "PAGE i".
 func Make(n int) []byte {
 	var b bytes.Buffer
@@ -39,8 +43,8 @@ func Make(n int) []byte {
 	obj("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
 	for i := 1; i <= n; i++ {
 		stream := fmt.Sprintf("BT /F1 24 Tf 72 700 Td (PAGE %d) Tj ET", i)
-		obj(fmt.Sprintf("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %d 800] "+
-			"/Resources << /Font << /F1 3 0 R >> >> /Contents %d 0 R >>", BaseWidth+i, 5+2*(i-1)))
+		obj(fmt.Sprintf("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %d %d] "+
+			"/Resources << /Font << /F1 3 0 R >> >> /Contents %d 0 R >>", BaseWidth+i, Height, 5+2*(i-1)))
 		obj(fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(stream), stream))
 	}
 

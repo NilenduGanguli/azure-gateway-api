@@ -11,6 +11,11 @@
 // every pod is busy, gateway-class statuses from a pod that is overloaded or being replaced, a
 // connection torn down mid-body, and a per-pod concurrency cap. See BusyFirst, StatusFirst,
 // ResetMidBody and Capacity.
+//
+// NewPaged builds a third kind for splitting: a fake that recognises the original pages of the
+// pdftest document, or part of one, it is sent, answers with docgen's result for exactly those
+// pages, and hangs or fails per page (see PagedOptions). cmd/fakeazure serves it on fixed ports
+// for end-to-end runs.
 package mockazure
 
 import (
@@ -120,6 +125,13 @@ type Options struct {
 type Container struct {
 	opts   Options
 	server *httptest.Server
+	// paged is set on a fake NewPaged built, which answers from docgen for the pages it is sent.
+	paged *paged
+
+	// done is closed by Close. It ends every call the container is holding, which would otherwise
+	// keep Close waiting until each client gave up.
+	done      chan struct{}
+	closeOnce sync.Once
 
 	mu   sync.Mutex
 	ops  map[string]*operation
@@ -142,13 +154,26 @@ type Container struct {
 
 type operation struct {
 	polls int
+	// result is the analyzeResult a paged fake worked out when the operation was submitted. A
+	// plain fake builds its body when polled, and leaves this nil.
+	result []byte
+}
+
+// newContainer validates opts and returns a container with no server yet.
+func newContainer(opts Options) *Container {
+	opts.validate()
+	return &Container{opts: opts, ops: map[string]*operation{}, done: make(chan struct{})}
 }
 
 // URL returns the container's base URL.
 func (c *Container) URL() string { return c.server.URL }
 
-// Close shuts the container down.
-func (c *Container) Close() { c.server.Close() }
+// Close shuts the container down. A call it is still holding is cut, not answered. Closing twice
+// is harmless.
+func (c *Container) Close() {
+	c.closeOnce.Do(func() { close(c.done) })
+	c.server.Close()
+}
 
 // Hits reports how many analyze calls, synchronous or asynchronous, the container itself served:
 // a call HAProxy turned away (Capacity, BusyFirst, StatusFirst) never reached a pod, and one
@@ -194,47 +219,39 @@ func (o Options) validate() {
 
 // NewDI starts a fake Document Intelligence layout container.
 func NewDI(opts Options) *Container {
-	opts.validate()
-	c := &Container{opts: opts, ops: map[string]*operation{}}
+	c := newContainer(opts)
+	c.server = httptest.NewServer(c.handler(c.diMux()))
+	return c
+}
+
+// NewRead starts a fake Computer Vision Read v3.2 container.
+func NewRead(opts Options) *Container {
+	c := newContainer(opts)
+	c.server = httptest.NewServer(c.handler(c.readMux()))
+	return c
+}
+
+// diMux routes a Document Intelligence container.
+func (c *Container) diMux() *http.ServeMux {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("POST /documentintelligence/documentModels/{action}", func(w http.ResponseWriter, r *http.Request) {
-		c.serveAction(w, r, "/documentintelligence/documentModels/prebuilt-layout/analyzeResults/")
-	})
-
-	mux.HandleFunc("GET /documentintelligence/documentModels/{modelId}/analyzeResults/{resultId}",
-		func(w http.ResponseWriter, r *http.Request) {
-			c.record(r.URL.Path)
-			c.servePoll(w, r.PathValue("resultId"), true)
-		})
-
-	// The legacy Form Recognizer family, which a probed layout-4.0 build declares alongside the
-	// newer one.
-	mux.HandleFunc("POST /formrecognizer/documentModels/{action}", func(w http.ResponseWriter, r *http.Request) {
-		c.serveAction(w, r, "/formrecognizer/documentModels/prebuilt-layout/analyzeResults/")
-	})
-	mux.HandleFunc("GET /formrecognizer/documentModels/{modelId}/analyzeResults/{resultId}",
-		func(w http.ResponseWriter, r *http.Request) {
-			c.record(r.URL.Path)
-			c.servePoll(w, r.PathValue("resultId"), true)
-		})
-
-	mux.HandleFunc("GET /documentintelligence/documentModels/{modelId}/analyzeResults/{resultId}/pdf",
-		func(w http.ResponseWriter, r *http.Request) {
-			c.record(r.URL.Path)
-			w.Header().Set("Content-Type", "application/pdf")
-			_, _ = w.Write([]byte("%PDF-1.7\n% fake searchable pdf\n"))
-		})
-
-	mux.HandleFunc("GET /documentintelligence/documentModels/{modelId}/analyzeResults/{resultId}/figures/{figureId}",
-		func(w http.ResponseWriter, r *http.Request) {
-			c.record(r.URL.Path)
-			w.Header().Set("Content-Type", "image/png")
-			_, _ = w.Write([]byte("\x89PNG\r\n\x1a\nfake-figure-" + r.PathValue("figureId")))
-		})
-
-	// Served on both families, as the containers do.
+	// Both families are served, as the containers do: the legacy Form Recognizer one is declared
+	// alongside the newer one by a probed layout-4.0 build.
 	for _, fam := range []string{"/documentintelligence", "/formrecognizer"} {
+		results := fam + "/documentModels/{modelId}/analyzeResults/{resultId}"
+
+		mux.HandleFunc("POST "+fam+"/documentModels/{action}", func(w http.ResponseWriter, r *http.Request) {
+			c.serveAction(w, r, fam+"/documentModels/prebuilt-layout/analyzeResults/")
+		})
+		mux.HandleFunc("GET "+results, func(w http.ResponseWriter, r *http.Request) {
+			c.record(r.URL.Path)
+			c.servePoll(w, r.PathValue("resultId"), true)
+		})
+		mux.HandleFunc("DELETE "+results, func(w http.ResponseWriter, r *http.Request) {
+			c.record(r.URL.Path)
+			c.serveDelete(w, r.PathValue("resultId"))
+		})
+
 		mux.HandleFunc("GET "+fam+"/info", func(w http.ResponseWriter, r *http.Request) {
 			c.record(r.URL.Path)
 			if c.opts.MetadataMissing {
@@ -268,11 +285,38 @@ func NewDI(opts Options) *Container {
 					"apiVersion":  "2024-11-30",
 				})
 			})
+
+		// Model-lifecycle operations: a layout container builds no models, so it has none.
+		mux.HandleFunc("GET "+fam+"/operations", func(w http.ResponseWriter, r *http.Request) {
+			c.record(r.URL.Path)
+			writeRaw(w, http.StatusOK, []byte(`{"value":[]}`))
+		})
+		mux.HandleFunc("GET "+fam+"/operations/{operationId}", func(w http.ResponseWriter, r *http.Request) {
+			c.record(r.URL.Path)
+			writeAPIError(w, http.StatusNotFound, apiError{
+				Code: "NotFound", Message: "Resource not found.",
+				InnerError: &apiError{Code: "OperationNotFound", Message: "The requested operation " +
+					"wasn't found. The identifier is invalid or the operation is expired."},
+			})
+		})
 	}
 
-	c.addCommon(mux)
-	c.start(mux)
-	return c
+	mux.HandleFunc("GET /documentintelligence/documentModels/{modelId}/analyzeResults/{resultId}/pdf",
+		func(w http.ResponseWriter, r *http.Request) {
+			c.record(r.URL.Path)
+			w.Header().Set("Content-Type", "application/pdf")
+			_, _ = w.Write([]byte("%PDF-1.7\n% fake searchable pdf\n"))
+		})
+
+	mux.HandleFunc("GET /documentintelligence/documentModels/{modelId}/analyzeResults/{resultId}/figures/{figureId}",
+		func(w http.ResponseWriter, r *http.Request) {
+			c.record(r.URL.Path)
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write([]byte("\x89PNG\r\n\x1a\nfake-figure-" + r.PathValue("figureId")))
+		})
+
+	c.addCommon(mux, true)
+	return mux
 }
 
 // serveAction answers a POST to a Document Intelligence model: :syncAnalyze, :analyze, or a verb
@@ -284,17 +328,15 @@ func (c *Container) serveAction(w http.ResponseWriter, r *http.Request, resultPr
 		c.serveSync(w, r, true)
 	case "analyze":
 		if c.authorized(w, r) {
-			c.serveSubmit(w, r, resultPrefix)
+			c.serveSubmit(w, r, resultPrefix, true)
 		}
 	default:
 		writeDIError(w, http.StatusNotFound, "NotFound", "Resource not found.")
 	}
 }
 
-// NewRead starts a fake Computer Vision Read v3.2 container.
-func NewRead(opts Options) *Container {
-	opts.validate()
-	c := &Container{opts: opts, ops: map[string]*operation{}}
+// readMux routes a Computer Vision Read v3.2 container.
+func (c *Container) readMux() *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /vision/v3.2/read/syncAnalyze", func(w http.ResponseWriter, r *http.Request) {
@@ -307,7 +349,7 @@ func NewRead(opts Options) *Container {
 		if !c.authorized(w, r) {
 			return
 		}
-		c.serveSubmit(w, r, "/vision/v3.2/read/analyzeResults/")
+		c.serveSubmit(w, r, "/vision/v3.2/read/analyzeResults/", false)
 	})
 
 	mux.HandleFunc("GET /vision/v3.2/read/analyzeResults/{operationId}", func(w http.ResponseWriter, r *http.Request) {
@@ -315,16 +357,15 @@ func NewRead(opts Options) *Container {
 		c.servePoll(w, r.PathValue("operationId"), false)
 	})
 
-	c.addCommon(mux)
-	c.start(mux)
-	return c
+	c.addCommon(mux, false)
+	return mux
 }
 
-// start serves mux the way Kestrel would. Every answer names Kestrel, and a request no route
+// handler serves mux the way Kestrel would. Every answer names Kestrel, and a request no route
 // matches gets Kestrel's bodyless 404, or a bodyless 405 with Allow for a known path and the wrong
 // verb, where net/http's mux would have written a line of text.
-func (c *Container) start(mux *http.ServeMux) {
-	c.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func (c *Container) handler(mux *http.ServeMux) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !c.opts.NoServerHeader {
 			w.Header().Set("Server", "Kestrel")
 		}
@@ -332,7 +373,7 @@ func (c *Container) start(mux *http.ServeMux) {
 			w = bodyless{w}
 		}
 		mux.ServeHTTP(w, r)
-	}))
+	})
 }
 
 // bodyless passes on a status and its headers and drops the body: the content headers net/http's
@@ -349,7 +390,17 @@ func (b bodyless) WriteHeader(status int) {
 
 func (b bodyless) Write(p []byte) (int, error) { return len(p), nil }
 
-func (c *Container) addCommon(mux *http.ServeMux) {
+// writeNotFound is Kestrel's answer for a request a route matched by path but its constraints
+// rejected: a bodyless 404, the same as for a path no route matches.
+func writeNotFound(w http.ResponseWriter) {
+	w.Header().Set("Content-Length", "0")
+	w.WriteHeader(http.StatusNotFound)
+}
+
+// addCommon routes what every container serves besides analysis: its health, its home page, its
+// swagger and its usage records. The gateway relays the last three verbatim, so the bodies here
+// are representative, not recorded; what matters is that the routes exist and answer in kind.
+func (c *Container) addCommon(mux *http.ServeMux, di bool) {
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
 		if c.opts.StatusUnhealthy {
 			writeJSON(w, http.StatusOK, map[string]string{
@@ -364,6 +415,56 @@ func (c *Container) addCommon(mux *http.ServeMux) {
 	mux.HandleFunc("GET /ready", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"ready": "ready"})
 	})
+
+	name, version := "Computer Vision Read", "v3.2"
+	if di {
+		name, version = "Document Intelligence", "2024-11-30"
+	}
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		writeHTML(w, "<!DOCTYPE html><html><head><title>"+name+" container</title></head>"+
+			"<body><h1>The "+name+" container is running.</h1></body></html>")
+	})
+	swaggerUI := func(w http.ResponseWriter, r *http.Request) {
+		writeHTML(w, `<!DOCTYPE html><html><head><title>Swagger UI</title></head>`+
+			`<body><div id="swagger-ui"></div></body></html>`)
+	}
+	mux.HandleFunc("GET /swagger", swaggerUI)
+	mux.HandleFunc("GET /swagger/index.html", swaggerUI)
+	mux.HandleFunc("GET /swagger/v1/swagger.json", func(w http.ResponseWriter, r *http.Request) {
+		writeRaw(w, http.StatusOK, []byte(`{"openapi":"3.0.1","info":{"title":"`+name+
+			`","version":"`+version+`"},"paths":{}}`))
+	})
+
+	usage := []byte(`{"apiType":"` + strings.ToLower(strings.ReplaceAll(name, " ", "")) +
+		`","serviceName":"` + name + `","meters":[]}`)
+	mux.HandleFunc("GET /records/usage-logs", func(w http.ResponseWriter, r *http.Request) {
+		writeRaw(w, http.StatusOK, usage)
+	})
+	mux.HandleFunc("GET /records/usage-logs/{month}/{year}", func(w http.ResponseWriter, r *http.Request) {
+		// The month and year are integer route constraints, so anything else matches no route.
+		month, okMonth := positive(r.PathValue("month"))
+		_, okYear := positive(r.PathValue("year"))
+		if !okMonth || !okYear || month > 12 {
+			writeNotFound(w)
+			return
+		}
+		writeRaw(w, http.StatusOK, usage)
+	})
+}
+
+// positive parses a positive decimal integer of ASCII digits.
+func positive(s string) (int, bool) {
+	if s == "" || len(s) > 9 {
+		return 0, false
+	}
+	n := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
+		n = n*10 + int(s[i]-'0')
+	}
+	return n, n > 0
 }
 
 func (c *Container) authorized(w http.ResponseWriter, r *http.Request) bool {
@@ -382,8 +483,14 @@ func (c *Container) serveSync(w http.ResponseWriter, r *http.Request, di bool) {
 	// Counted first: SyncCalls is every attempt a client made, whoever answered it.
 	c.syncCalls.Add(1)
 	// The body is read before anything is answered, so a client still uploading meets the answer
-	// it is owed and not a connection closed under it.
-	_, _ = io.Copy(io.Discard, r.Body)
+	// it is owed and not a connection closed under it. A paged fake keeps it to work out which
+	// pages it was sent.
+	var body []byte
+	if c.paged != nil {
+		body, _ = io.ReadAll(r.Body)
+	} else {
+		_, _ = io.Copy(io.Discard, r.Body)
+	}
 
 	// What HAProxy and the autoscaler do to a call happens in front of the container, so it is
 	// decided before anything the container does: its key check, its behaviour and its Latency.
@@ -414,6 +521,10 @@ func (c *Container) serveSync(w http.ResponseWriter, r *http.Request, di bool) {
 	if c.opts.Latency > 0 {
 		time.Sleep(c.opts.Latency)
 	}
+	if c.paged != nil {
+		c.paged.serveSync(c, w, r, body, di)
+		return
+	}
 
 	if c.opts.SyncErrorStatus != 0 {
 		w.Header().Set("Retry-After", "120")
@@ -425,7 +536,7 @@ func (c *Container) serveSync(w http.ResponseWriter, r *http.Request, di bool) {
 
 	switch c.opts.Sync {
 	case SyncHang:
-		<-r.Context().Done()
+		c.hang(r)
 		return
 	case Sync404:
 		// Kestrel's unrouted response: no body at all. This is what distinguishes "this build does
@@ -529,10 +640,21 @@ func (c *Container) writeSyncBody(w http.ResponseWriter, body []byte) {
 }
 
 // serveSubmit answers the asynchronous analyze route.
-func (c *Container) serveSubmit(w http.ResponseWriter, r *http.Request, resultPrefix string) {
+func (c *Container) serveSubmit(w http.ResponseWriter, r *http.Request, resultPrefix string, di bool) {
 	c.hits.Add(1)
-	_, _ = io.Copy(io.Discard, r.Body)
-	id := c.newOperation()
+	op := &operation{}
+	if c.paged != nil {
+		// The analysis is worked out now, as a container starts one on submit; the poll serves it.
+		body, _ := io.ReadAll(r.Body)
+		a, ok := c.paged.analyse(w, r, body, di)
+		if !ok {
+			return
+		}
+		op.result = c.paged.result(a, di)
+	} else {
+		_, _ = io.Copy(io.Discard, r.Body)
+	}
+	id := c.addOperation(op)
 	w.Header().Set("Operation-Location", c.server.URL+resultPrefix+id)
 	w.Header().Set("Retry-After", "1")
 	w.WriteHeader(http.StatusAccepted)
@@ -566,15 +688,47 @@ func (c *Container) servePoll(w http.ResponseWriter, id string, di bool) {
 		writeRaw(w, http.StatusOK, failedEnvelope(di))
 		return
 	}
-	writeRaw(w, http.StatusOK, envelope("succeeded", pollUpdated, "analyzeResult", c.analyzeResult(di)))
+	result := op.result
+	if result == nil {
+		result = c.analyzeResult(di)
+	}
+	writeRaw(w, http.StatusOK, envelope("succeeded", pollUpdated, "analyzeResult", result))
 }
 
-func (c *Container) newOperation() string {
+// serveDelete deletes a Document Intelligence result. Afterwards its id is unknown, exactly as an
+// id that never existed is.
+func (c *Container) serveDelete(w http.ResponseWriter, id string) {
+	c.mu.Lock()
+	_, ok := c.ops[id]
+	delete(c.ops, id)
+	c.mu.Unlock()
+	if !ok {
+		writeUnknownID(w, true)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (c *Container) newOperation() string { return c.addOperation(&operation{}) }
+
+// addOperation stores op under a new id and returns the id.
+func (c *Container) addOperation(op *operation) string {
 	id := fmt.Sprintf("%08x-0000-4000-8000-%012x", c.seq.Add(1), c.seq.Load())
 	c.mu.Lock()
-	c.ops[id] = &operation{}
+	c.ops[id] = op
 	c.mu.Unlock()
 	return id
+}
+
+// hang holds a call, answering nothing, until its client gives up. If the container is closed
+// first the connection is cut instead: returning would send an empty 200, which reads as a result
+// with nothing in it.
+func (c *Container) hang(r *http.Request) {
+	select {
+	case <-r.Context().Done():
+	case <-c.done:
+		panic(http.ErrAbortHandler)
+	}
 }
 
 // The timestamps every envelope carries: when the operation was created, and when it was last
@@ -731,6 +885,28 @@ func writeUnknownID(w http.ResponseWriter, di bool) {
 		"message": "Operation ID is invalid, expired or the results matching this " +
 			"operationId have been deleted.",
 	}})
+}
+
+// writeHTML sends a 200 HTML page.
+func writeHTML(w http.ResponseWriter, page string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Length", fmt.Sprint(len(page)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, page)
+}
+
+// apiError is the error object both containers wrap in {"error": ...}. It is a struct so its
+// members are written in the containers' order, code first and innererror last.
+type apiError struct {
+	Code       string    `json:"code"`
+	Message    string    `json:"message"`
+	InnerError *apiError `json:"innererror,omitempty"`
+}
+
+func writeAPIError(w http.ResponseWriter, status int, e apiError) {
+	writeJSON(w, status, struct {
+		Error apiError `json:"error"`
+	}{e})
 }
 
 func writeDIError(w http.ResponseWriter, status int, code, message string) {

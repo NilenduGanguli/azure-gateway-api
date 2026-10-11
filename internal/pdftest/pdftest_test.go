@@ -31,6 +31,9 @@ func TestMakeParsesWithDistinctWidths(t *testing.T) {
 		if got := PageOf(d.Width); got != i+1 {
 			t.Fatalf("page %d width %v maps to %d", i+1, d.Width, got)
 		}
+		if d.Height != Height {
+			t.Fatalf("page %d height %v, want %v", i+1, d.Height, Height)
+		}
 	}
 }
 
