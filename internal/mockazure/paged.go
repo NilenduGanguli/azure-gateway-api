@@ -89,6 +89,12 @@ type PagedOptions struct {
 
 	// NoServerHeader drops the Server: Kestrel header, as in Options.
 	NoServerHeader bool
+
+	// Replay, when set, answers each analysis with Replay's bare analyzeResult for the original
+	// pages the call carries, numbered as numbering says, in place of docgen's. A test can so put
+	// recorded service output, cut per part (internal/realcut), through the gateway. A nil answer
+	// is a 500.
+	Replay func(pages []int, numbering docgen.Numbering, di bool) []byte
 }
 
 // paged is a paged fake's own state, shared by every request it serves.
@@ -283,6 +289,8 @@ func (p *paged) serveSync(c *Container, w http.ResponseWriter, r *http.Request, 
 		} else {
 			writeDIError(w, http.StatusBadRequest, "InvalidImageFormat", "Input data is not a valid image.")
 		}
+	case p.o.Replay != nil && p.result(a, di) == nil:
+		writeDIError(w, http.StatusInternalServerError, "InternalServerError", "Nothing to replay for these pages.")
 	case c.opts.SyncBodyBare:
 		c.writeSyncBody(w, p.result(a, di))
 	default:
@@ -342,6 +350,9 @@ func (p *paged) bad(a analysis) bool {
 // 2023-07-31 on /formrecognizer has no sections, figures or contentFormat. A Read result is in
 // inches for a PDF and in pixels for an image, as the service measures them.
 func (p *paged) result(a analysis, di bool) []byte {
+	if p.o.Replay != nil {
+		return p.o.Replay(a.pages, a.numbering, di)
+	}
 	if !di {
 		return docgen.Read(a.pages, a.numbering, docgen.ReadOptions{Image: a.image})
 	}

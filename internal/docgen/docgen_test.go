@@ -111,15 +111,8 @@ func TestLegacyIsFormRecognizerShaped(t *testing.T) {
 		b := docgen.DI(pages, docgen.Original, o)
 		fs := azschema.Errors(ref(t).Result(azschema.FormRecognizer, b, azschema.Expect{
 			APIVersion: docgen.LegacyAPIVersion, Pages: numbers(pages, docgen.Original)}))
-		// contentFormat is a 2024-11-30 member; its absence is right here.
-		var keep []azschema.Finding
-		for _, f := range fs {
-			if f.Path != "/contentFormat" {
-				keep = append(keep, f)
-			}
-		}
-		if len(keep) > 0 {
-			t.Errorf("pages %v:\n  %s", pages, show(keep))
+		if len(fs) > 0 {
+			t.Errorf("pages %v:\n  %s", pages, show(fs))
 		}
 		for _, absent := range []string{`"sections"`, `"figures"`, `"contentFormat"`, `"elements"`, `"caption"`} {
 			if bytes.Contains(b, []byte(absent)) {

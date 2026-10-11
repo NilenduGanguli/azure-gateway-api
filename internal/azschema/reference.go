@@ -155,8 +155,11 @@ func (r *Reference) result(f Family, v obj, n *realcut.Node, e Expect) []Finding
 	}
 	out = DIInvariants(v, e)
 	if f == FormRecognizer {
-		// The 2023-07-31 result has no styles requirement of its own beyond its schema.
-		out = slices.DeleteFunc(out, func(fd Finding) bool { return fd.Path == "/styles" })
+		// The 2023-07-31 result has no contentFormat member, and its schema alone says what
+		// it needs of styles.
+		out = slices.DeleteFunc(out, func(fd Finding) bool {
+			return fd.Path == "/styles" || fd.Path == "/contentFormat"
+		})
 	}
 	walkDI(n, func(kind string, o *realcut.Node, path string) {
 		out = append(out, r.Order.check(kind, o, path)...)
