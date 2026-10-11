@@ -14,18 +14,14 @@ type Health struct {
 	URL  string `json:"url"`
 	OK   bool   `json:"ok"`
 	// Detail carries the container's own status message, or the reason it is unreachable.
-	Detail string `json:"detail,omitempty"`
-	// SyncAnalyze reports what the old clients learned about the synchronous route: "unknown"
-	// before the first call, then "available" or "unavailable". Client leaves it empty, and so
-	// omitted, because the synchronous route is the only one it uses; there is nothing to learn.
-	SyncAnalyze string `json:"syncAnalyze,omitempty"`
-	LatencyMS   int64  `json:"latencyMs,omitempty"`
+	Detail    string `json:"detail,omitempty"`
+	LatencyMS int64  `json:"latencyMs,omitempty"`
 }
 
 // checkStatus fetches the container's /status endpoint, which validates its billing key without
 // consuming a model query.
 func (b *base) checkStatus(ctx context.Context) Health {
-	h := Health{Name: b.name, URL: redactUserinfo(b.baseURL), SyncAnalyze: "unknown"}
+	h := Health{Name: b.name, URL: redactUserinfo(b.baseURL)}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
@@ -68,8 +64,4 @@ func summarizeStatus(body []byte, code int) string {
 
 // Health reports whether the container is reachable, from its GET /status. That route validates
 // the billing key without consuming a model query.
-func (c *Client) Health(ctx context.Context) Health {
-	h := c.b.checkStatus(ctx)
-	h.SyncAnalyze = ""
-	return h
-}
+func (c *Client) Health(ctx context.Context) Health { return c.b.checkStatus(ctx) }

@@ -1,29 +1,25 @@
 // Package upstream makes the gateway's calls to the Azure containers.
 //
-// Client is the sync-only path. One attempt is one POST of the stored document to the container's
+// Client is the only path. One attempt is one POST of the stored document to the container's
 // synchronous analyze route, through the HAProxy in front of autoscaled pods, on a connection of
 // its own. Do classifies the attempt into an Outcome and leaves retrying to its caller, with
 // Backoff for the wait. Nothing is ever polled: an asynchronous operation lives on the pod that
 // minted it, and an autoscaled pod can be gone before the poll arrives.
 //
-// DIClient and ReadClient are the older clients, which hide a sync, degraded-202 and async
-// strategy behind one blocking Analyze call. They stay until their callers have moved to Client.
-//
 // Both containers expose a native synchronous analyze route. Read's is documented; Document
 // Intelligence's is not — it is absent from every public doc and from azure-rest-api-specs, and
 // was established from the container image's own routing table. Because it is undocumented it is
 // also unreliable: it has been observed degrading to 202 under memory pressure, and older image
-// builds answer 500 UnhandledEndpointException. Both cases are handled rather than assumed away.
+// builds answer 500 UnhandledEndpointException. Both are classified (as Retry and RouteMissing)
+// rather than assumed away.
 package upstream
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -52,127 +48,17 @@ type Document struct {
 	Open        func() (io.ReadCloser, error)
 }
 
-// Request carries the per-call parameters that vary between surfaces.
-type Request struct {
-	// ModelID is the Document Intelligence model, e.g. prebuilt-layout. Unused by Read.
-	ModelID string
-	// Query is the client's query string, forwarded to the container unchanged apart from
-	// parameters the gateway owns.
-	Query url.Values
-	// Prefix is the path family to call the container on: /documentintelligence or the legacy
-	// /formrecognizer. Both are served by these containers, and a client that arrived on one
-	// must be answered on the same one.
-	Prefix string
-	// RequireOperation forces the asynchronous upstream path even when a synchronous route is
-	// available.
-	//
-	// Result-file endpoints — the searchable PDF and cropped figures — are addressed by the
-	// container's own operation id, and a synchronous call never mints one. So a submit that asks
-	// for output=pdf or output=figures must go through :analyze even though it costs the
-	// stateless-call property, or the artifacts would be unreachable afterwards.
-	RequireOperation bool
-}
-
-// Analyzer performs one blocking analysis against a container.
-type Analyzer interface {
-	// Analyze runs the document through the container and returns the result. The returned
-	// Result owns a temp file the caller must Cleanup.
-	Analyze(ctx context.Context, doc Document, req Request) (*Result, error)
-	// Surface identifies which error vocabulary this analyzer speaks.
-	Surface() azerr.Surface
-	// Health reports whether the container is reachable and what the gateway detected about it.
-	Health(ctx context.Context) Health
-}
-
-// transportConfig builds the shared HTTP transport settings.
-//
-// Redirects are never followed: .NET's pipeline sets AllowAutoRedirect=false and treats any 3xx
-// as terminal, and the containers have no reason to redirect. Following one here would mask a
-// misconfiguration that clients would experience as a hard failure.
-func newTransport(maxConns int) *http.Transport {
-	return &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		MaxIdleConns:          maxConns,
-		MaxIdleConnsPerHost:   maxConns,
-		MaxConnsPerHost:       0,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		ForceAttemptHTTP2:     true,
-	}
-}
-
-// affinityClient is a client dedicated to a single job.
-//
-// When a container degrades to 202 the resulting operation id is meaningful only to the replica
-// that minted it. Two mechanisms keep the follow-up polls on that replica: a private connection
-// pool capped at one idle connection, so keep-alive holds the same backend through the router,
-// and a private cookie jar, so the OpenShift HAProxy affinity cookie is replayed.
-//
-// Kubernetes sessionAffinity: ClientIP cannot help here — every request from the single gateway
-// pod shares a source IP, so it would pin all traffic to one backend rather than pinning each
-// job to its own.
-type affinityClient struct {
-	http *http.Client
-	tr   *http.Transport
-}
-
-func newAffinityClient(timeout time.Duration) (*affinityClient, error) {
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		return nil, fmt.Errorf("upstream: create cookie jar: %w", err)
-	}
-	tr := newTransport(1)
-	tr.DisableKeepAlives = false
-	return &affinityClient{
-		tr: tr,
-		http: &http.Client{
-			Transport: tr,
-			Jar:       jar,
-			Timeout:   timeout,
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
-	}, nil
-}
-
-func (a *affinityClient) close() { a.tr.CloseIdleConnections() }
-
-// base holds the plumbing shared by both surface clients.
+// base holds one surface's container address, credential and limits.
 type base struct {
 	name     string
 	baseURL  string
 	apiKey   string
 	timeout  time.Duration
 	tempDir  string
-	client   *http.Client
 	surface  azerr.Surface
 	maxBytes int64
-}
-
-func newBase(name, baseURL, apiKey string, timeout time.Duration, tempDir string,
-	surface azerr.Surface, maxConns int, maxBytes int64) *base {
-	return &base{
-		name:     name,
-		baseURL:  strings.TrimRight(baseURL, "/"),
-		apiKey:   apiKey,
-		timeout:  timeout,
-		tempDir:  tempDir,
-		surface:  surface,
-		maxBytes: maxBytes,
-		client: &http.Client{
-			Transport: newTransport(maxConns),
-			Timeout:   timeout,
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
-	}
+	// client serves health checks. It keeps no connection between them, as attempts do not.
+	client *http.Client
 }
 
 // newRequest builds an upstream request with the API key attached.
@@ -284,9 +170,8 @@ func (b *base) genericError(status int) *azerr.APIError {
 		fmt.Sprintf("The %s container returned HTTP %d.", b.name, status))
 }
 
-// drain empties and closes a response body so the connection can be reused. Leaking a body would
-// force a new TCP connection on the next call, which on the affinity path would also lose the
-// backend the job is pinned to.
+// drain empties and closes a response body, bounded, so a misbehaving container cannot hold the
+// caller reading it.
 func drain(resp *http.Response) {
 	if resp == nil || resp.Body == nil {
 		return
@@ -307,22 +192,6 @@ func (b *base) joinURL(path string, q url.Values) string {
 // tempPrefix derives a filename-safe prefix from a surface name.
 func tempPrefix(name string) string { return filepath.Base(name) }
 
-// unreachable turns a transport failure into the right kind of error.
-//
-// A cancelled or expired context is not an upstream fault: during graceful shutdown every
-// in-flight request fails this way, and reporting it as a container error would make the worker
-// mark a job terminally failed instead of leaving it for the recovery pass to resume. The 202 for
-// that job has already been sent, so failing it would break the promise.
-func (b *base) unreachable(ctx context.Context, err error) error {
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return ctxErr
-	}
-	// The transport error text embeds the full upstream URL, which is internal topology. It is
-	// logged by the caller; the client is told only which surface failed.
-	return azerr.Internal(b.surface,
-		fmt.Sprintf("The %s container is unreachable.", b.name))
-}
-
 // redactUserinfo removes credentials from a URL before it is shown on an unauthenticated endpoint.
 func redactUserinfo(raw string) string {
 	u, err := url.Parse(raw)
@@ -332,12 +201,6 @@ func redactUserinfo(raw string) string {
 	u.User = url.User(u.User.Username() + ":***")
 	return u.String()
 }
-
-// ErrSyncUnavailable reports that a container does not serve its synchronous analyze route.
-var ErrSyncUnavailable = errors.New("upstream: synchronous analyze route unavailable")
-
-// ErrDegradedToAsync reports that a synchronous call returned 202 instead of a result.
-var ErrDegradedToAsync = errors.New("upstream: synchronous analyze degraded to async")
 
 // Client makes synchronous calls to one surface's container.
 //
@@ -359,12 +222,19 @@ func NewClient(surface azerr.Surface, up config.Upstream, tempDir string, maxRes
 	if surface == azerr.SurfaceRead {
 		name = "computer-vision-read"
 	}
-	b := newBase(name, up.BaseURL, up.APIKey, up.Timeout, tempDir, surface, 1, maxResultBytes)
-	// The base's pooled client would keep an idle connection to HAProxy between health checks.
-	// This one shares a transport that never keeps one, and bounds nothing itself: checkStatus
-	// applies its own deadline.
-	b.client = &http.Client{Transport: newAttemptTransport(), CheckRedirect: noRedirects}
-	return &Client{b: b}
+	return &Client{b: &base{
+		name:     name,
+		baseURL:  strings.TrimRight(up.BaseURL, "/"),
+		apiKey:   up.APIKey,
+		timeout:  up.Timeout,
+		tempDir:  tempDir,
+		surface:  surface,
+		maxBytes: maxResultBytes,
+		// A pooled client would keep an idle connection to HAProxy between health checks. This
+		// one shares the attempts' transport, which never keeps one, and bounds nothing itself:
+		// checkStatus applies its own deadline.
+		client: &http.Client{Transport: newAttemptTransport(), CheckRedirect: noRedirects},
+	}}
 }
 
 // Surface identifies the error vocabulary this client speaks.
@@ -399,5 +269,7 @@ func newAttemptTransport() *http.Transport {
 	}
 }
 
-// noRedirects stops a client following a redirect, for the reason newTransport gives.
+// noRedirects stops a client following a redirect. .NET's pipeline sets AllowAutoRedirect=false
+// and treats any 3xx as terminal, and the containers have no reason to redirect: following one
+// would mask a misconfiguration that clients would experience as a hard failure.
 func noRedirects(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }

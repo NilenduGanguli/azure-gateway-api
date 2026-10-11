@@ -795,7 +795,7 @@ func TestDoUsesAFreshConnectionPerAttempt(t *testing.T) {
 		if r.Header.Get("Cookie") != "" {
 			t.Errorf("an attempt replayed a cookie: %q", r.Header.Get("Cookie"))
 		}
-		// An affinity cookie, as the OpenShift router sets: a cookie jar would pin the next
+		// A sticky-session cookie, as the OpenShift router sets: a cookie jar would pin the next
 		// attempt to this pod.
 		http.SetCookie(w, &http.Cookie{Name: "route", Value: "pod-a"})
 		w.Header().Set("Content-Type", "application/json")
