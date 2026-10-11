@@ -10,8 +10,8 @@ import (
 // PageRange is one term of Azure's pages grammar.
 type PageRange struct{ First, Last int }
 
-// ParsePages parses "1-3,5,7-9" (whitespace around terms tolerated). ok is false for anything
-// else, including open ranges, zero, or First > Last.
+// ParsePages parses "1-3,5,7-9" (spaces and tabs around terms tolerated). ok is false for
+// anything else, including open ranges, zero, or First > Last.
 //
 // A client's pages= value decides which pages are split, so anything this parser is unsure of
 // is rejected rather than guessed at: the document is then sent whole with the client's value
@@ -36,10 +36,11 @@ func ParsePages(spec string) (ranges []PageRange, ok bool) {
 	return ranges, true
 }
 
-// pageNumber parses one page number: ASCII digits, optionally surrounded by whitespace, at
-// least 1. strconv.Atoi alone would also take a sign.
+// pageNumber parses one page number: ASCII digits, optionally surrounded by spaces and tabs, at
+// least 1. strconv.Atoi alone would also take a sign. strings.TrimSpace would also strip
+// newlines and Unicode spaces such as NBSP, which are not part of the grammar.
 func pageNumber(s string) (int, bool) {
-	s = strings.TrimSpace(s)
+	s = strings.Trim(s, " \t")
 	if s == "" {
 		return 0, false
 	}

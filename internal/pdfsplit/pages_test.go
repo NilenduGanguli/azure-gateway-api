@@ -14,6 +14,7 @@ func TestParsePagesAcceptsAzureGrammar(t *testing.T) {
 		{"1-3", []PageRange{{1, 3}}},
 		{"1-3,5,7-9", []PageRange{{1, 3}, {5, 5}, {7, 9}}},
 		{" 2 - 4 , 6 ", []PageRange{{2, 4}, {6, 6}}},
+		{"\t3\t-\t5", []PageRange{{3, 5}}},
 		{"4-4", []PageRange{{4, 4}}},
 		// Terms keep the client's order; Select is what sorts and de-duplicates.
 		{"9,2-3", []PageRange{{9, 9}, {2, 3}}},
@@ -31,6 +32,8 @@ func TestParsePagesRejectsEverythingElse(t *testing.T) {
 		"0", "3-1", "1-", "a", "", "1,,2",
 		"-3", "0-2", "1-2-3", "+1", "1.5", "1 2", "1,2,", ",1", " ",
 		"99999999999999999999", // overflows int
+		// Only spaces and tabs may surround a term; other whitespace is not Azure's grammar.
+		" 1", "1　", "1\n", "\v1", "\r1", "1,\n2", "1\f-2",
 	} {
 		if got, ok := ParsePages(spec); ok {
 			t.Errorf("ParsePages(%q) = %v, true; want it rejected", spec, got)

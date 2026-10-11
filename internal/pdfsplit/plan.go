@@ -29,7 +29,7 @@ func Plan(pages []int, max int) []Part {
 	if n == 0 {
 		return nil
 	}
-	k := (n + max - 1) / max
+	k := (n-1)/max + 1 // ceil(n/max); (n+max-1)/max overflows for a huge max
 	size, extra := n/k, n%k
 
 	parts := make([]Part, 0, k)

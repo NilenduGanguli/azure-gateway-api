@@ -1,6 +1,7 @@
 package pdfsplit
 
 import (
+	"math"
 	"slices"
 	"testing"
 )
@@ -113,6 +114,13 @@ func TestPlanKeepsOriginalPageNumbers(t *testing.T) {
 	pages[0] = 99
 	if parts[0].Pages[0] != 1 {
 		t.Error("a part aliases the caller's slice")
+	}
+}
+
+func TestPlanHugeMaxIsOnePart(t *testing.T) {
+	parts := Plan([]int{1, 2}, math.MaxInt)
+	if len(parts) != 1 || !slices.Equal(parts[0].Pages, []int{1, 2}) {
+		t.Fatalf("Plan([1 2], MaxInt) = %v, want one part [1 2]", parts)
 	}
 }
 

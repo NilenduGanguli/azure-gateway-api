@@ -17,6 +17,7 @@ import (
 	"github.com/NilenduGanguli/azure-gateway-api/internal/pdftest"
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
 
 // writeFile stores data in a fresh temporary directory and returns the file's path.
@@ -495,5 +496,144 @@ func TestOpenNeedsNoWritableHome(t *testing.T) {
 	}
 	if !bytes.Contains(out, []byte("--- PASS: TestOpenNeedsNoWritableHome")) {
 		t.Fatalf("the child process did not run the check:\n%s", out)
+	}
+}
+
+// makeWithDests is pdftest.Make with one named destination per page: the catalog's /Names /Dests
+// tree maps "dNNN" to [page NNN /Fit], as in a document with an outline or internal links.
+func makeWithDests(n int) []byte {
+	var b bytes.Buffer
+	var offsets []int
+	obj := func(body string) {
+		offsets = append(offsets, b.Len())
+		fmt.Fprintf(&b, "%d 0 obj\n%s\nendobj\n", len(offsets), body)
+	}
+	page := func(i int) int { return 5 + 2*(i-1) } // object number of page i; its content follows
+
+	var kids, names bytes.Buffer
+	for i := 1; i <= n; i++ {
+		fmt.Fprintf(&kids, "%d 0 R ", page(i))
+		fmt.Fprintf(&names, "(d%03d) [%d 0 R /Fit] ", i, page(i))
+	}
+	b.WriteString("%PDF-1.7\n")
+	obj("<< /Type /Catalog /Pages 2 0 R /Names << /Dests 4 0 R >> >>")
+	obj(fmt.Sprintf("<< /Type /Pages /Kids [%s] /Count %d >>", kids.String(), n))
+	obj("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+	obj(fmt.Sprintf("<< /Names [%s] >>", names.String()))
+	for i := 1; i <= n; i++ {
+		stream := fmt.Sprintf("BT /F1 24 Tf 72 700 Td (PAGE %d) Tj ET", i)
+		obj(fmt.Sprintf("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %d 800] "+
+			"/Resources << /Font << /F1 3 0 R >> >> /Contents %d 0 R >>", pdftest.BaseWidth+i, page(i)+1))
+		obj(fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(stream), stream))
+	}
+	xref := b.Len()
+	fmt.Fprintf(&b, "xref\n0 %d\n0000000000 65535 f \n", len(offsets)+1)
+	for _, off := range offsets {
+		fmt.Fprintf(&b, "%010d 00000 n \n", off)
+	}
+	fmt.Fprintf(&b, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", len(offsets)+1, xref)
+	return b.Bytes()
+}
+
+// namedDests lists a PDF's named destinations, each with its target.
+func namedDests(t *testing.T, data []byte) []string {
+	t.Helper()
+	ctx := context.Background()
+	pdf, err := api.ReadAndValidate(ctx, bytes.NewReader(data), newConfig())
+	if err != nil {
+		t.Fatalf("PDF does not parse: %v", err)
+	}
+	tree := pdf.Names["Dests"]
+	if tree == nil {
+		return nil
+	}
+	entries, err := tree.KeyList(ctx) // "name target" pairs
+	if err != nil {
+		t.Fatal(err)
+	}
+	return entries
+}
+
+// TestCutsDoNotLeakNamedDestinations is a regression test. pdfcpu carries named destinations into
+// a part by patching and pruning the source model's /Dests tree in place, so each cut saw what the
+// previous one left: after cutting 1-4, the part 5-8 held only d001, pointing at the font object,
+// and 9-12 held none. Parts are analysed for their pages alone, so they carry no named
+// destinations at all.
+func TestCutsDoNotLeakNamedDestinations(t *testing.T) {
+	data := makeWithDests(12)
+	if got := namedDests(t, data); len(got) != 12 {
+		t.Fatalf("fixture has named destinations %v, want 12", got)
+	}
+
+	s := NewSplitter(1, time.Minute)
+	doc := mustOpen(t, s, writeFile(t, data))
+	defer doc.Close()
+
+	for _, pages := range [][]int{{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}} {
+		var buf bytes.Buffer
+		if err := doc.WritePart(context.Background(), pages, &buf); err != nil {
+			t.Fatalf("WritePart(%v): %v", pages, err)
+		}
+		if got := originalPages(t, buf.Bytes()); !slices.Equal(got, pages) {
+			t.Errorf("part %v holds original pages %v", pages, got)
+		}
+		if dests := namedDests(t, buf.Bytes()); len(dests) > 0 {
+			t.Errorf("part %v carries named destinations %v", pages, dests)
+		}
+	}
+}
+
+// failingReader serves its data for a few reads and then fails every read, as a disk or network
+// filesystem can part-way through a parse.
+type failingReader struct {
+	*bytes.Reader
+	reads, failAfter int
+	err              error
+}
+
+func (r *failingReader) Read(p []byte) (int, error) {
+	if r.reads++; r.reads > r.failAfter {
+		return 0, r.err
+	}
+	return r.Reader.Read(p)
+}
+
+func TestReadErrorsAreNotBlamedOnTheDocument(t *testing.T) {
+	ioErr := errors.New("input/output error")
+	data := pdftest.Make(200) // large enough that every case below fails before the parse is done
+	for _, failAfter := range []int{0, 2, 5} {
+		src := &failingReader{Reader: bytes.NewReader(data), failAfter: failAfter, err: ioErr}
+		ctx := context.Background()
+		_, err := readPDF(ctx, ctx, src)
+		if !errors.Is(err, ioErr) {
+			t.Errorf("failing after %d reads: readPDF = %v, want the reader's error", failAfter, err)
+		}
+		if errors.Is(err, ErrUnparseable) {
+			t.Errorf("failing after %d reads: a read error was blamed on the document: %v", failAfter, err)
+		}
+	}
+}
+
+// TestWritePartStaysFailedAfterAPanic checks that a document whose cut panicked is not cut again:
+// pdfcpu may have stopped half-way through updating the model.
+func TestWritePartStaysFailedAfterAPanic(t *testing.T) {
+	s := NewSplitter(1, time.Minute)
+	doc := mustOpen(t, s, writeFile(t, pdftest.Make(6)))
+	defer doc.Close()
+
+	real := cut
+	t.Cleanup(func() { cut = real })
+	cut = func(context.Context, *model.Context, []int, io.Writer) error { panic("half-way through") }
+	if err := doc.WritePart(context.Background(), []int{1}, io.Discard); !errors.Is(err, ErrPanic) {
+		t.Fatalf("WritePart with a panicking cut = %v, want ErrPanic", err)
+	}
+
+	cut = real
+	if err := doc.WritePart(context.Background(), []int{2}, io.Discard); !errors.Is(err, ErrPanic) {
+		t.Fatalf("WritePart after a panic = %v, want the panic's ErrPanic again", err)
+	}
+	doc.Close()
+	if n := slotsInUse(s); n != 0 {
+		t.Fatalf("%d slots held after closing the failed document", n)
 	}
 }

@@ -6,7 +6,8 @@
 // (Splitter).
 //
 // A document is parsed once and every part is cut from that one model. A part copies the original
-// page objects and their resources, so each page renders exactly as it did in the original.
+// page objects and their resources, so each page renders exactly as it did in the original. Parts
+// carry no named destinations (see readPDF).
 //
 // Uploads are untrusted, and parsing is where that shows: a large file holds its object graph in
 // memory, a crafted one can keep pdfcpu busy, and a malformed one can make it panic. So a Splitter
@@ -88,11 +89,16 @@ type Document struct {
 	owner    *Splitter
 	deadline time.Time // the end of the budget, shared by Open and every WritePart
 
-	// mu serialises cuts and Close. A cut is not read-only: pdfcpu decodes objects into the model
-	// as it reaches them.
-	mu   sync.Mutex
-	pdf  *model.Context // nil once closed
-	file *os.File       // the model's source, which pdfcpu keeps a reader on
+	// mu serialises cuts and Close, and guards the fields below. A cut writes into the shared
+	// model, so every cut sees what the earlier ones left behind. pdfcpu caches the objects it
+	// decodes, which is harmless. It also carries named destinations into a part by patching and
+	// pruning the model's /Dests tree in place, which gave later parts destinations pointing at the
+	// wrong objects; readPDF removes that tree. A cut that panicked may have left the model
+	// half-changed, so failed then refuses every later cut.
+	mu     sync.Mutex
+	pdf    *model.Context // nil once closed
+	file   *os.File       // the model's source, which pdfcpu keeps a reader on
+	failed error          // the ErrPanic of a cut that panicked
 }
 
 // Open parses the file at path within the budget. Encrypted PDFs give ErrEncrypted; parse
@@ -146,21 +152,40 @@ func (s *Splitter) parse(ctx context.Context, path string, deadline time.Time) (
 	c, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 
+	pdf, err := readPDF(ctx, c, f)
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return &Document{PageCount: pdf.PageCount, owner: s, deadline: deadline, pdf: pdf, file: f}, nil
+}
+
+// readPDF parses rs under c, which is ctx bounded by the document's deadline. A failure of rs
+// itself is returned as such: an I/O error is not the document's fault.
+func readPDF(ctx, c context.Context, rs io.ReadSeeker) (*model.Context, error) {
+	src := &errReader{rs: rs}
 	var pdf *model.Context
-	err = guard(func() (err error) {
-		if pdf, err = api.ReadAndValidate(c, f, newConfig()); err != nil {
+	err := guard(func() (err error) {
+		if pdf, err = api.ReadAndValidate(c, src, newConfig()); err != nil {
 			return err
 		}
 		if pdf.Encrypt != nil || pdf.E != nil {
 			return ErrEncrypted
 		}
+		// pdfcpu carries named destinations into a part by rewriting this tree in place, so each
+		// cut would inherit the previous cuts' edits. Azure analyses a part's pages, not its
+		// links, and without the tree an internal link dangles the same way in every part, so the
+		// parts go without it. Nothing on a page renders differently.
+		delete(pdf.Names, "Dests")
 		return nil
 	})
+	if err != nil && src.err != nil && ctx.Err() == nil {
+		return nil, fmt.Errorf("pdfsplit: read: %w", src.err)
+	}
 	if err != nil {
-		_ = f.Close()
 		return nil, classify(ctx, c, err)
 	}
-	return &Document{PageCount: pdf.PageCount, owner: s, deadline: deadline, pdf: pdf, file: f}, nil
+	return pdf, nil
 }
 
 // WritePart writes the given original pages (1-based) as a standalone PDF to w, within the
@@ -170,11 +195,17 @@ func (s *Splitter) parse(ctx context.Context, path string, deadline time.Time) (
 // else is the caller's mistake and is rejected before pdfcpu sees it. Errors are classified as for
 // Open, except that a failure of w itself is returned as such: a full disk is not the document's
 // fault.
+//
+// On any error w may already hold part of the output, so the caller must discard it. Once a cut
+// has panicked, every later WritePart on the Document returns that same ErrPanic.
 func (d *Document) WritePart(ctx context.Context, pages []int, w io.Writer) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.pdf == nil {
 		return errors.New("pdfsplit: document is closed")
+	}
+	if d.failed != nil {
+		return d.failed
 	}
 	if err := checkPages(pages, d.PageCount); err != nil {
 		return err
@@ -183,17 +214,24 @@ func (d *Document) WritePart(ctx context.Context, pages []int, w io.Writer) erro
 	c, cancel := context.WithDeadline(ctx, d.deadline)
 	defer cancel()
 	dst := &errWriter{w: w}
-	err := guard(func() error {
-		part, err := pdfcpu.ExtractPages(c, d.pdf, pages, true)
-		if err != nil {
-			return err
-		}
-		return api.WriteContext(c, part, dst)
-	})
+	err := guard(func() error { return cut(c, d.pdf, pages, dst) })
+	if errors.Is(err, ErrPanic) {
+		d.failed = err
+	}
 	if err != nil && dst.err != nil && ctx.Err() == nil {
 		return fmt.Errorf("pdfsplit: write part: %w", dst.err)
 	}
 	return classify(ctx, c, err)
+}
+
+// cut extracts pages from pdf into a new PDF written to w. It is a variable so tests can make it
+// panic, which pdfcpu cannot be made to do on demand.
+var cut = func(c context.Context, pdf *model.Context, pages []int, w io.Writer) error {
+	part, err := pdfcpu.ExtractPages(c, pdf, pages, true)
+	if err != nil {
+		return err
+	}
+	return api.WriteContext(c, part, w)
 }
 
 // checkPages validates a cut's page list against a document of count pages.
@@ -230,6 +268,10 @@ func (d *Document) Close() {
 // Halving happens after the original's model has been released, and a part file is a few pages,
 // so parsing it again is cheap. Recut takes a slot and a fresh budget of its own: it is Open
 // followed by one WritePart.
+//
+// It must not be called while holding a Document from the same Splitter. It waits for a slot of
+// its own, so once every slot is held by callers doing that, none of them can proceed. Close the
+// original's Document first, as soon as its parts are written.
 func (s *Splitter) Recut(ctx context.Context, srcPath string, local []int, w io.Writer) error {
 	doc, err := s.Open(ctx, srcPath)
 	if err != nil {
@@ -289,6 +331,25 @@ func isEncryption(err error) bool {
 	}
 	return false
 }
+
+// errReader remembers the source's first read error, so that an I/O failure during a parse is
+// reported as itself rather than classified as a fault in the document. io.EOF is how pdfcpu
+// finds the end of the file, so it is not an error here. Seek errors are not recorded either:
+// seeking a file does no I/O, and only fails on an offset taken from a corrupt document.
+type errReader struct {
+	rs  io.ReadSeeker
+	err error
+}
+
+func (e *errReader) Read(p []byte) (int, error) {
+	n, err := e.rs.Read(p)
+	if err != nil && err != io.EOF && e.err == nil {
+		e.err = err
+	}
+	return n, err
+}
+
+func (e *errReader) Seek(offset int64, whence int) (int64, error) { return e.rs.Seek(offset, whence) }
 
 // errWriter remembers the destination's first error, so that a failed write is reported as itself
 // rather than classified as a fault in the document.
