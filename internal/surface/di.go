@@ -9,6 +9,7 @@ import (
 
 	"github.com/NilenduGanguli/azure-gateway-api/internal/azerr"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/config"
+	"github.com/NilenduGanguli/azure-gateway-api/internal/httpx"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/ids"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/jobs"
 	"github.com/NilenduGanguli/azure-gateway-api/internal/logging"
@@ -68,6 +69,10 @@ func (s *Server) registerDI(mux *http.ServeMux) {
 		mux.HandleFunc("GET "+fam+"/info", s.diInfo)
 		mux.HandleFunc("GET "+fam+"/documentModels", s.diListModels)
 		mux.HandleFunc("GET "+fam+"/documentModels/{modelId}", s.diGetModel)
+		// Model-lifecycle operations. A layout container has none, but it routes them, so a
+		// gateway that did not would answer a client differently from the pod.
+		mux.HandleFunc("GET "+fam+"/operations", s.diListOperations)
+		mux.HandleFunc("GET "+fam+"/operations/{operationId}", s.diGetOperation)
 	}
 }
 
@@ -102,6 +107,11 @@ func (s *Server) diAction(w http.ResponseWriter, r *http.Request) {
 func (s *Server) diAnalyze(w http.ResponseWriter, r *http.Request, modelID string) {
 	apiVersion, err := requireAPIVersion(r)
 	if err != nil {
+		err.WriteTo(w, azerr.SurfaceDI)
+		return
+	}
+	// Before admission, so a refused request stores nothing.
+	if err := checkDIParams(r.URL.Query()); err != nil {
 		err.WriteTo(w, azerr.SurfaceDI)
 		return
 	}
@@ -143,6 +153,10 @@ func diOperationLocation(base, prefix, modelID, resultID, apiVersion string) str
 // diSyncAnalyze serves a synchronous analysis through the engine; see syncAnalyze.
 func (s *Server) diSyncAnalyze(w http.ResponseWriter, r *http.Request, modelID string) {
 	if _, err := requireAPIVersion(r); err != nil {
+		err.WriteTo(w, azerr.SurfaceDI)
+		return
+	}
+	if err := checkDIParams(r.URL.Query()); err != nil {
 		err.WriteTo(w, azerr.SurfaceDI)
 		return
 	}
@@ -212,6 +226,18 @@ func (s *Server) diGetModel(w http.ResponseWriter, r *http.Request) {
 	}
 	s.proxyGET(w, r, azerr.SurfaceDI, jobs.SurfaceDI,
 		prefixOf(r)+"/documentModels/"+url.PathEscape(modelID))
+}
+
+// diListOperations proxies GET {family}/operations.
+func (s *Server) diListOperations(w http.ResponseWriter, r *http.Request) {
+	s.proxyGET(w, r, azerr.SurfaceDI, jobs.SurfaceDI, prefixOf(r)+"/operations")
+}
+
+// diGetOperation proxies GET {family}/operations/{operationId}, re-escaping the routed id for the
+// reason diGetModel gives.
+func (s *Server) diGetOperation(w http.ResponseWriter, r *http.Request) {
+	s.proxyGET(w, r, azerr.SurfaceDI, jobs.SurfaceDI,
+		prefixOf(r)+"/operations/"+url.PathEscape(r.PathValue("operationId")))
 }
 
 // validModelID applies the contract's own constraint: maxLength 64, pattern
@@ -351,7 +377,14 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) {
 // Middleware writes Server, Cache-Control and the x-ms-client-request-id echo before any handler
 // runs, and a real container sends Server and the echo too. Appending to them sent each header
 // twice, which no pod does, and the spec asks for these routes to be relayed verbatim.
+//
+// x-ms-client-request-id is the exception. It is the client's own correlation id, echoed by the
+// middleware, and the gateway's call to the container does not carry it, so whatever the container
+// sends under that name is not the client's id and is dropped.
 func relayHeader(dst http.Header, k string, vs []string) {
+	if http.CanonicalHeaderKey(k) == http.CanonicalHeaderKey(httpx.HeaderClientRequestID) {
+		return
+	}
 	dst.Del(k)
 	for _, v := range vs {
 		dst.Add(k, v)

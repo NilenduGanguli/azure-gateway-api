@@ -130,8 +130,14 @@ func TestClientProxyGET(t *testing.T) {
 		base := dead.URL
 		dead.Close()
 		c, _ := newTestClient(t, azerr.SurfaceDI, base)
-		if _, err := c.ProxyGET(context.Background(), "/documentintelligence/info", ""); err == nil {
+		_, err := c.ProxyGET(context.Background(), "/documentintelligence/info", "")
+		if err == nil {
 			t.Fatal("no error from a closed container")
+		}
+		// The error is reduced to its cause: the *url.Error around it names the whole upstream
+		// URL, path included.
+		if strings.Contains(err.Error(), base+"/documentintelligence") {
+			t.Errorf("the error names the upstream URL: %v", err)
 		}
 	})
 }

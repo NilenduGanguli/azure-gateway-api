@@ -44,10 +44,26 @@ func New(d Deps) *Server {
 	return &Server{deps: d}
 }
 
-// Register wires both surfaces onto a mux.
+// Register wires the configured surfaces onto a mux.
+//
+// A surface with no container behind it registers nothing, so its paths answer the bodyless 404
+// of an unrouted path, as a pod of the other kind would. Accepting a 202 there would promise work
+// that can never run. The container's root routes go to DI when it is configured, else to Read.
 func (s *Server) Register(mux *http.ServeMux) {
-	s.registerDI(mux)
-	s.registerRead(mux)
+	di := s.deps.Jobs.Engine(jobs.SurfaceDI) != nil
+	read := s.deps.Jobs.Engine(jobs.SurfaceRead) != nil
+	if di {
+		s.registerDI(mux)
+	}
+	if read {
+		s.registerRead(mux)
+	}
+	switch {
+	case di:
+		s.registerRoot(mux, azerr.SurfaceDI, jobs.SurfaceDI)
+	case read:
+		s.registerRoot(mux, azerr.SurfaceRead, jobs.SurfaceRead)
+	}
 }
 
 // envelope is the operation-status body both surfaces return from a poll.

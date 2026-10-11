@@ -82,7 +82,9 @@ func (c *Client) ProxyGET(ctx context.Context, pathAndQuery, accept string) (*ht
 	hc := &http.Client{Transport: newAttemptTransport(), Timeout: proxyTimeout, CheckRedirect: noRedirects}
 	resp, err := hc.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("upstream: proxy GET: %w", err)
+		// Reduced to its cause: the *url.Error names the internal upstream address, and an error
+		// that reaches a caller must not carry it.
+		return nil, fmt.Errorf("upstream: proxy GET: %w", transportCause(err))
 	}
 	return resp, nil
 }
